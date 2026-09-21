@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Production build outputs
+dist/
+dist-ssr/
+*.local
+
+# Tauri / Rust build artifacts
+target/
+libkyro/target/
+libkyro/gen/schemas/
+**/*.rs.bk
+*.pdb
+
+# Local SQLite databases & cache
+*.db
+*.db-shm
+*.db-wal
+kyro.db*
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Reverse engineering temporary files & raw deb packages
+extracted/
+extracted_asar/
+*.deb
+.images/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor & OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
