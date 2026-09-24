@@ -1,0 +1,1234 @@
+import React, { useState, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import {
+  Conversation,
+  Message,
+  AgentStepEvent,
+  BotRecord,
+  TakeoverStatus,
+  ApprovalRequest,
+  GroundedScreenResult,
+} from "./types/agent";
+import { ToolCallCard } from "./components/ToolCallCard";
+import { TerminalView } from "./components/TerminalView";
+import { SettingsModal } from "./components/SettingsModal";
+import { TeachTaskModal } from "./components/TeachTaskModal";
+import { TeammateRosterModal } from "./components/TeammateRosterModal";
+import { McpModal } from "./components/McpModal";
+import { ConnectionsModal } from "./components/ConnectionsModal";
+import { TimelineDrawer } from "./components/TimelineDrawer";
+import { ArtifactsModal } from "./components/ArtifactsModal";
+import { CommandPalette } from "./components/CommandPalette";
+import { MarkdownRenderer } from "./components/MarkdownRenderer";
+import { KyroLogo } from "./components/Logo";
+import { AgentAvatar } from "./components/AgentAvatar";
+import { NvidiaIcon } from "./components/BrandIcons";
+import {
+  Send,
+  Plus,
+  Settings,
+  Terminal,
+  Monitor,
+  Camera,
+  Crop,
+  StopCircle,
+  ChevronRight,
+  ExternalLink,
+  Users,
+  Workflow,
+  Server,
+  Globe,
+  AlertTriangle,
+  Play,
+  Ghost,
+  Target,
+  History,
+  ShieldAlert,
+  CheckCircle,
+  XCircle,
+  Layers,
+  Command,
+  Mic,
+  MicOff,
+  Volume2,
+  VolumeX,
+  Paperclip,
+  FileCode,
+  X,
+  Plug,
+  Copy,
+  Check,
+} from "lucide-react";
+
+export const App: React.FC = () => {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConvId, setActiveConvId] = useState<string | null>(null);
+  const activeConvIdRef = useRef<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [prompt, setPrompt] = useState("");
+  const [selectedModel, setSelectedModel] = useState("nvidia/nemotron-3-ultra-550b-a55b");
+
+  // Modals & Drawers
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<string>("model");
+  const [isTeachTaskOpen, setIsTeachTaskOpen] = useState(false);
+  const [teachTaskInitialTab, setTeachTaskInitialTab] = useState<"skills" | "record" | "routines">("skills");
+  const [teachTaskHighlightId, setTeachTaskHighlightId] = useState<string | undefined>(undefined);
+  const [isTeammatesOpen, setIsTeammatesOpen] = useState(false);
+  const [isMcpOpen, setIsMcpOpen] = useState(false);
+  const [isConnectionsOpen, setIsConnectionsOpen] = useState(false);
+  const [isTimelineOpen, setIsTimelineOpen] = useState(false);
+  const [isArtifactsOpen, setIsArtifactsOpen] = useState(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [isGhostMode, setIsGhostMode] = useState(false);
+
+  // Agent State & Governance
+  const [isAgentRunning, setIsAgentRunning] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequest[]>([]);
+  const [liveSteps, setLiveSteps] = useState<AgentStepEvent[]>([]);
+  const [screenPreview, setScreenPreview] = useState<string | null>(null);
+  const [groundedResult, setGroundedResult] = useState<GroundedScreenResult | null>(null);
+
+  // Voice Dictation & Text-to-Speech
+  const [isListening, setIsListening] = useState(false);
+  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const recognitionRef = useRef<any>(null);
+
+  // File Attachment
+  const [attachedFile, setAttachedFile] = useState<{
+    name: string;
+    content: string;
+    base64?: string;
+    mimeType?: string;
+  } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Multi-Bot & Governance
+  const [activeBot, setActiveBot] = useState<BotRecord>({
+    id: "apex-orchestrator",
+    name: "Apex",
+    avatar: "zap",
+    role: "General Workspace & Strategic Orchestrator",
+    system_prompt: "",
+    is_default: true,
+  });
+
+  const [takeover, setTakeover] = useState<TakeoverStatus>({
+    is_active: false,
+    reason: "",
+    timestamp: 0,
+  });
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    activeConvIdRef.current = activeConvId;
+  }, [activeConvId]);
+
+  useEffect(() => {
+    loadConversations();
+    loadDefaultBot();
+
+    // Request notification permission if supported
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+
+    // Initialize Web Speech API for zero-cloud voice dictation
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      try {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.onresult = (event: any) => {
+          const transcript = event.results[0][0].transcript;
+          if (transcript) {
+            setPrompt((prev) => (prev ? prev + " " + transcript : transcript));
+          }
+          setIsListening(false);
+        };
+        recognition.onerror = () => setIsListening(false);
+        recognition.onend = () => setIsListening(false);
+        recognitionRef.current = recognition;
+      } catch (e) {
+        console.warn("Speech recognition init error:", e);
+      }
+    }
+
+    // Keyboard shortcut for command palette (Ctrl+K or Cmd+K)
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setIsCommandPaletteOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handleGlobalKeyDown);
+
+    // Listen to real-time agent turn step updates from Rust engine
+    const unlistenPromise = listen<AgentStepEvent>("agent:step", (event) => {
+      setLiveSteps((prev) => {
+        const existing = prev.filter((s) => s.step !== event.payload.step);
+        return [...existing, event.payload].sort((a, b) => a.step - b.step);
+      });
+    });
+
+    // Governance & Takeover polling
+    const pollInterval = setInterval(async () => {
+      try {
+        const [tStatus, approvals] = await Promise.all([
+          invoke<TakeoverStatus>("get_takeover_status"),
+          invoke<ApprovalRequest[]>("list_pending_approvals"),
+        ]);
+        setTakeover(tStatus);
+        setPendingApprovals(approvals.filter((a) => a.status === "pending"));
+      } catch (e) {
+        // ignore
+      }
+    }, 1000);
+
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKeyDown);
+      unlistenPromise.then((fn) => fn());
+      clearInterval(pollInterval);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeConvId) {
+      loadMessages(activeConvId);
+    }
+  }, [activeConvId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, liveSteps]);
+
+  const sendNotification = (title: string, body: string) => {
+    if ("Notification" in window && Notification.permission === "granted") {
+      try {
+        new Notification(title, { body });
+      } catch (e) {
+        console.warn("Desktop notification error:", e);
+      }
+    }
+  };
+
+  const loadDefaultBot = async () => {
+    try {
+      const bots = await invoke<BotRecord[]>("list_bots");
+      if (bots.length > 0) {
+        setActiveBot(bots[0]);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const loadConversations = async () => {
+    try {
+      const list = await invoke<Conversation[]>("list_conversations");
+      setConversations(list);
+      if (list.length > 0 && !activeConvId) {
+        setActiveConvId(list[0].id);
+      }
+    } catch (err) {
+      console.error("Failed to load conversations:", err);
+    }
+  };
+
+  const loadMessages = async (convId: string) => {
+    try {
+      const msgs = await invoke<Message[]>("get_messages", { conversationId: convId });
+      if (activeConvIdRef.current === convId) {
+        setMessages(msgs);
+        setLiveSteps([]);
+      }
+    } catch (err) {
+      console.error("Failed to load messages:", err);
+    }
+  };
+
+  const handleNewConversation = async () => {
+    const id = "conv_" + crypto.randomUUID();
+    const title = "New Task " + (conversations.length + 1);
+    try {
+      const newConv = await invoke<Conversation>("create_conversation", {
+        id,
+        title,
+        model: selectedModel,
+      });
+      setConversations([newConv, ...conversations]);
+      setActiveConvId(id);
+      setMessages([]);
+      setLiveSteps([]);
+    } catch (err) {
+      console.error("Failed to create conversation:", err);
+    }
+  };
+
+  const handleOpenTeachTask = (
+    tab: "skills" | "record" | "routines" = "skills",
+    taskId?: string
+  ) => {
+    setTeachTaskInitialTab(tab);
+    setTeachTaskHighlightId(taskId);
+    setIsTeachTaskOpen(true);
+  };
+
+  const handleResumeTakeover = async () => {
+    try {
+      await invoke("resume_takeover");
+      setTakeover({ is_active: false, reason: "", timestamp: 0 });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleResolveApproval = async (id: string, decision: "approved" | "denied") => {
+    try {
+      await invoke("resolve_approval", { id, decision, resolvedBy: "desktop_user" });
+      setPendingApprovals((prev) => prev.filter((a) => a.id !== id));
+    } catch (err) {
+      console.error("Failed to resolve approval:", err);
+    }
+  };
+
+  const toggleVoiceDictation = () => {
+    if (!recognitionRef.current) {
+      alert("Speech recognition is not supported in this browser/webview engine.");
+      return;
+    }
+    if (isListening) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {}
+      setIsListening(false);
+    } else {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (e) {
+        console.warn("Speech recognition start failed:", e);
+        setIsListening(false);
+      }
+    }
+  };
+
+  const handleSpeak = (msgId: string, text: string) => {
+    if (!("speechSynthesis" in window)) return;
+    if (speakingMessageId === msgId) {
+      window.speechSynthesis.cancel();
+      setSpeakingMessageId(null);
+    } else {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.onend = () => setSpeakingMessageId(null);
+      utterance.onerror = () => setSpeakingMessageId(null);
+      window.speechSynthesis.speak(utterance);
+      setSpeakingMessageId(msgId);
+    }
+  };
+
+  const handleCopyMessage = async (msgId: string, text: string) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        setCopiedMessageId(msgId);
+        setTimeout(() => setCopiedMessageId(null), 2000);
+      }
+    } catch (e) {
+      console.warn("Copy message error:", e);
+    }
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = (reader.result as string).split(",")[1];
+        setAttachedFile({
+          name: file.name,
+          content: `[Attached image file: ${file.name}]`,
+          base64,
+          mimeType: file.type || "image/png",
+        });
+      };
+      reader.readAsDataURL(file);
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = reader.result as string;
+        setAttachedFile({
+          name: file.name,
+          content: text,
+        });
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if ((!prompt.trim() && !attachedFile) || isAgentRunning) return;
+
+    let convId = activeConvId;
+    if (!convId) {
+      convId = "conv_" + crypto.randomUUID();
+      const newConv = await invoke<Conversation>("create_conversation", {
+        id: convId,
+        title: prompt.slice(0, 30) || attachedFile?.name || "New Task",
+        model: selectedModel,
+      });
+      setConversations([newConv, ...conversations]);
+      setActiveConvId(convId);
+    }
+
+    let fullPromptText = prompt;
+    let imageAttachment: { base64: string; mimeType: string; name: string } | null = null;
+    if (attachedFile) {
+      if (attachedFile.base64) {
+        imageAttachment = {
+          base64: attachedFile.base64,
+          mimeType: attachedFile.mimeType || "image/png",
+          name: attachedFile.name,
+        };
+        fullPromptText = `[Attachment: ${attachedFile.name}]\n${prompt}`;
+      } else {
+        fullPromptText = `[Attachment: ${attachedFile.name}]\n\`\`\`\n${attachedFile.content}\n\`\`\`\n\n${prompt}`;
+      }
+      setAttachedFile(null);
+    }
+
+    const userMsg: Message = {
+      id: "msg_" + crypto.randomUUID(),
+      conversation_id: convId,
+      role: "user",
+      content: fullPromptText,
+      created_at: Date.now(),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    await invoke("add_message", { msg: userMsg }).catch(console.error);
+
+    setPrompt("");
+    const runId = "run_" + crypto.randomUUID();
+    setActiveRunId(runId);
+    setIsAgentRunning(true);
+    setLiveSteps([]);
+
+    const priorHistory = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      tool_calls: m.tool_calls_json ? JSON.parse(m.tool_calls_json) : null,
+      tool_call_id: null,
+    }));
+
+    const lastMessageContent = imageAttachment
+      ? [
+          {
+            type: "text",
+            text: fullPromptText.trim() ? fullPromptText : `Image attached: ${imageAttachment.name}`,
+          },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:${imageAttachment.mimeType};base64,${imageAttachment.base64}`,
+            },
+          },
+        ]
+      : fullPromptText;
+
+    const history = priorHistory.concat([
+      {
+        role: userMsg.role,
+        content: lastMessageContent as any,
+        tool_calls: null,
+        tool_call_id: null,
+      },
+    ]);
+
+    try {
+      const systemPrompt = activeBot.system_prompt
+        ? `${activeBot.system_prompt}\nYou are responding as @${activeBot.name}.`
+        : null;
+
+      const finalReply = await invoke<string>("run_agent_turn", {
+        runId,
+        conversationId: convId,
+        model: selectedModel,
+        botId: activeBot.id,
+        history,
+        systemPrompt,
+      });
+
+      const assistantMsg: Message = {
+        id: "msg_" + crypto.randomUUID(),
+        conversation_id: convId,
+        role: "assistant",
+        content: finalReply || "Task completed.",
+        created_at: Date.now(),
+      };
+
+      setMessages((prev) => [...prev, assistantMsg]);
+      await invoke("add_message", { msg: assistantMsg }).catch(console.error);
+      sendNotification("Kyro Task Completed", finalReply.slice(0, 80));
+    } catch (err: any) {
+      const errorMsg: Message = {
+        id: "msg_" + crypto.randomUUID(),
+        conversation_id: convId,
+        role: "assistant",
+        content: "Error running turn: " + err,
+        created_at: Date.now(),
+      };
+      setMessages((prev) => [...prev, errorMsg]);
+      sendNotification("Kyro Task Failed", String(err));
+    } finally {
+      setIsAgentRunning(false);
+      setActiveRunId(null);
+    }
+  };
+
+  const handleAbort = async () => {
+    if (activeRunId) {
+      await invoke("cancel_agent_run", { runId: activeRunId }).catch(console.error);
+    }
+    await invoke("abort_computer_use").catch(console.error);
+    setIsAgentRunning(false);
+    setActiveRunId(null);
+  };
+
+  const handleCaptureScreen = async () => {
+    try {
+      const res = await invoke<any>("take_screenshot");
+      setScreenPreview(`data:image/png;base64,${res.base64_png}`);
+    } catch (err) {
+      alert("Screen capture error: " + err);
+    }
+  };
+
+  const handleToggleGhostMode = async () => {
+    try {
+      const next = !isGhostMode;
+      await invoke("toggle_ghost_mode", { enabled: next });
+      setIsGhostMode(next);
+    } catch (err: any) {
+      alert("Error toggling Ghost Mode: " + err);
+    }
+  };
+
+  const handleCaptureGrounded = async () => {
+    try {
+      const res = await invoke<GroundedScreenResult>("capture_grounded_screen");
+      setGroundedResult(res);
+    } catch (err: any) {
+      alert("Set-of-Marks grounding error: " + err);
+    }
+  };
+
+  return (
+    <div className="flex h-screen w-screen bg-[#0a0a0a] text-neutral-100 overflow-hidden font-sans select-none">
+      {/* Sidebar */}
+      <div className="w-64 bg-[#0a0a0a] border-r border-neutral-800 flex flex-col justify-between">
+        <div className="p-4 flex flex-col h-full">
+          {/* Logo & HUD trigger */}
+          <div className="flex items-center justify-between pb-4 border-b border-neutral-800">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-[#141414] border border-neutral-800/80 flex items-center justify-center p-1 shadow-sm overflow-hidden">
+                <KyroLogo className="w-full h-full" />
+              </div>
+              <div>
+                <h1 className="font-semibold text-sm tracking-wide text-neutral-100">KYRO</h1>
+                <p className="text-[10px] text-neutral-400 font-mono">Autonomous OS</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setIsCommandPaletteOpen(true)}
+                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 rounded-lg transition"
+                title="Quick Actions & Search (Ctrl+K)"
+              >
+                <Command className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => invoke("toggle_hud_window")}
+                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 rounded-lg transition"
+                title="Toggle Floating HUD Widget"
+              >
+                <ExternalLink className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* New Chat Button */}
+          <button
+            onClick={handleNewConversation}
+            className="my-3 w-full py-2 px-3 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 text-xs font-medium flex items-center justify-center gap-1.5 transition shadow-sm"
+          >
+            <Plus className="w-4 h-4" /> New Session
+          </button>
+
+          {/* Active Teammate & Model Badge */}
+          <div className="mb-3 p-3 bg-[#111111] border border-neutral-800 rounded-xl space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] uppercase font-mono tracking-wider text-neutral-400">
+                Active Teammate
+              </span>
+              <button
+                onClick={() => setIsTeammatesOpen(true)}
+                className="text-[10px] text-neutral-400 hover:text-neutral-200 hover:underline flex items-center gap-0.5"
+              >
+                Change
+              </button>
+            </div>
+            <div
+              onClick={() => setIsTeammatesOpen(true)}
+              className="flex items-center gap-2.5 cursor-pointer hover:opacity-90 transition"
+            >
+              <AgentAvatar
+                avatar={activeBot.avatar}
+                name={activeBot.name}
+                className="w-8 h-8 rounded-lg bg-black/40 border border-neutral-800/60 flex items-center justify-center text-neutral-200"
+                iconClassName="w-4 h-4"
+              />
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-neutral-100">@{activeBot.name}</div>
+                <div className="text-[10px] text-neutral-400 truncate">{activeBot.role}</div>
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-neutral-800 flex items-center justify-between text-[10px] font-mono text-neutral-400">
+              <span className="flex items-center gap-1.5">
+                <NvidiaIcon className="w-3.5 h-3.5 text-[#76B900]" /> Nemotron-3 Ultra
+              </span>
+              <span className="text-[9px] px-1 py-0.2 bg-neutral-900 rounded border border-neutral-800 text-neutral-300">
+                550B
+              </span>
+            </div>
+          </div>
+
+          {/* Navigation Tools */}
+          <div className="space-y-1 mb-3">
+            <button
+              onClick={() => setIsConnectionsOpen(true)}
+              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/80 flex items-center gap-2 transition"
+            >
+              <Plug className="w-4 h-4 text-neutral-400" /> App Connections
+            </button>
+            <button
+              onClick={() => setIsArtifactsOpen(true)}
+              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+            >
+              <Layers className="w-4 h-4 text-neutral-400" /> Artifacts Registry
+            </button>
+            <button
+              onClick={() => handleOpenTeachTask("skills")}
+              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+            >
+              <Workflow className="w-4 h-4 text-neutral-400" /> Teach-a-Task & Routines
+            </button>
+            <button
+              onClick={() => setIsTeammatesOpen(true)}
+              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+            >
+              <Users className="w-4 h-4 text-neutral-400" /> Teammate Roster
+            </button>
+            <button
+              onClick={() => setIsMcpOpen(true)}
+              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+            >
+              <Server className="w-4 h-4 text-neutral-400" /> MCP Tool Servers
+            </button>
+          </div>
+
+          {/* Conversations list */}
+          <div className="flex-1 overflow-y-auto space-y-1 pr-1 border-t border-neutral-800 pt-3">
+            <div className="text-[10px] uppercase font-mono tracking-wider text-neutral-500 mb-1.5 px-2">
+              Recent Sessions
+            </div>
+            {conversations.map((c) => (
+              <div
+                key={c.id}
+                onClick={() => setActiveConvId(c.id)}
+                className={`px-3 py-2 rounded-lg text-xs cursor-pointer truncate transition flex items-center justify-between ${
+                  activeConvId === c.id
+                    ? "bg-neutral-800 text-neutral-100 border border-neutral-700 font-medium"
+                    : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200 border border-transparent"
+                }`}
+              >
+                <span className="truncate">{c.title}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Bottom Sidebar: Settings */}
+        <div className="p-3 border-t border-neutral-800 bg-[#0a0a0a]">
+          <button
+            onClick={() => {
+              setSettingsInitialTab("model");
+              setIsSettingsOpen(true);
+            }}
+            className="w-full px-3 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 transition flex items-center justify-between"
+          >
+            <span className="flex items-center gap-2">
+              <Settings className="w-4 h-4 text-neutral-400" /> Vault & Settings
+            </span>
+            <ChevronRight className="w-3.5 h-3.5 text-neutral-500" />
+          </button>
+        </div>
+      </div>
+
+      {/* Main Workspace Area */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0a0a0a]">
+        {/* Top Navbar */}
+        <div className="h-14 px-6 border-b border-neutral-800 flex items-center justify-between bg-[#0a0a0a]">
+          <div className="flex items-center gap-3">
+            <AgentAvatar
+              avatar={activeBot.avatar}
+              name={activeBot.name}
+              className="w-8 h-8 rounded-lg bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-200"
+              iconClassName="w-4 h-4"
+            />
+            <div>
+              <div className="text-xs font-semibold text-neutral-100 flex items-center gap-1.5">
+                <span>@{activeBot.name}</span>
+                <span className="text-[10px] text-neutral-400 font-normal">• {activeBot.role}</span>
+              </div>
+              <div className="text-[10px] text-neutral-400 font-mono flex items-center gap-1.5">
+                <NvidiaIcon className="w-3 h-3 text-[#76B900]" />
+                <span>nvidia/nemotron-3-ultra-550b-a55b</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* Quick Actions / Palette */}
+            <button
+              onClick={() => setIsCommandPaletteOpen(true)}
+              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              title="Global Command Palette (Ctrl+K)"
+            >
+              <Command className="w-3.5 h-3.5 text-neutral-400" /> Palette
+            </button>
+
+            {/* Artifacts */}
+            <button
+              onClick={() => setIsArtifactsOpen(true)}
+              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              title="Artifacts Registry"
+            >
+              <Layers className="w-3.5 h-3.5 text-neutral-400" /> Artifacts
+            </button>
+
+            {/* Ghost Mode Toggle */}
+            <button
+              onClick={handleToggleGhostMode}
+              className={`px-3 py-1.5 border rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+                isGhostMode
+                  ? "bg-purple-950/40 text-purple-200 border-purple-700/60 shadow-sm"
+                  : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-400 border-neutral-800"
+              }`}
+              title="Runs actions inside isolated virtual display (:99). Your physical mouse & screen stay 100% free!"
+            >
+              <Ghost
+                className={`w-3.5 h-3.5 ${isGhostMode ? "text-purple-300 animate-pulse" : "text-neutral-400"}`}
+              />
+              {isGhostMode ? "Ghost Mode: ON (:99)" : "Ghost Mode"}
+            </button>
+
+            {/* Set-of-Marks Grounding */}
+            <button
+              onClick={handleCaptureGrounded}
+              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              title="Detect UI elements and render numbered markers [1], [2], [3] for zero-miss clicks"
+            >
+              <Target className="w-3.5 h-3.5 text-neutral-400" /> Set-of-Marks
+            </button>
+
+            {/* Step Timeline */}
+            <button
+              onClick={() => setIsTimelineOpen(true)}
+              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              title="Inspect step-by-step before/after diffs with click target rings"
+            >
+              <History className="w-3.5 h-3.5 text-neutral-400" /> Timeline
+            </button>
+
+            <button
+              onClick={handleCaptureScreen}
+              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              title="Capture display snapshot"
+            >
+              <Camera className="w-3.5 h-3.5 text-neutral-400" /> Screen
+            </button>
+            <button
+              onClick={() => invoke("toggle_overlay_window", { show: true })}
+              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              title="Snip region of screen"
+            >
+              <Crop className="w-3.5 h-3.5 text-neutral-400" /> Snip
+            </button>
+            <button
+              onClick={() => setShowTerminal(!showTerminal)}
+              className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition ${
+                showTerminal
+                  ? "bg-neutral-800 text-neutral-100 border-neutral-700"
+                  : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-300 border-neutral-800"
+              }`}
+            >
+              <Terminal className="w-3.5 h-3.5 text-neutral-400" /> PTY
+            </button>
+          </div>
+        </div>
+
+        {/* Human Takeover Alert Banner */}
+        {takeover.is_active && (
+          <div className="px-6 py-2.5 bg-neutral-900 border-b border-neutral-800 flex items-center justify-between text-xs text-neutral-200">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 animate-bounce" />
+              <span>
+                <strong>Human Takeover Active</strong>:{" "}
+                {takeover.reason || "Autonomous execution paused for manual verification."}
+              </span>
+            </div>
+            <button
+              onClick={handleResumeTakeover}
+              className="px-3 py-1 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 font-medium flex items-center gap-1.5 shadow-sm transition"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" /> Resume Autonomous Agent
+            </button>
+          </div>
+        )}
+
+        {/* Actionable Governance Approval Queue Banner */}
+        {pendingApprovals.length > 0 && (
+          <div className="px-6 py-3 bg-[#111111] border-b border-neutral-800 space-y-2">
+            {pendingApprovals.map((req) => (
+              <div
+                key={req.id}
+                className="flex items-center justify-between bg-[#161616] p-3 rounded-xl border border-neutral-700 text-xs"
+              >
+                <div className="flex items-center gap-3 min-w-0 pr-4">
+                  <ShieldAlert className="w-5 h-5 text-neutral-300 flex-shrink-0 animate-pulse" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-neutral-100">Tool Approval Required:</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase font-bold ${
+                          req.risk_level === "destructive"
+                            ? "bg-red-950/60 text-red-300 border border-red-800/60"
+                            : req.risk_level === "moderate"
+                            ? "bg-amber-950/60 text-amber-300 border border-amber-800/60"
+                            : "bg-neutral-800 text-neutral-300 border border-neutral-700"
+                        }`}
+                      >
+                        {req.risk_level} Risk
+                      </span>
+                      <span className="font-mono text-neutral-200 text-[11px]">
+                        {req.tool_name}
+                      </span>
+                    </div>
+                    <p className="text-neutral-300 text-[11px] truncate mt-0.5">{req.summary}</p>
+                    {req.reason && (
+                      <p className="text-neutral-400 text-[10px] italic mt-0.5">
+                        Policy: {req.reason}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <button
+                    onClick={() => handleResolveApproval(req.id, "approved")}
+                    className="px-3 py-1.5 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 font-medium text-xs flex items-center gap-1 shadow-sm transition"
+                  >
+                    <CheckCircle className="w-3.5 h-3.5" /> Approve
+                  </button>
+                  <button
+                    onClick={() => handleResolveApproval(req.id, "denied")}
+                    className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 font-medium text-xs flex items-center gap-1 transition"
+                  >
+                    <XCircle className="w-3.5 h-3.5" /> Deny
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Screen Preview Modal / Bar */}
+        {screenPreview && (
+          <div className="p-3 bg-black/80 border-b border-neutral-800 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <img
+                src={screenPreview}
+                alt="Screenshot"
+                className="h-16 rounded border border-neutral-700 shadow"
+              />
+              <span className="text-xs text-neutral-300">Display Snapshot ready</span>
+            </div>
+            <button
+              onClick={() => setScreenPreview(null)}
+              className="text-xs text-neutral-400 hover:text-white px-2 py-1 transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {/* Set-of-Marks Grounded Preview Bar */}
+        {groundedResult && (
+          <div className="p-3 bg-neutral-900 border-b border-neutral-800 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <img
+                src={`data:image/png;base64,${groundedResult.base64_png}`}
+                alt="Grounded Screenshot"
+                className="h-16 rounded border border-neutral-700 shadow"
+              />
+              <div className="text-xs text-neutral-200">
+                <div className="font-semibold">Set-of-Marks (SoM) Grounding Active</div>
+                <div className="text-[11px] text-neutral-400">
+                  {groundedResult.marks.length} interactive tags calibrated. Model clicks by mark ID with 100% precision.
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={() => setGroundedResult(null)}
+              className="text-xs text-neutral-400 hover:text-white px-2 py-1 transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {/* Message Thread & Live Steps */}
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {messages.length === 0 && liveSteps.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-4">
+              <div className="relative">
+                <div className="w-16 h-16 rounded-2xl bg-[#141414] border border-neutral-800 flex items-center justify-center p-3 shadow-lg">
+                  <KyroLogo className="w-full h-full" />
+                </div>
+                <div className="absolute -bottom-1 -right-1 p-1 rounded-full bg-[#1c1c1c] border border-neutral-700/80 shadow flex items-center justify-center">
+                  <AgentAvatar
+                    avatar={activeBot.avatar}
+                    name={activeBot.name}
+                    className="w-4 h-4 rounded-full bg-transparent flex items-center justify-center text-neutral-200"
+                    iconClassName="w-3 h-3"
+                  />
+                </div>
+              </div>
+              <h2 className="text-lg font-semibold text-neutral-100">
+                Kyro Autonomous Workspace
+              </h2>
+              <p className="text-xs text-neutral-400 leading-relaxed">
+                Powered by <strong>NVIDIA Nemotron-3 Ultra 550B</strong> with native Computer Use, interactive terminal execution, local artifacts, and data sovereignty.
+              </p>
+              <div className="grid grid-cols-2 gap-2 text-left w-full pt-2">
+                <button
+                  onClick={() =>
+                    setPrompt("Open the browser and check the latest Hacker News stories")
+                  }
+                  className="p-2.5 rounded-xl bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 text-[11px] text-neutral-300 transition flex items-center gap-2"
+                >
+                  <Globe className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                  <span>"Open browser and check HN"</span>
+                </button>
+                <button
+                  onClick={() =>
+                    setPrompt("Capture the desktop and identify all open application windows")
+                  }
+                  className="p-2.5 rounded-xl bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 text-[11px] text-neutral-300 transition flex items-center gap-2"
+                >
+                  <Monitor className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                  <span>"Inspect all open windows"</span>
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {messages.map((m) => (
+                <div
+                  key={m.id}
+                  className={`flex flex-col ${
+                    m.role === "user" ? "items-end" : "items-start"
+                  }`}
+                >
+                  <div
+                    className={`max-w-2xl px-4 py-3 rounded-2xl text-sm leading-relaxed ${
+                      m.role === "user"
+                        ? "bg-[#1f1f1f] text-[#ededed] border border-[#2e2e2e] rounded-br-none shadow-sm"
+                        : "bg-[#121212] text-[#ededed] border border-[#262626] rounded-bl-none shadow-sm"
+                    }`}
+                  >
+                    {m.role === "assistant" ? (
+                      <MarkdownRenderer content={m.content} />
+                    ) : (
+                      <div className="whitespace-pre-wrap">{m.content}</div>
+                    )}
+
+                    {/* Actions for assistant messages */}
+                    {m.role === "assistant" && (
+                      <div className="flex items-center justify-between pt-2 mt-2 border-t border-neutral-800 text-xs">
+                        <span className="text-[10px] text-neutral-400 font-mono">
+                          {new Date(m.created_at).toLocaleTimeString()}
+                        </span>
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={() => handleCopyMessage(m.id, m.content)}
+                            className="text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
+                            title="Copy response"
+                          >
+                            {copiedMessageId === m.id ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-neutral-200" />
+                                <span className="text-[10px]">Copied</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span className="text-[10px]">Copy</span>
+                              </>
+                            )}
+                          </button>
+                          <button
+                            onClick={() => handleSpeak(m.id, m.content)}
+                            className="text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
+                            title="Read message aloud (Local TTS)"
+                          >
+                            {speakingMessageId === m.id ? (
+                              <>
+                                <VolumeX className="w-3.5 h-3.5 text-amber-400" />
+                                <span className="text-[10px]">Stop</span>
+                              </>
+                            ) : (
+                              <>
+                                <Volume2 className="w-3.5 h-3.5" />
+                                <span className="text-[10px]">Speak</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {/* Real-time Tool Action Cards & Thoughts */}
+              {liveSteps.map((step) => (
+                <React.Fragment key={step.step}>
+                  {step.thought && (
+                    <div className="flex flex-col items-start my-2 max-w-2xl">
+                      <div className="px-4 py-3 rounded-2xl rounded-bl-none bg-[#121212] text-[#ededed] border border-[#262626] shadow-sm text-sm">
+                        <MarkdownRenderer content={step.thought} />
+                      </div>
+                    </div>
+                  )}
+                  {step.tool_calls.map((tc, idx) => (
+                    <ToolCallCard
+                      key={`${step.step}-${tc.id || idx}`}
+                      toolCall={tc}
+                      result={step.tool_results.find((r) => r.tool_call_id === tc.id)}
+                    />
+                  ))}
+                </React.Fragment>
+              ))}
+
+              {isAgentRunning && (
+                <div className="flex items-center gap-2 text-xs text-neutral-400 font-mono py-1">
+                  <span className="w-2 h-2 rounded-full bg-neutral-400 animate-pulse" />
+                  <span>Kyro is processing...</span>
+                </div>
+              )}
+
+              <div ref={messagesEndRef} />
+            </>
+          )}
+        </div>
+
+        {/* Collapsible Terminal Drawer */}
+        {showTerminal && (
+          <div className="h-64 border-t border-neutral-800 bg-[#0a0a0a] flex flex-col">
+            <div className="px-4 py-1.5 bg-[#141414] border-b border-neutral-800 flex items-center justify-between text-xs text-neutral-400">
+              <span className="flex items-center gap-1.5 font-mono text-[11px]">
+                <Terminal className="w-3.5 h-3.5 text-neutral-400" /> Host Terminal PTY (Interactive ANSI Stream)
+              </span>
+              <button
+                onClick={() => setShowTerminal(false)}
+                className="hover:text-neutral-100 transition-colors"
+              >
+                Close
+              </button>
+            </div>
+            <div className="flex-1 p-2 overflow-hidden">
+              <TerminalView />
+            </div>
+          </div>
+        )}
+
+        {/* Attached File Preview Chip */}
+        {attachedFile && (
+          <div className="px-4 py-1.5 bg-[#141414] border-t border-neutral-800 flex items-center justify-between text-xs text-neutral-200">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-neutral-400" />
+              <span>Attached: <strong>{attachedFile.name}</strong></span>
+            </div>
+            <button
+              onClick={() => setAttachedFile(null)}
+              className="text-neutral-400 hover:text-white transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Input Form with Voice Dictation & Attachments */}
+        <div className="p-4 border-t border-neutral-800 bg-[#0a0a0a]">
+          <form onSubmit={handleSubmit} className="flex items-center gap-2">
+            {/* Hidden File Picker */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileSelect}
+              className="hidden"
+            />
+
+            {/* Attachment Button */}
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="p-3 rounded-xl bg-[#000000] hover:bg-neutral-900 border border-neutral-800 text-neutral-400 hover:text-neutral-200 transition"
+              title="Attach a local text or image file"
+            >
+              <Paperclip className="w-4 h-4" />
+            </button>
+
+            {/* Voice Dictation Button */}
+            <button
+              type="button"
+              onClick={toggleVoiceDictation}
+              className={`p-3 rounded-xl border transition ${
+                isListening
+                  ? "bg-red-950/40 text-red-400 border-red-700/60 animate-pulse"
+                  : "bg-[#000000] hover:bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+              }`}
+              title={isListening ? "Listening... click to stop" : "Voice Dictation (Speech to Text)"}
+            >
+              {isListening ? <Mic className="w-4 h-4 text-red-400 animate-bounce" /> : <MicOff className="w-4 h-4" />}
+            </button>
+
+            <input
+              type="text"
+              placeholder={
+                isListening
+                  ? "Listening to your voice..."
+                  : `Ask @${activeBot.name} to automate a desktop task, run terminal commands, or teach a skill...`
+              }
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              disabled={isAgentRunning}
+              className="flex-1 px-4 py-3 bg-[#000000] border border-neutral-800 rounded-xl text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition"
+            />
+
+            {isAgentRunning ? (
+              <button
+                type="button"
+                onClick={handleAbort}
+                className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-semibold uppercase tracking-wider flex items-center gap-2 shadow-sm transition"
+              >
+                <StopCircle className="w-4 h-4 fill-current" /> Stop
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!prompt.trim() && !attachedFile}
+                className="px-5 py-3 rounded-xl bg-neutral-100 hover:bg-white disabled:opacity-40 text-neutral-950 text-xs font-medium flex items-center gap-2 shadow-sm transition"
+              >
+                <Send className="w-4 h-4" /> Send
+              </button>
+            )}
+          </form>
+        </div>
+      </div>
+
+      {/* Modals & Drawers */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        selectedModel={selectedModel}
+        onSelectModel={setSelectedModel}
+        initialTab={settingsInitialTab}
+      />
+
+      <TeachTaskModal
+        isOpen={isTeachTaskOpen}
+        onClose={() => {
+          setIsTeachTaskOpen(false);
+          setTeachTaskHighlightId(undefined);
+        }}
+        initialTab={teachTaskInitialTab}
+        highlightTaskId={teachTaskHighlightId}
+      />
+
+      <TeammateRosterModal
+        isOpen={isTeammatesOpen}
+        onClose={() => setIsTeammatesOpen(false)}
+        selectedBotId={activeBot.id}
+        onSelectBot={(bot) => {
+          setActiveBot(bot);
+          setIsTeammatesOpen(false);
+        }}
+      />
+
+      <McpModal
+        isOpen={isMcpOpen}
+        onClose={() => setIsMcpOpen(false)}
+      />
+
+      <ConnectionsModal
+        isOpen={isConnectionsOpen}
+        onClose={() => setIsConnectionsOpen(false)}
+      />
+
+      <TimelineDrawer
+        isOpen={isTimelineOpen}
+        onClose={() => setIsTimelineOpen(false)}
+      />
+
+      <ArtifactsModal
+        isOpen={isArtifactsOpen}
+        onClose={() => setIsArtifactsOpen(false)}
+        conversationId={activeConvId || undefined}
+      />
+
+      <CommandPalette
+        isOpen={isCommandPaletteOpen}
+        onClose={() => setIsCommandPaletteOpen(false)}
+        onNewSession={handleNewConversation}
+        onToggleGhost={handleToggleGhostMode}
+        onToggleTerminal={() => setShowTerminal((prev) => !prev)}
+        onOpenTeammates={() => setIsTeammatesOpen(true)}
+        onOpenTeachTask={handleOpenTeachTask}
+        onOpenMcp={() => setIsMcpOpen(true)}
+        onOpenConnections={() => setIsConnectionsOpen(true)}
+        onOpenTimeline={() => setIsTimelineOpen(true)}
+        onOpenArtifacts={() => setIsArtifactsOpen(true)}
+        onOpenSettings={(tab) => {
+          if (tab) setSettingsInitialTab(tab);
+          setIsSettingsOpen(true);
+        }}
+        onSelectConversation={(id) => setActiveConvId(id)}
+        onSelectBot={(bot) => setActiveBot(bot)}
+      />
+    </div>
+  );
+};
