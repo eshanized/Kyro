@@ -1,0 +1,45 @@
+[package]
+name = "kyro"
+version = "0.1.0"
+description = "Kyro - Autonomous Desktop AI Agent"
+authors = ["Kyro Team"]
+edition = "2021"
+
+[lib]
+name = "kyro_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+portable-pty = "0.8"
+enigo = { version = "0.2", features = ["serde"] }
+xcap = "0.2"
+image = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+libc = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"
+futures-util = "0.3"
+regex = "1.10"
+once_cell = "1.19"
+aes-gcm = "0.11.1"
+sha2 = "0.11.1"
+rand = "0.10.3"
+cron = "0.17.0"
+shell-words = "1.1.1"
+keyring = "4.2.0"
