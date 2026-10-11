@@ -27,6 +27,23 @@ impl RoutineScheduler {
         active.contains(id)
     }
 
+    /// Access active routines lock for synchronized lifecycle checks
+    pub fn active_routines_lock() -> std::sync::MutexGuard<'static, HashSet<String>> {
+        ACTIVE_ROUTINE_EXECUTIONS.lock().unwrap()
+    }
+
+    /// Synchronized deletion preventing race conditions with scheduler loop
+    pub fn delete_routine_synchronized(db: &Database, id: &str) -> Result<bool, String> {
+        let active = ACTIVE_ROUTINE_EXECUTIONS.lock().unwrap();
+        if active.contains(id) {
+            return Err(format!(
+                "Cannot delete routine '{}': routine is currently executing. Please wait for execution to complete.",
+                id
+            ));
+        }
+        db.delete_routine(id).map_err(|e| e.to_string())
+    }
+
     /// Mark a routine as actively executing (used for testing lifecycle rules)
     pub fn set_routine_running_for_test(id: &str, running: bool) {
         let mut active = ACTIVE_ROUTINE_EXECUTIONS.lock().unwrap();
@@ -180,6 +197,25 @@ impl RoutineScheduler {
                         // Mark active to enforce overlap prevention
                         {
                             let mut active = ACTIVE_ROUTINE_EXECUTIONS.lock().unwrap();
+                            // Stale snapshot guard: verify routine definition still exists before marking active
+                            match db.get_routine(&r.id) {
+                                Ok(Some(active_def)) => {
+                                    if !active_def.enabled {
+                                        continue;
+                                    }
+                                }
+                                Ok(None) => {
+                                    log::info!(
+                                        "[Scheduler] Routine '{}' was deleted; skipping from stale list snapshot",
+                                        r.id
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    log::error!("[Scheduler] Error verifying routine: {}", e);
+                                    continue;
+                                }
+                            }
                             active.insert(r.id.clone());
                         }
 
@@ -227,6 +263,34 @@ impl RoutineScheduler {
             }
         }
         let _guard = Guard(routine_id);
+
+        // Ensure routine already selected from a stale scheduler snapshot cannot begin execution after deletion
+        match db.get_routine(&routine.id) {
+            Ok(Some(def)) if def.enabled => {}
+            _ => {
+                log::info!(
+                    "[Scheduler] Routine '{}' ({}) was deleted or disabled before execution began; skipping execution",
+                    routine.name,
+                    routine.id
+                );
+                return;
+            }
+        }
+
+        if routine.action_type == "skill" {
+            // Also ensure targeted skill definition was not deleted
+            match db.get_skill(&routine.target_id) {
+                Ok(Some(_)) => {}
+                _ => {
+                    log::info!(
+                        "[Scheduler] Target skill '{}' for routine '{}' was deleted before execution began; skipping execution",
+                        routine.target_id,
+                        routine.name
+                    );
+                    return;
+                }
+            }
+        }
 
         let run_id = format!("run_sched_{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().timestamp_millis();

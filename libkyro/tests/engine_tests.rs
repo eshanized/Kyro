@@ -134,6 +134,8 @@ fn test_vault_migration_and_secure_storage() {
 fn test_durable_agent_runs_and_events() {
     let temp_dir = std::env::temp_dir().join(format!("kyro_runs_test_{}", uuid::Uuid::new_v4()));
     let db = Database::init(temp_dir.clone()).expect("Failed to init db");
+    db.create_conversation("conv_1", "Analysis Task", "nemotron")
+        .unwrap();
 
     let run_id = "test_run_101";
     let run = AgentRun {
@@ -593,6 +595,8 @@ fn test_end_to_end_agent_task_lifecycle_and_recovery() {
     let db = Database::init(temp_dir.clone()).expect("Failed to init db");
 
     // 1. Start Task 1, execute permitted tool, record result
+    db.create_conversation("conv_e2e", "E2E Task", "nemotron")
+        .unwrap();
     let run1_id = "run_e2e_1";
     let run1 = AgentRun {
         id: run1_id.to_string(),
@@ -2400,6 +2404,8 @@ async fn test_end_to_end_agent_turn_with_connector_governance() {
     let conn_mgr = Arc::new(ConnectorManager::new(db.clone(), vault.clone(), local_mcp));
 
     // 1. Create agent run
+    db.create_conversation("conv_1", "Connector Task", "nemotron")
+        .unwrap();
     let run = AgentRun {
         id: "run_connector_e2e".to_string(),
         conversation_id: Some("conv_1".to_string()),
@@ -4137,4 +4143,432 @@ fn test_running_task_lifecycle_guards() {
 
     assert!(!SkillReplayer::is_skill_running(skill_id));
     assert!(!RoutineScheduler::is_routine_running(routine_id));
+}
+
+#[test]
+fn test_conversation_deletion_lifecycle_and_messages_cleanup() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kyro_conv_del_test_{}", uuid::Uuid::new_v4()));
+    let db = Database::init(temp_dir.clone()).expect("Failed to init db");
+
+    let conv_id = "conv_lifecycle_test";
+    db.create_conversation(conv_id, "Analysis Task", "nemotron")
+        .unwrap();
+
+    // Add messages to this conversation
+    for i in 1..=3 {
+        db.add_message(&Message {
+            id: format!("msg_{}_{}", conv_id, i),
+            conversation_id: conv_id.to_string(),
+            role: "user".to_string(),
+            content: format!("Step {} query", i),
+            tool_calls_json: None,
+            observations_json: None,
+            created_at: 1000 + i,
+        })
+        .unwrap();
+    }
+
+    assert!(db.get_conversation(conv_id).unwrap().is_some());
+    assert_eq!(db.get_messages(conv_id).unwrap().len(), 3);
+
+    // 1. Deleting an existing conversation succeeds
+    let deleted = db.delete_conversation(conv_id).unwrap();
+    assert!(
+        deleted,
+        "delete_conversation must return true for existing conversation"
+    );
+
+    // 2. Its messages are removed
+    assert!(db.get_conversation(conv_id).unwrap().is_none());
+    assert!(db.get_messages(conv_id).unwrap().is_empty());
+
+    // 3. Deleting an unknown ID returns documented not-found result (false)
+    let unknown_del = db.delete_conversation("conv_nonexistent_xyz").unwrap();
+    assert!(
+        !unknown_del,
+        "Deleting non-existent conversation returns false"
+    );
+
+    // 4. Repeated deletion is safe and idempotent (returns false)
+    let repeat_del = db.delete_conversation(conv_id).unwrap();
+    assert!(!repeat_del, "Repeated deletion must return false safely");
+
+    // Empty or whitespace ID is rejected
+    assert!(db.delete_conversation("").is_err());
+    assert!(db.delete_conversation("   ").is_err());
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+#[test]
+fn test_conversation_deletion_persistence_across_restart() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kyro_conv_restart_del_{}", uuid::Uuid::new_v4()));
+
+    // Phase 1: Create conversations, delete one, verify in memory
+    {
+        let db = Database::init(temp_dir.clone()).expect("Failed to init db");
+        let del_id = "conv_to_delete";
+        let keep_id = "conv_to_keep";
+
+        db.create_conversation(del_id, "Temporary Session", "nemotron")
+            .unwrap();
+        db.create_conversation(keep_id, "Important Session", "nemotron")
+            .unwrap();
+
+        db.add_message(&Message {
+            id: "msg_temp_1".to_string(),
+            conversation_id: del_id.to_string(),
+            role: "user".to_string(),
+            content: "Temp message".to_string(),
+            tool_calls_json: None,
+            observations_json: None,
+            created_at: 1000,
+        })
+        .unwrap();
+
+        db.add_message(&Message {
+            id: "msg_keep_1".to_string(),
+            conversation_id: keep_id.to_string(),
+            role: "user".to_string(),
+            content: "Important message".to_string(),
+            tool_calls_json: None,
+            observations_json: None,
+            created_at: 1000,
+        })
+        .unwrap();
+
+        assert!(db.delete_conversation(del_id).unwrap());
+        assert!(db.get_conversation(del_id).unwrap().is_none());
+        assert!(db.get_messages(del_id).unwrap().is_empty());
+    }
+
+    // Phase 2: Reopen database from disk and verify deletion persisted
+    {
+        let db = Database::init(temp_dir.clone()).expect("Failed to re-open db");
+        assert!(
+            db.get_conversation("conv_to_delete").unwrap().is_none(),
+            "Deleted conversation must not reappear after restart"
+        );
+        assert!(
+            db.get_messages("conv_to_delete").unwrap().is_empty(),
+            "Messages of deleted conversation must not reappear after restart"
+        );
+
+        // Verify surviving session remained intact
+        let kept = db.get_conversation("conv_to_keep").unwrap();
+        assert!(kept.is_some());
+        assert_eq!(kept.unwrap().title, "Important Session");
+        let kept_msgs = db.get_messages("conv_to_keep").unwrap();
+        assert_eq!(kept_msgs.len(), 1);
+        assert_eq!(kept_msgs[0].content, "Important message");
+    }
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+#[test]
+fn test_conversation_deletion_preserves_runs_artifacts_and_unrelated_data() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kyro_conv_pres_test_{}", uuid::Uuid::new_v4()));
+    let db = Database::init(temp_dir.clone()).expect("Failed to init db");
+
+    let conv_id = "conv_with_history";
+    db.create_conversation(conv_id, "Historical Session", "nemotron")
+        .unwrap();
+
+    let unrelated_conv = "conv_unrelated_active";
+    db.create_conversation(unrelated_conv, "Unrelated Session", "nemotron")
+        .unwrap();
+
+    // 1. Historical agent run referencing the conversation
+    let run_id = "run_historical_101";
+    let run = AgentRun {
+        id: run_id.to_string(),
+        conversation_id: Some(conv_id.to_string()),
+        agent_id: "apex-orchestrator".to_string(),
+        model: "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
+        prompt: "Historical analysis step".to_string(),
+        status: "succeeded".to_string(),
+        created_at: 1000,
+        started_at: Some(1000),
+        completed_at: Some(1500),
+        error: None,
+        config_json: Some("{\"mode\":\"batch\"}".to_string()),
+        parent_run_id: None,
+    };
+    db.create_run(&run).unwrap();
+
+    // Add run event
+    db.append_run_event(&RunEvent {
+        id: "evt_101".to_string(),
+        run_id: run_id.to_string(),
+        seq: 1,
+        event_type: "turn_complete".to_string(),
+        payload_json: "{\"status\":\"ok\"}".to_string(),
+        created_at: 1500,
+    })
+    .unwrap();
+
+    // 2. Registered artifact associated with the conversation and a file on disk
+    let art_file_path = temp_dir.join("summary_report.md");
+    std::fs::write(&art_file_path, "# Executive Summary\nContent preserved.").unwrap();
+
+    let art_id = "art_report_101";
+    db.create_artifact(&ArtifactRecord {
+        id: art_id.to_string(),
+        run_id: Some(run_id.to_string()),
+        conversation_id: Some(conv_id.to_string()),
+        name: "summary_report.md".to_string(),
+        file_path: art_file_path.to_string_lossy().to_string(),
+        artifact_type: "markdown".to_string(),
+        mime_type: "text/markdown".to_string(),
+        size_bytes: 42,
+        created_at: 1200,
+        metadata_json: None,
+    })
+    .unwrap();
+
+    // 3. Unrelated skill and routine
+    db.create_skill(&SkillRecord {
+        id: "skill_unrelated".to_string(),
+        name: "Unrelated Task".to_string(),
+        description: "Should not be touched".to_string(),
+        steps_json: "[]".to_string(),
+        created_at: 1000,
+    })
+    .unwrap();
+
+    db.create_routine(&RoutineRecord {
+        id: "routine_unrelated".to_string(),
+        name: "Unrelated Routine".to_string(),
+        cron_expression: "0 0 * * *".to_string(),
+        action_type: "prompt".to_string(),
+        target_id: "Check disk".to_string(),
+        enabled: true,
+        last_run: None,
+        next_run: Some(2000),
+    })
+    .unwrap();
+
+    // Perform deletion of conv_id
+    assert!(db.delete_conversation(conv_id).unwrap());
+    assert!(db.get_conversation(conv_id).unwrap().is_none());
+
+    // Verify historical agent run is completely preserved, but detached (conversation_id = None)
+    let fetched_run = db.get_run(run_id).unwrap();
+    assert!(
+        fetched_run.is_some(),
+        "Historical agent run must be preserved"
+    );
+    let unwrapped_run = fetched_run.unwrap();
+    assert_eq!(unwrapped_run.id, run_id);
+    assert_eq!(
+        unwrapped_run.conversation_id, None,
+        "Run must be detached from deleted conversation"
+    );
+    assert_eq!(unwrapped_run.status, "succeeded");
+    assert_eq!(unwrapped_run.prompt, "Historical analysis step");
+    assert_eq!(
+        unwrapped_run.config_json,
+        Some("{\"mode\":\"batch\"}".to_string())
+    );
+
+    // Verify run event is preserved
+    let events = db.get_run_events(run_id, None).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "evt_101");
+
+    // Verify artifact record is preserved and detached
+    let fetched_art = db.get_artifact(art_id).unwrap();
+    assert!(fetched_art.is_some(), "Artifact record must be preserved");
+    let unwrapped_art = fetched_art.unwrap();
+    assert_eq!(unwrapped_art.name, "summary_report.md");
+    assert_eq!(
+        unwrapped_art.conversation_id, None,
+        "Artifact conversation_id must be cleared"
+    );
+    assert_eq!(unwrapped_art.run_id, Some(run_id.to_string()));
+
+    // Verify artifact file on disk is preserved with exact content
+    assert!(
+        art_file_path.exists(),
+        "Artifact file on disk must be preserved"
+    );
+    let disk_content = std::fs::read_to_string(&art_file_path).unwrap();
+    assert_eq!(disk_content, "# Executive Summary\nContent preserved.");
+
+    // Verify unrelated data remains intact
+    assert!(db.get_conversation(unrelated_conv).unwrap().is_some());
+    assert!(db.get_skill("skill_unrelated").unwrap().is_some());
+    assert!(db.get_routine("routine_unrelated").unwrap().is_some());
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+#[test]
+fn test_conversation_deletion_active_run_guards() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kyro_conv_active_guard_{}", uuid::Uuid::new_v4()));
+    let db = Database::init(temp_dir.clone()).expect("Failed to init db");
+
+    // Case 1: Running task
+    let conv1 = "conv_running_guard";
+    db.create_conversation(conv1, "Running Task Session", "nemotron")
+        .unwrap();
+    let run1 = AgentRun {
+        id: "run_running_1".to_string(),
+        conversation_id: Some(conv1.to_string()),
+        agent_id: "apex".to_string(),
+        model: "nemotron".to_string(),
+        prompt: "Active command".to_string(),
+        status: "running".to_string(),
+        created_at: 1000,
+        started_at: Some(1000),
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    db.create_run(&run1).unwrap();
+
+    let err1 = db.delete_conversation(conv1).unwrap_err();
+    let err_str1 = err1.to_string();
+    assert!(
+        err_str1.contains("active task in progress") && err_str1.contains("finish or be stopped"),
+        "Error message must be actionable: {}",
+        err_str1
+    );
+    assert!(
+        db.get_conversation(conv1).unwrap().is_some(),
+        "Conversation must not be deleted"
+    );
+
+    // Case 2: Queued task
+    let conv2 = "conv_queued_guard";
+    db.create_conversation(conv2, "Queued Task Session", "nemotron")
+        .unwrap();
+    let run2 = AgentRun {
+        id: "run_queued_1".to_string(),
+        conversation_id: Some(conv2.to_string()),
+        agent_id: "apex".to_string(),
+        model: "nemotron".to_string(),
+        prompt: "Queued command".to_string(),
+        status: "queued".to_string(),
+        created_at: 1000,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    db.create_run(&run2).unwrap();
+
+    let err2 = db.delete_conversation(conv2).unwrap_err();
+    assert!(err2.to_string().contains("active task in progress"));
+    assert!(db.get_conversation(conv2).unwrap().is_some());
+
+    // Case 3: Waiting Approval task
+    let conv3 = "conv_approval_guard";
+    db.create_conversation(conv3, "Approval Task Session", "nemotron")
+        .unwrap();
+    let run3 = AgentRun {
+        id: "run_approval_1".to_string(),
+        conversation_id: Some(conv3.to_string()),
+        agent_id: "apex".to_string(),
+        model: "nemotron".to_string(),
+        prompt: "Approval needed".to_string(),
+        status: "waiting_approval".to_string(),
+        created_at: 1000,
+        started_at: Some(1000),
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    db.create_run(&run3).unwrap();
+
+    let err3 = db.delete_conversation(conv3).unwrap_err();
+    assert!(err3.to_string().contains("active task in progress"));
+    assert!(db.get_conversation(conv3).unwrap().is_some());
+
+    // Terminal state allows safe deletion
+    db.update_run_status(
+        "run_approval_1",
+        "cancelled",
+        None,
+        Some(2000),
+        Some("User cancelled"),
+    )
+    .unwrap();
+    assert!(
+        db.delete_conversation(conv3).unwrap(),
+        "Terminal run state permits conversation deletion"
+    );
+    assert!(db.get_conversation(conv3).unwrap().is_none());
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+#[test]
+fn test_conversation_deletion_concurrency_and_lifecycle_consistency() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kyro_conv_race_guard_{}", uuid::Uuid::new_v4()));
+    let db = Database::init(temp_dir.clone()).expect("Failed to init db");
+
+    let conv_id = "conv_race_test";
+    db.create_conversation(conv_id, "Concurrency Test Session", "nemotron")
+        .unwrap();
+
+    let db_clone1 = db.clone();
+    let db_clone2 = db.clone();
+
+    // Concurrent thread 1: attempts to delete conversation
+    let h1 = std::thread::spawn(move || db_clone1.delete_conversation(conv_id));
+
+    // Concurrent thread 2: attempts to create an active run for the conversation
+    let h2 = std::thread::spawn(move || {
+        let run = AgentRun {
+            id: format!("run_race_{}", uuid::Uuid::new_v4()),
+            conversation_id: Some(conv_id.to_string()),
+            agent_id: "apex".to_string(),
+            model: "nemotron".to_string(),
+            prompt: "Concurrent action".to_string(),
+            status: "running".to_string(),
+            created_at: 1000,
+            started_at: Some(1000),
+            completed_at: None,
+            error: None,
+            config_json: None,
+            parent_run_id: None,
+        };
+        db_clone2.create_run(&run)
+    });
+
+    let res1 = h1.join().unwrap();
+    let res2 = h2.join().unwrap();
+
+    // In all execution orderings, data integrity must be maintained:
+    // If run creation ran first, res2 is Ok(()) and delete returned Err(active run)
+    // If delete ran first, delete returned Ok(true) and res2 is Err(conversation was deleted)
+    if res1.as_ref().copied().unwrap_or(false) {
+        // Conversation was deleted first
+        assert!(db.get_conversation(conv_id).unwrap().is_none());
+        // Run creation for deleted conversation must have failed
+        assert!(
+            res2.is_err(),
+            "Cannot create an active run referencing a deleted conversation"
+        );
+    } else {
+        // Active run was created first
+        assert!(res2.is_ok(), "Run creation succeeded first");
+        assert!(
+            res1.is_err(),
+            "Deletion must be rejected when active run is running"
+        );
+        assert!(db.get_conversation(conv_id).unwrap().is_some());
+    }
+
+    std::fs::remove_dir_all(temp_dir).ok();
 }

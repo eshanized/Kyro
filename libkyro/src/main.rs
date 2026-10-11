@@ -54,6 +54,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_conversations,
             create_conversation,
+            delete_conversation,
             get_messages,
             add_message,
             get_api_keys,

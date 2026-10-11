@@ -715,6 +715,90 @@ impl Database {
         Ok(list)
     }
 
+    pub fn get_conversation(&self, id: &str) -> Result<Option<Conversation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, title, model, created_at FROM conversations WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                model: row.get(2)?,
+                created_at: row.get(3)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_conversation(&self, id: &str) -> Result<bool> {
+        let id_trimmed = id.trim();
+        if id_trimmed.is_empty() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other("Invalid session identifier: ID cannot be empty"),
+            )));
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // 1. Verify existence before starting mutation
+        {
+            let mut check_stmt = tx.prepare("SELECT 1 FROM conversations WHERE id = ?1")?;
+            if !check_stmt.exists(params![id_trimmed])? {
+                return Ok(false);
+            }
+        }
+
+        // 2. Reject deletion if conversation has an active run (queued, running, waiting_approval)
+        {
+            let mut active_stmt = tx.prepare(
+                "SELECT COUNT(*) FROM agent_runs 
+                 WHERE conversation_id = ?1 
+                   AND status IN ('queued', 'running', 'waiting_approval')",
+            )?;
+            let active_count: i64 = active_stmt.query_row(params![id_trimmed], |row| row.get(0))?;
+            if active_count > 0 {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(format!(
+                        "Cannot delete session: conversation '{}' has an active task in progress. The task must finish or be stopped before the session can be deleted.",
+                        id_trimmed
+                    )),
+                )));
+            }
+        }
+
+        // 3. Atomically perform deletion and association cleanup within the transaction
+        // Detach historical agent runs: keep execution history and events, detach conversation link
+        tx.execute(
+            "UPDATE agent_runs SET conversation_id = NULL WHERE conversation_id = ?1",
+            params![id_trimmed],
+        )?;
+
+        // Preserve artifacts and files: clear conversation association
+        tx.execute(
+            "UPDATE artifacts SET conversation_id = NULL WHERE conversation_id = ?1",
+            params![id_trimmed],
+        )?;
+
+        // Remove conversation messages (reliably removes associated messages)
+        tx.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![id_trimmed],
+        )?;
+
+        // Delete conversation definition
+        let count = tx.execute(
+            "DELETE FROM conversations WHERE id = ?1",
+            params![id_trimmed],
+        )?;
+
+        tx.commit()?;
+
+        Ok(count > 0)
+    }
+
     pub fn add_message(&self, msg: &Message) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -841,6 +925,23 @@ impl Database {
     // Agent Runs
     pub fn create_run(&self, run: &AgentRun) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+
+        // Lifecycle guard: reject creating an active run for a deleted or non-existent conversation
+        if let Some(ref conv_id) = run.conversation_id {
+            if run.status == "running" || run.status == "queued" || run.status == "waiting_approval"
+            {
+                let mut stmt = conn.prepare("SELECT 1 FROM conversations WHERE id = ?1")?;
+                if !stmt.exists(params![conv_id])? {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other(format!(
+                            "Cannot create active run: conversation '{}' not found or was deleted",
+                            conv_id
+                        )),
+                    )));
+                }
+            }
+        }
+
         conn.execute(
             "INSERT INTO agent_runs (id, conversation_id, agent_id, model, prompt, status, created_at, started_at, completed_at, error, config_json, parent_run_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -871,6 +972,27 @@ impl Database {
         error: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+
+        // Lifecycle guard: reject transitioning to active state if parent conversation was deleted
+        if status == "running" || status == "queued" || status == "waiting_approval" {
+            let mut stmt = conn.prepare("SELECT conversation_id FROM agent_runs WHERE id = ?1")?;
+            let mut rows = stmt.query(params![id])?;
+            if let Some(row) = rows.next()? {
+                let conv_id: Option<String> = row.get(0)?;
+                if let Some(ref cid) = conv_id {
+                    let mut c_stmt = conn.prepare("SELECT 1 FROM conversations WHERE id = ?1")?;
+                    if !c_stmt.exists(params![cid])? {
+                        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                            std::io::Error::other(format!(
+                                "Cannot transition run to active: conversation '{}' was deleted",
+                                cid
+                            )),
+                        )));
+                    }
+                }
+            }
+        }
+
         conn.execute(
             "UPDATE agent_runs
              SET status = ?1,

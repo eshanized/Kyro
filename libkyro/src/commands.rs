@@ -55,6 +55,23 @@ pub fn create_conversation(
 }
 
 #[tauri::command]
+pub fn delete_conversation(state: State<AppState>, id: String) -> Result<bool, String> {
+    let id_trimmed = id.trim();
+    if id_trimmed.is_empty() {
+        return Err("Invalid session identifier: ID cannot be empty".to_string());
+    }
+
+    state.db.delete_conversation(id_trimmed).map_err(|e| {
+        let err_str = e.to_string();
+        if let Some(pos) = err_str.find("Cannot delete") {
+            err_str[pos..].to_string()
+        } else {
+            err_str
+        }
+    })
+}
+
+#[tauri::command]
 pub fn get_messages(
     state: State<AppState>,
     conversation_id: String,
@@ -334,28 +351,14 @@ pub fn delete_skill(state: State<AppState>, id: String) -> Result<bool, String> 
         return Err("Invalid task identifier: ID cannot be empty".to_string());
     }
 
-    // 1. Safe lifecycle check: is skill currently executing?
-    if SkillReplayer::is_skill_running(id_trimmed) {
-        return Err(format!(
-            "Cannot delete task '{}': task is currently executing. Please wait for execution to complete.",
-            id_trimmed
-        ));
-    }
+    // Fail closed if retrieving associated routines fails
+    let routines = state
+        .db
+        .get_routines_for_target(id_trimmed)
+        .map_err(|e| e.to_string())?;
 
-    // 2. Safe lifecycle check: are any associated routines currently executing?
-    if let Ok(routines) = state.db.get_routines_for_target(id_trimmed) {
-        for r in routines {
-            if RoutineScheduler::is_routine_running(&r.id) {
-                return Err(format!(
-                    "Cannot delete task '{}': associated scheduled routine '{}' is currently executing. Please wait for execution to complete.",
-                    id_trimmed, r.name
-                ));
-            }
-        }
-    }
-
-    // 3. Perform deletion with cascade cleanup of associated routines in persistent storage
-    state.db.delete_skill(id_trimmed).map_err(|e| e.to_string())
+    // Perform synchronized deletion protecting against concurrent execution dispatch
+    SkillReplayer::delete_skill_synchronized(&state.db, id_trimmed, &routines)
 }
 
 #[tauri::command]
@@ -379,19 +382,8 @@ pub fn delete_routine(state: State<AppState>, id: String) -> Result<bool, String
         return Err("Invalid routine identifier: ID cannot be empty".to_string());
     }
 
-    // 1. Safe lifecycle check: is routine currently executing?
-    if RoutineScheduler::is_routine_running(id_trimmed) {
-        return Err(format!(
-            "Cannot delete routine '{}': routine is currently executing. Please wait for execution to complete or cancel the active run.",
-            id_trimmed
-        ));
-    }
-
-    // 2. Perform deletion from persistent storage
-    state
-        .db
-        .delete_routine(id_trimmed)
-        .map_err(|e| e.to_string())
+    // Perform synchronized deletion protecting against concurrent execution dispatch
+    RoutineScheduler::delete_routine_synchronized(&state.db, id_trimmed)
 }
 
 // Multi-Bot Roster

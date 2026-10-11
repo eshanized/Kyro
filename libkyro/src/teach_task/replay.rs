@@ -31,6 +31,34 @@ impl SkillReplayer {
         }
     }
 
+    /// Synchronized deletion preventing race conditions with concurrent execution dispatches
+    pub fn delete_skill_synchronized(
+        db: &Database,
+        id: &str,
+        associated_routines: &[crate::storage::RoutineRecord],
+    ) -> Result<bool, String> {
+        let active_skills = ACTIVE_SKILL_EXECUTIONS.lock().unwrap();
+        if active_skills.contains(id) {
+            return Err(format!(
+                "Cannot delete task '{}': task is currently executing. Please wait for execution to complete.",
+                id
+            ));
+        }
+
+        let active_routines =
+            crate::teach_task::scheduler::RoutineScheduler::active_routines_lock();
+        for r in associated_routines {
+            if active_routines.contains(&r.id) {
+                return Err(format!(
+                    "Cannot delete task '{}': associated scheduled routine '{}' is currently executing. Please wait for execution to complete.",
+                    id, r.name
+                ));
+            }
+        }
+
+        db.delete_skill(id).map_err(|e| e.to_string())
+    }
+
     pub async fn execute<F>(
         skill: &Skill,
         db: Option<&Database>,
@@ -40,6 +68,19 @@ impl SkillReplayer {
     where
         F: FnMut(usize, usize, String),
     {
+        if let Some(d) = db {
+            match d.get_skill(&skill.id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(format!(
+                        "Cannot replay task '{}': task definition was deleted",
+                        skill.id
+                    ))
+                }
+                Err(e) => return Err(format!("Failed to verify task definition: {}", e)),
+            }
+        }
+
         {
             let mut active = ACTIVE_SKILL_EXECUTIONS.lock().unwrap();
             active.insert(skill.id.clone());

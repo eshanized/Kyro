@@ -59,6 +59,7 @@ import {
   Plug,
   Copy,
   Check,
+  Trash2,
 } from "lucide-react";
 
 export const App: React.FC = () => {
@@ -68,6 +69,11 @@ export const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [prompt, setPrompt] = useState("");
   const [selectedModel, setSelectedModel] = useState("nvidia/nemotron-3-ultra-550b-a55b");
+
+  // Session Deletion State
+  const [sessionToDelete, setSessionToDelete] = useState<Conversation | null>(null);
+  const [isDeletingSession, setIsDeletingSession] = useState(false);
+  const [sessionDeleteError, setSessionDeleteError] = useState<string | null>(null);
 
   // Modals & Drawers
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -202,8 +208,22 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (activeConvId) {
       loadMessages(activeConvId);
+    } else {
+      setMessages([]);
+      setLiveSteps([]);
     }
   }, [activeConvId]);
+
+  useEffect(() => {
+    if (!sessionToDelete) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isDeletingSession) {
+        handleCancelDeleteSession();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [sessionToDelete, isDeletingSession]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -234,11 +254,81 @@ export const App: React.FC = () => {
     try {
       const list = await invoke<Conversation[]>("list_conversations");
       setConversations(list);
-      if (list.length > 0 && !activeConvId) {
+      const currentId = activeConvIdRef.current;
+      if (list.length === 0) {
+        setActiveConvId(null);
+        setMessages([]);
+        setLiveSteps([]);
+      } else if (!currentId || !list.some((c) => c.id === currentId)) {
         setActiveConvId(list[0].id);
       }
     } catch (err) {
       console.error("Failed to load conversations:", err);
+    }
+  };
+
+  const handlePromptDeleteSession = (conv: Conversation) => {
+    setSessionToDelete(conv);
+    setSessionDeleteError(null);
+  };
+
+  const handleCancelDeleteSession = () => {
+    if (isDeletingSession) return;
+    setSessionToDelete(null);
+    setSessionDeleteError(null);
+  };
+
+  const handleConfirmDeleteSession = async () => {
+    if (!sessionToDelete || isDeletingSession) return;
+
+    setIsDeletingSession(true);
+    setSessionDeleteError(null);
+
+    const targetId = sessionToDelete.id;
+    const wasActive = activeConvId === targetId;
+
+    try {
+      const success = await invoke<boolean>("delete_conversation", { id: targetId });
+      if (!success) {
+        setSessionDeleteError("Session not found or already deleted.");
+        await loadConversations();
+        return;
+      }
+
+      // Reconcile list from persistent storage
+      const updatedList = await invoke<Conversation[]>("list_conversations");
+      setConversations(updatedList);
+
+      if (wasActive) {
+        if (updatedList.length > 0) {
+          const nextId = updatedList[0].id;
+          setActiveConvId(nextId);
+          await loadMessages(nextId);
+        } else {
+          setActiveConvId(null);
+          setMessages([]);
+          setLiveSteps([]);
+        }
+      } else {
+        if (!updatedList.some((c) => c.id === activeConvIdRef.current)) {
+          if (updatedList.length > 0) {
+            const nextId = updatedList[0].id;
+            setActiveConvId(nextId);
+            await loadMessages(nextId);
+          } else {
+            setActiveConvId(null);
+            setMessages([]);
+            setLiveSteps([]);
+          }
+        }
+      }
+
+      setSessionToDelete(null);
+    } catch (err: any) {
+      const msg = typeof err === "string" ? err : err?.message || "Failed to delete session.";
+      setSessionDeleteError(msg);
+    } finally {
+      setIsDeletingSession(false);
     }
   };
 
@@ -658,13 +748,26 @@ export const App: React.FC = () => {
               <div
                 key={c.id}
                 onClick={() => setActiveConvId(c.id)}
-                className={`px-3 py-2 rounded-lg text-xs cursor-pointer truncate transition flex items-center justify-between ${
+                className={`group px-3 py-2 rounded-lg text-xs cursor-pointer truncate transition flex items-center justify-between ${
                   activeConvId === c.id
                     ? "bg-neutral-800 text-neutral-100 border border-neutral-700 font-medium"
                     : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200 border border-transparent"
                 }`}
               >
                 <span className="truncate">{c.title}</span>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handlePromptDeleteSession(c);
+                  }}
+                  title="Delete session"
+                  aria-label="Delete session"
+                  data-testid={`delete-session-button-${c.id}`}
+                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1 text-neutral-400 hover:text-red-400 rounded transition shrink-0 ml-2"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
               </div>
             ))}
           </div>
@@ -1229,6 +1332,73 @@ export const App: React.FC = () => {
         onSelectConversation={(id) => setActiveConvId(id)}
         onSelectBot={(bot) => setActiveBot(bot)}
       />
+
+      {/* Confirmation Dialog for Session Deletion */}
+      {sessionToDelete && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div
+            className="w-full max-w-md bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-session-dialog-title"
+          >
+            <div className="flex items-center justify-between border-b border-[#262626] pb-3">
+              <h3
+                id="delete-session-dialog-title"
+                className="text-base font-semibold text-neutral-100"
+              >
+                Delete session?
+              </h3>
+              <button
+                type="button"
+                onClick={handleCancelDeleteSession}
+                disabled={isDeletingSession}
+                className="p-1 text-neutral-400 hover:text-neutral-100 rounded-lg disabled:opacity-50 transition"
+                aria-label="Cancel deletion"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="text-xs text-neutral-300 leading-relaxed space-y-2">
+              <p>
+                Are you sure you want to delete &ldquo;{sessionToDelete.title}&rdquo;? Its conversation messages will be permanently deleted. This action cannot be undone.
+              </p>
+            </div>
+
+            {sessionDeleteError && (
+              <div
+                role="alert"
+                className="p-3 bg-red-950/40 border border-red-500/40 rounded-xl text-xs text-red-300 flex items-center gap-2"
+              >
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                <span>{sessionDeleteError}</span>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={handleCancelDeleteSession}
+                disabled={isDeletingSession}
+                data-testid="cancel-delete-session-button"
+                className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 rounded-xl text-xs font-medium transition disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteSession}
+                disabled={isDeletingSession}
+                data-testid="confirm-delete-session-button"
+                className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition shadow disabled:opacity-50"
+              >
+                {isDeletingSession ? "Deleting..." : "Delete session"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
