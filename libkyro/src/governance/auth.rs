@@ -1,5 +1,7 @@
 use crate::execution::permissions::RiskLevel;
 use crate::governance::policy::{GovernancePolicy, PolicyEngine};
+use crate::governance::shell_lexer::lex;
+use crate::governance::shell_policy::{is_protected_path, policy_for, PathArgPolicy};
 use crate::governance::takeover::TakeoverController;
 use crate::sandbox::DockerSandbox;
 use crate::storage::{ApprovalRequest, Database};
@@ -41,10 +43,30 @@ pub enum AuthDecision {
     },
 }
 
+/// The result of analysing a shell command.
+///
+/// `argv` is the *exact* argument vector that will be executed when the
+/// decision is `Allow`.  When `requires_shell` is `true` the command needs
+/// real shell semantics and must be executed through `sh -c` behind an
+/// approval; in that case `argv` is `None`.
+#[derive(Debug, Clone)]
+pub struct ShellAnalysis {
+    pub decision: AuthDecision,
+    pub argv: Option<Vec<String>>,
+    pub requires_shell: bool,
+    pub lexed_words: Vec<String>,
+}
+
 pub struct AuthorizationEngine;
 
 impl AuthorizationEngine {
-    /// Safe read-only executables permitted for SafeAutoApprove shell mode
+    /// Executables that are safe to auto-approve *as a name only*.
+    ///
+    /// Deprecated: this list is retained for backwards compatibility with the
+    /// settings UI, but it is **no longer used for authorisation**.  Argument
+    /// policies live in `governance::shell_policy`; a command is only
+    /// auto-approved when its executable, its flags and its path arguments all
+    /// satisfy that policy.
     pub const SAFE_COMMANDS: &'static [&'static str] = &[
         "ls",
         "dir",
@@ -295,7 +317,9 @@ impl AuthorizationEngine {
         }
 
         match tool_name {
-            "execute_shell" | "bash" | "terminal" => Self::evaluate_shell(&policy, args),
+            "execute_shell" | "bash" | "terminal" => {
+                Self::evaluate_shell_in_context(&policy, ctx, args)
+            }
             "read_file" => Self::evaluate_file_read(ctx, args),
             "write_file" => Self::evaluate_file_write(ctx, args),
             "create_artifact" => Self::evaluate_create_artifact(ctx, args),
@@ -313,11 +337,40 @@ impl AuthorizationEngine {
 
     /// Evaluates shell command according to shell_mode policy
     pub fn evaluate_shell(policy: &GovernancePolicy, args: &serde_json::Value) -> AuthDecision {
+        Self::analyze_shell_command(policy, None, args).decision
+    }
+
+    /// Evaluates a shell command with access to the workspace root so that
+    /// path arguments can be constrained to the authorised working directory.
+    pub fn evaluate_shell_in_context(
+        policy: &GovernancePolicy,
+        ctx: &ExecutionContext,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        Self::analyze_shell_command(policy, ctx.workspace_root.as_deref(), args).decision
+    }
+
+    /// Analyses a shell command string against the configured shell policy.
+    ///
+    /// The analysis is deliberately argument-aware: the executable name alone
+    /// is never sufficient for auto-approval.  Every flag is checked against
+    /// the executable's policy and every path-like argument is checked against
+    /// the protected-location list and the workspace boundary.
+    pub fn analyze_shell_command(
+        policy: &GovernancePolicy,
+        workspace_root: Option<&Path>,
+        args: &serde_json::Value,
+    ) -> ShellAnalysis {
         let cmd = match args["command"].as_str() {
             Some(c) if !c.trim().is_empty() => c.trim(),
             _ => {
-                return AuthDecision::Deny {
-                    reason: "Missing or empty shell command argument".into(),
+                return ShellAnalysis {
+                    decision: AuthDecision::Deny {
+                        reason: "Missing or empty shell command argument".into(),
+                    },
+                    argv: None,
+                    requires_shell: false,
+                    lexed_words: Vec::new(),
                 }
             }
         };
@@ -328,191 +381,420 @@ impl AuthorizationEngine {
         if policy.shell_mode == "SandboxOnly" || requested_sandbox {
             let sandbox_status = DockerSandbox::probe();
             if !sandbox_status.available {
-                return AuthDecision::Deny {
-                    reason: format!(
-                        "Sandbox execution required by policy ({}), but container engine is unavailable: {}",
-                        policy.shell_mode, sandbox_status.message
-                    ),
+                return ShellAnalysis {
+                    decision: AuthDecision::Deny {
+                        reason: format!(
+                            "Sandbox execution required by policy ({}), but container engine is unavailable: {}",
+                            policy.shell_mode, sandbox_status.message
+                        ),
+                    },
+                    argv: None,
+                    requires_shell: true,
+                    lexed_words: Vec::new(),
                 };
             }
-            return AuthDecision::AllowSandboxOnly {
-                image: "alpine:latest".to_string(),
+            return ShellAnalysis {
+                decision: AuthDecision::AllowSandboxOnly {
+                    image: "alpine:latest".to_string(),
+                },
+                argv: None,
+                requires_shell: true,
+                lexed_words: Vec::new(),
             };
         }
 
         // AskAlways mode
         if policy.shell_mode == "AskAlways" {
-            return AuthDecision::RequireApproval {
-                reason: "Policy 'AskAlways' requires confirmation for all shell execution"
-                    .to_string(),
-                risk: RiskLevel::Moderate,
-                summary: format!("Execute shell command: '{}'", cmd),
-            };
-        }
-
-        // SafeAutoApprove mode: Conservative parser
-        // 1. Multiline input protection: Newlines are strictly prohibited from auto-approval
-        if cmd.contains('\n') || cmd.contains('\r') {
-            return AuthDecision::RequireApproval {
-                reason: "Multiline commands require explicit approval".to_string(),
-                risk: RiskLevel::Moderate,
-                summary: format!("Execute multiline shell command:\n{}", cmd),
-            };
-        }
-
-        // 2. Reject shell operators, redirs, pipes, substitutions, chained commands
-        let has_complex_operators = cmd.contains('|')
-            || cmd.contains('&')
-            || cmd.contains(';')
-            || cmd.contains('>')
-            || cmd.contains('<')
-            || cmd.contains('`')
-            || cmd.contains("$(")
-            || cmd.contains("${")
-            || cmd.contains("||")
-            || cmd.contains("&&")
-            || cmd.contains('\\');
-
-        if has_complex_operators {
-            return AuthDecision::RequireApproval {
-                reason: "Command contains shell operators, pipelines, substitutions, or chained execution".to_string(),
-                risk: RiskLevel::Moderate,
-                summary: format!("Run complex command: '{}'", cmd),
-            };
-        }
-
-        // Tokenize using shell-words
-        let words = match shell_words::split(cmd) {
-            Ok(w) if !w.is_empty() => w,
-            _ => {
-                return AuthDecision::RequireApproval {
-                    reason: "Failed to parse command arguments safely".to_string(),
+            return ShellAnalysis {
+                decision: AuthDecision::RequireApproval {
+                    reason: "Policy 'AskAlways' requires confirmation for all shell execution"
+                        .to_string(),
                     risk: RiskLevel::Moderate,
-                    summary: format!("Run unparsed shell command: '{}'", cmd),
+                    summary: format!("Execute shell command: '{}'", cmd),
+                },
+                argv: None,
+                requires_shell: true,
+                lexed_words: Vec::new(),
+            };
+        }
+
+        // SafeAutoApprove mode.
+        let lexed = lex(cmd);
+
+        if lexed.words.is_empty() {
+            return ShellAnalysis {
+                decision: AuthDecision::Deny {
+                    reason: "Shell command did not contain an executable".into(),
+                },
+                argv: None,
+                requires_shell: false,
+                lexed_words: Vec::new(),
+            };
+        }
+
+        // A command that relies on shell-only constructs must be executed by a
+        // real shell, which means the authorisation can no longer guarantee
+        // what runs.  Such commands always require explicit approval.
+        if !lexed.is_simple {
+            let kinds = lexed
+                .constructs
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ShellAnalysis {
+                decision: AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Command uses shell-only constructs ({}); its expanded form cannot be statically verified",
+                        kinds
+                    ),
+                    risk: RiskLevel::Moderate,
+                    summary: format!("Run shell command: '{}'", cmd),
+                },
+                argv: None,
+                requires_shell: true,
+                lexed_words: lexed.words,
+            };
+        }
+
+        let words = lexed.words.clone();
+        let executable = words[0].clone();
+
+        // Environment assignments preceding the command are never auto-approved.
+        if executable.contains('=') {
+            return ShellAnalysis {
+                decision: AuthDecision::RequireApproval {
+                    reason: "Command with environment variable assignments requires approval"
+                        .to_string(),
+                    risk: RiskLevel::Moderate,
+                    summary: format!("Run command with env assignment: '{}'", cmd),
+                },
+                argv: None,
+                requires_shell: true,
+                lexed_words: words,
+            };
+        }
+
+        // Interpreters and shell wrappers can execute arbitrary code.
+        const INTERPRETERS: &[&str] = &[
+            "sh", "bash", "zsh", "ksh", "csh", "dash", "fish", "busybox", "env", "sudo", "su",
+            "doas", "xargs", "eval", "exec", "source", "timeout", "nice", "nohup", "setsid",
+            "stdbuf", "script", "command", "builtin", "trap", "wait", "python", "python3", "node",
+            "ruby", "perl", "php", "lua", "awk", "gawk", "sed", "make", "cmake", "xargs",
+        ];
+        if INTERPRETERS.contains(&executable.as_str()) {
+            return ShellAnalysis {
+                decision: AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Interpreter or wrapper command '{}' can execute arbitrary code and requires approval",
+                        executable
+                    ),
+                    risk: RiskLevel::Moderate,
+                    summary: format!("Run wrapper command: '{}'", cmd),
+                },
+                argv: None,
+                requires_shell: true,
+                lexed_words: words,
+            };
+        }
+
+        // Look up the argument policy for this executable.
+        let policy_entry = match policy_for(&executable) {
+            Some(p) => p,
+            None => {
+                // An unknown executable is never auto-approved.  The risk is
+                // raised to `Destructive` when the program is one that can
+                // destroy data or take the machine down.
+                const DESTRUCTIVE_EXECUTABLES: &[&str] = &[
+                    "rm",
+                    "rmdir",
+                    "shred",
+                    "dd",
+                    "mkfs",
+                    "fdisk",
+                    "parted",
+                    "wipefs",
+                    "mkswap",
+                    "chmod",
+                    "chown",
+                    "chgrp",
+                    "kill",
+                    "killall",
+                    "pkill",
+                    "reboot",
+                    "shutdown",
+                    "poweroff",
+                    "halt",
+                    "init",
+                    "insmod",
+                    "rmmod",
+                    "modprobe",
+                    "iptables",
+                    "systemctl",
+                    "service",
+                    "mount",
+                    "umount",
+                    "swapoff",
+                    "userdel",
+                    "groupdel",
+                    "passwd",
+                    "visudo",
+                    "truncate",
+                    "shred",
+                    "mktemp",
+                    "install",
+                ];
+                // `mkfs.ext4`, `mkfs.xfs` and friends are variants of `mkfs`.
+                let is_destructive = DESTRUCTIVE_EXECUTABLES.contains(&executable.as_str())
+                    || DESTRUCTIVE_EXECUTABLES
+                        .iter()
+                        .any(|name| executable.starts_with(&format!("{}.", name)));
+                let risk = if is_destructive {
+                    RiskLevel::Destructive
+                } else {
+                    RiskLevel::Moderate
+                };
+                return ShellAnalysis {
+                    decision: AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Command '{}' is not in the read-only allowlist and requires approval",
+                            executable
+                        ),
+                        risk,
+                        summary: format!("Run host command: '{}'", cmd),
+                    },
+                    argv: None,
+                    requires_shell: true,
+                    lexed_words: words,
                 };
             }
         };
 
-        // 3. Reject environment assignments preceding command
-        if words[0].contains('=') {
-            return AuthDecision::RequireApproval {
-                reason: "Command with environment variable assignments requires approval"
-                    .to_string(),
-                risk: RiskLevel::Moderate,
-                summary: format!("Run command with env assignment: '{}'", cmd),
-            };
-        }
-
-        let primary_binary = words[0].as_str();
-
-        // 4. Reject wrapper commands and shell interpreters
-        let wrappers = [
-            "sh", "bash", "zsh", "ksh", "csh", "dash", "busybox", "env", "sudo", "su", "xargs",
-            "eval", "exec", "python", "python3", "node", "ruby", "perl", "awk", "sed",
-        ];
-        if wrappers.contains(&primary_binary) {
-            return AuthDecision::RequireApproval {
-                reason: format!(
-                    "Wrapper command or interpreter '{}' requires approval",
-                    primary_binary
-                ),
-                risk: RiskLevel::Moderate,
-                summary: format!("Run wrapper command: '{}'", cmd),
-            };
-        }
-
-        // 5. Check destructive commands
-        let lower = cmd.to_lowercase();
-        let destructive_patterns = [
-            "rm ",
-            "rm -",
-            "mkfs",
-            "dd if=",
-            ":(){ :|:& };:",
-            "> /dev/",
-            "chmod ",
-            "chown ",
-            "shutdown",
-            "reboot",
-            "init 0",
-            "pkill",
-            "killall",
-            "kill ",
-            "wipefs",
-            "fdisk",
-        ];
-        for pattern in &destructive_patterns {
-            if lower.contains(pattern) || primary_binary == "rm" {
-                return AuthDecision::RequireApproval {
-                    reason: format!(
-                        "Command contains prohibited destructive pattern '{}'",
-                        pattern
-                    ),
-                    risk: RiskLevel::Destructive,
-                    summary: format!("Execute potentially destructive command: '{}'", cmd),
-                };
-            }
-        }
-
-        // 6. Check if command is in safe read-only list
-        let is_safe = Self::SAFE_COMMANDS.iter().any(|&safe| {
-            if safe.contains(' ') {
-                cmd == safe || cmd.starts_with(&format!("{} ", safe))
+        // Sub-command policy (git and friends).
+        if !policy_entry.allowed_subcommands.is_empty() {
+            let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
+            let sub_ok = if sub.is_empty() {
+                // `git` with no sub-command prints help; harmless.
+                true
             } else {
-                primary_binary == safe
-            }
-        });
-
-        // For git, ensure subcommands are strictly read-only
-        if primary_binary == "git" {
-            let subcmd = words.get(1).map(|s| s.as_str()).unwrap_or("");
-            let safe_git_subcmds = [
-                "status",
-                "log",
-                "diff",
-                "branch",
-                "--version",
-                "tag",
-                "show",
-            ];
-            if !safe_git_subcmds.contains(&subcmd) {
-                return AuthDecision::RequireApproval {
-                    reason: format!("Git command '{}' modifies repository state", cmd),
-                    risk: RiskLevel::Moderate,
-                    summary: format!("Execute git command: '{}'", cmd),
+                policy_entry.permits_subcommand(sub)
+            };
+            if !sub_ok {
+                return ShellAnalysis {
+                    decision: AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Sub-command '{}' of '{}' is not read-only and requires approval",
+                            sub, executable
+                        ),
+                        risk: RiskLevel::Moderate,
+                        summary: format!("Execute {} command: '{}'", executable, cmd),
+                    },
+                    argv: None,
+                    requires_shell: true,
+                    lexed_words: words,
                 };
             }
         }
 
-        // For compiler/runtime tools: only allow version query
-        let version_only_tools = ["cargo", "python", "node", "npm", "rustc"];
-        if version_only_tools.contains(&primary_binary) {
-            let is_version_check = words.len() == 2
-                && (words[1] == "--version" || words[1] == "-V" || words[1] == "-v");
-            if !is_version_check {
-                return AuthDecision::RequireApproval {
-                    reason: format!(
-                        "Command '{}' executes code or mutates system state",
-                        primary_binary
-                    ),
-                    risk: RiskLevel::Moderate,
-                    summary: format!("Run tool command: '{}'", cmd),
-                };
+        // Argument policy: flags, paths and the remaining arguments.
+        let mut arg_start = 1usize;
+        if !policy_entry.allowed_subcommands.is_empty() && words.len() > 1 {
+            arg_start = 2;
+        }
+
+        for arg in words.iter().skip(arg_start) {
+            if arg.starts_with('-') && arg.len() > 1 {
+                if policy_entry.flag_is_denied(arg) {
+                    return ShellAnalysis {
+                        decision: AuthDecision::RequireApproval {
+                            reason: format!(
+                                "Flag '{}' is not permitted for '{}' because it can modify or execute state",
+                                arg, executable
+                            ),
+                            risk: RiskLevel::Destructive,
+                            summary: format!("Execute potentially destructive command: '{}'", cmd),
+                        },
+                        argv: None,
+                        requires_shell: true,
+                        lexed_words: words,
+                    };
+                }
+                if !policy_entry.flag_is_allowed(arg) {
+                    return ShellAnalysis {
+                        decision: AuthDecision::RequireApproval {
+                            reason: format!(
+                                "Flag '{}' is not permitted for '{}' by the configured argument policy",
+                                arg, executable
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: format!("Execute command: '{}'", cmd),
+                        },
+                        argv: None,
+                        requires_shell: true,
+                        lexed_words: words,
+                    };
+                }
+                continue;
+            }
+
+            // Path-like argument handling.
+            match policy_entry.path_args {
+                PathArgPolicy::Text => {
+                    // The argument is literal text, not a filesystem path.
+                }
+                PathArgPolicy::None => {
+                    return ShellAnalysis {
+                        decision: AuthDecision::RequireApproval {
+                            reason: format!(
+                                "'{}' does not accept path arguments; '{}' requires approval",
+                                executable, arg
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: format!("Execute command: '{}'", cmd),
+                        },
+                        argv: None,
+                        requires_shell: true,
+                        lexed_words: words,
+                    };
+                }
+                PathArgPolicy::NoProtectedPaths => {
+                    if let Some(reason) = Self::check_path_argument(arg, workspace_root) {
+                        return ShellAnalysis {
+                            decision: AuthDecision::RequireApproval {
+                                reason,
+                                risk: RiskLevel::Destructive,
+                                summary: format!(
+                                    "Execute command reading sensitive path: '{}'",
+                                    cmd
+                                ),
+                            },
+                            argv: None,
+                            requires_shell: true,
+                            lexed_words: words,
+                        };
+                    }
+                }
+                PathArgPolicy::WorkspaceOnly => {
+                    if let Some(reason) = Self::check_workspace_argument(arg, workspace_root) {
+                        return ShellAnalysis {
+                            decision: AuthDecision::RequireApproval {
+                                reason,
+                                risk: RiskLevel::Moderate,
+                                summary: format!("Execute command: '{}'", cmd),
+                            },
+                            argv: None,
+                            requires_shell: true,
+                            lexed_words: words,
+                        };
+                    }
+                }
             }
         }
 
-        if is_safe {
-            AuthDecision::Allow
+        // The command is fully classified: execute the exact argument vector.
+        ShellAnalysis {
+            decision: AuthDecision::Allow,
+            argv: Some(words.clone()),
+            requires_shell: false,
+            lexed_words: words,
+        }
+    }
+
+    /// Checks a path-like argument against the protected-location list.
+    ///
+    /// Returns `None` when the argument is acceptable, otherwise a reason.
+    fn check_path_argument(arg: &str, workspace_root: Option<&Path>) -> Option<String> {
+        // A path argument that mentions a protected location is refused even if
+        // it is only a prefix of a longer, legitimate path.
+        let candidate = Path::new(arg);
+        if candidate.is_absolute() {
+            if is_protected_path(candidate) {
+                return Some(format!(
+                    "Access to protected system location '{}' is not permitted for read-only commands",
+                    arg
+                ));
+            }
+            return None;
+        }
+
+        // Relative paths are resolved against the workspace root when one is
+        // configured; otherwise the relative form is checked for protected
+        // components.
+        if let Some(root) = workspace_root {
+            let joined = root.join(candidate);
+            if is_protected_path(&joined) {
+                return Some(format!(
+                    "Access to protected system location '{}' is not permitted for read-only commands",
+                    arg
+                ));
+            }
+        } else if is_protected_path(candidate) {
+            return Some(format!(
+                "Access to protected system location '{}' is not permitted for read-only commands",
+                arg
+            ));
+        }
+
+        // A relative path that climbs out of the workspace is not acceptable.
+        if arg.split('/').any(|c| c == "..") {
+            if let Some(root) = workspace_root {
+                let joined = root.join(candidate);
+                let normalised = joined.components().fold(PathBuf::new(), |mut acc, comp| {
+                    match comp {
+                        std::path::Component::ParentDir => {
+                            acc.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        other => acc.push(other),
+                    }
+                    acc
+                });
+                if !normalised.starts_with(root) {
+                    return Some(format!(
+                        "Path argument '{}' escapes the authorised workspace root",
+                        arg
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Checks a path-like argument against the workspace boundary.
+    fn check_workspace_argument(arg: &str, workspace_root: Option<&Path>) -> Option<String> {
+        let root = match workspace_root {
+            Some(r) => r,
+            None => {
+                return Some(
+                    "No workspace root is configured for path arguments; approval required"
+                        .to_string(),
+                )
+            }
+        };
+        let candidate = Path::new(arg);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
         } else {
-            AuthDecision::RequireApproval {
-                reason: format!(
-                    "Command '{}' modifies system state or is not in safe read-only allowlist",
-                    primary_binary
-                ),
-                risk: RiskLevel::Moderate,
-                summary: format!("Run host command: '{}'", cmd),
+            root.join(candidate)
+        };
+        let normalised = joined.components().fold(PathBuf::new(), |mut acc, comp| {
+            match comp {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => acc.push(other),
             }
+            acc
+        });
+        if !normalised.starts_with(root) {
+            return Some(format!(
+                "Path argument '{}' resolves outside the authorised workspace root",
+                arg
+            ));
         }
+        None
     }
 
     /// Evaluates filesystem reads: canonical workspace confinement validation
@@ -640,22 +922,141 @@ impl AuthorizationEngine {
         AuthDecision::Allow
     }
 
+    /// Evaluates an application launch inside the Ghost display.
+    ///
+    /// The launch is expressed as an explicit executable plus argument vector,
+    /// so the executable can be resolved and validated exactly like any other
+    /// consequential action.  The previous implementation only checked whether
+    /// a blocked domain appeared somewhere in a free-form command string,
+    /// which is trivially bypassed and is not an authorisation check at all.
     pub fn evaluate_ghost_launch(
         policy: &GovernancePolicy,
         args: &serde_json::Value,
     ) -> AuthDecision {
-        let cmd = args["command"].as_str().unwrap_or_default();
-        for domain in &policy.blocked_domains {
-            if cmd.to_lowercase().contains(&domain.to_lowercase()) {
+        // Support the legacy free-form `command` argument only to produce a
+        // clear denial: free-form command strings are no longer accepted.
+        if let Some(cmd) = args["command"].as_str() {
+            if !cmd.trim().is_empty() {
                 return AuthDecision::Deny {
-                    reason: format!(
-                        "Cannot launch application targeting blocked domain '{}'",
-                        domain
-                    ),
+                    reason: "Free-form shell commands are not accepted for application launch. \
+Use the 'executable' and 'args' fields so the launch can be validated."
+                        .into(),
                 };
             }
         }
-        AuthDecision::Allow
+
+        let executable = match args["executable"].as_str() {
+            Some(e) if !e.trim().is_empty() => e.trim().to_string(),
+            _ => {
+                return AuthDecision::Deny {
+                    reason: "Missing 'executable' parameter for application launch".into(),
+                }
+            }
+        };
+
+        if executable.contains('\0') {
+            return AuthDecision::Deny {
+                reason: "Executable name contains a null byte".into(),
+            };
+        }
+
+        // The executable must not be a shell or interpreter, because those can
+        // execute arbitrary code from their arguments.
+        const INTERPRETERS: &[&str] = &[
+            "sh",
+            "bash",
+            "zsh",
+            "ksh",
+            "csh",
+            "dash",
+            "fish",
+            "env",
+            "sudo",
+            "su",
+            "xargs",
+            "eval",
+            "exec",
+            "python",
+            "python3",
+            "node",
+            "ruby",
+            "perl",
+            "php",
+            "awk",
+            "sed",
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "pwsh",
+            "source",
+            "timeout",
+            "nohup",
+            "setsid",
+        ];
+        let base = executable
+            .rsplit('/')
+            .next()
+            .unwrap_or(executable.as_str())
+            .to_ascii_lowercase();
+        if INTERPRETERS.contains(&base.as_str()) {
+            return AuthDecision::Deny {
+                reason: format!(
+                    "Executable '{}' is a shell or interpreter and cannot be launched directly",
+                    executable
+                ),
+            };
+        }
+
+        // Blocked domains are checked against the *resolved* argument values,
+        // not against a substring of a command line.
+        let arg_values: Vec<String> = args["args"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for domain in &policy.blocked_domains {
+            for value in std::iter::once(&executable).chain(arg_values.iter()) {
+                if value.to_lowercase().contains(&domain.to_lowercase()) {
+                    return AuthDecision::Deny {
+                        reason: format!(
+                            "Cannot launch application targeting blocked domain '{}'",
+                            domain
+                        ),
+                    };
+                }
+            }
+        }
+
+        // The launch must be resolvable through the controlled discovery
+        // mechanism before it is approved.
+        let resolver = crate::execution::launcher::ExecutableResolver::new();
+        let spec = crate::execution::launcher::ProgramSpec {
+            executable: executable.clone(),
+            args: arg_values.clone(),
+            cwd: None,
+            env: Vec::new(),
+        };
+        if let Err(e) = resolver.resolve(&spec) {
+            return AuthDecision::Deny {
+                reason: format!("Application executable rejected: {}", e),
+            };
+        }
+
+        AuthDecision::RequireApproval {
+            reason: format!(
+                "Launching '{}' inside the isolated Ghost Display requires confirmation",
+                executable
+            ),
+            risk: RiskLevel::Moderate,
+            summary: format!(
+                "Launch application: {} {}",
+                executable,
+                arg_values.join(" ")
+            ),
+        }
     }
 
     pub fn evaluate_skill_invoke(
