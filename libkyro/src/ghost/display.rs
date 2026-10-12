@@ -1,3 +1,4 @@
+use crate::execution::launcher::{ExecutableResolver, ProgramSpec, ResolvedProgram};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
@@ -13,6 +14,28 @@ pub struct GhostStatus {
     pub is_enabled: bool,
     pub display: String,
     pub resolution: String,
+}
+
+/// The outcome of launching a program inside the Ghost display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GhostLaunchResult {
+    /// Absolute path of the executable that was started.
+    pub executable: String,
+    /// The exact argument vector that was started.
+    pub args: Vec<String>,
+    /// PID of the launched process.
+    pub pid: u32,
+    /// The display the process was started on.
+    pub display: String,
+}
+
+/// A program that was launched inside the Ghost display.
+///
+/// The child handle is retained so the process can be stopped later; Kyro
+/// never leaks the `sh -c` shell that previously wrapped every launch.
+pub struct GhostLaunchedApp {
+    pub child: Child,
+    pub result: GhostLaunchResult,
 }
 
 pub struct GhostDisplayManager;
@@ -80,19 +103,102 @@ impl GhostDisplayManager {
         }
     }
 
-    /// Launches a program directly inside the isolated virtual screen
-    pub fn launch_in_ghost(cmd: &str) -> Result<(), String> {
+    /// Launches a program inside the isolated virtual screen.
+    ///
+    /// The launch is expressed as an explicit executable plus argument vector.
+    /// The command is **never** passed to a shell, so shell metacharacters in
+    /// the argument list remain literal and cannot start a second process.
+    /// The executable is resolved through the controlled discovery mechanism
+    /// before it is started.
+    pub fn launch_in_ghost(spec: &ProgramSpec) -> Result<GhostLaunchResult, String> {
         Self::ensure_virtual_display()?;
-        Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .env("DISPLAY", GHOST_DISPLAY)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to launch '{}' in ghost display: {}", cmd, e))?;
-        Ok(())
+
+        let resolver = ExecutableResolver::new();
+        let resolved: ResolvedProgram = resolver.resolve(spec).map_err(|e| e.to_string())?;
+
+        let mut command = Command::new(&resolved.path);
+        command.args(&resolved.args);
+        command.env("DISPLAY", GHOST_DISPLAY);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let child = command.spawn().map_err(|e| {
+            format!(
+                "Failed to launch '{}' in ghost display: {}",
+                resolved.path.display(),
+                e
+            )
+        })?;
+
+        let pid = child.id();
+
+        Ok(GhostLaunchResult {
+            executable: resolved.path.to_string_lossy().to_string(),
+            args: resolved.args,
+            pid,
+            display: GHOST_DISPLAY.to_string(),
+        })
+    }
+
+    /// Launches a program and retains the child handle so the caller can stop it.
+    pub fn launch_managed(spec: &ProgramSpec) -> Result<GhostLaunchedApp, String> {
+        Self::ensure_virtual_display()?;
+
+        let resolver = ExecutableResolver::new();
+        let resolved: ResolvedProgram = resolver.resolve(spec).map_err(|e| e.to_string())?;
+
+        let mut command = Command::new(&resolved.path);
+        command.args(&resolved.args);
+        command.env("DISPLAY", GHOST_DISPLAY);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let child = command.spawn().map_err(|e| {
+            format!(
+                "Failed to launch '{}' in ghost display: {}",
+                resolved.path.display(),
+                e
+            )
+        })?;
+
+        let pid = child.id();
+
+        Ok(GhostLaunchedApp {
+            result: GhostLaunchResult {
+                executable: resolved.path.to_string_lossy().to_string(),
+                args: resolved.args,
+                pid,
+                display: GHOST_DISPLAY.to_string(),
+            },
+            child,
+        })
+    }
+
+    /// Terminates a process that Kyro started, together with its process
+    /// group, so that helper processes do not survive.
+    pub fn stop_managed(app: &mut GhostLaunchedApp) {
+        let pid = app.result.pid as i32;
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let _ = app.child.kill();
+        let _ = app.child.wait();
     }
 
     /// Captures the virtual display buffer without disturbing physical monitor
@@ -108,49 +214,138 @@ impl GhostDisplayManager {
             .map_err(|e| format!("Failed to capture ghost display: {}", e))?;
 
         if !output.status.success() {
-            // Fallback: try xwd and convert if import isn't present
-            return Err("Unable to grab virtual screen with ImageMagick import".into());
+            let _ = std::fs::remove_file(&temp_png);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "Unable to grab virtual screen with ImageMagick import: {}",
+                if stderr.is_empty() {
+                    "command failed"
+                } else {
+                    &stderr
+                }
+            ));
         }
 
-        let bytes = std::fs::read(&temp_png).map_err(|e| e.to_string())?;
-        std::fs::remove_file(&temp_png).ok();
-        Ok(bytes)
+        let bytes = std::fs::read(&temp_png).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&temp_png);
+        bytes
     }
 
-    /// Sends mouse clicks directly to the virtual display using xdotool
+    /// Sends mouse clicks directly to the virtual display using xdotool.
+    ///
+    /// The exit status of `xdotool` is checked: a failed click is reported as
+    /// an error instead of being silently swallowed.
     pub fn click(x: i32, y: i32) -> Result<(), String> {
-        Command::new("xdotool")
-            .args([
-                "mousemove",
-                "--sync",
-                &x.to_string(),
-                &y.to_string(),
-                "click",
-                "1",
-            ])
-            .env("DISPLAY", GHOST_DISPLAY)
-            .output()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        Self::run_xdotool(&[
+            "mousemove",
+            "--sync",
+            &x.to_string(),
+            &y.to_string(),
+            "click",
+            "1",
+        ])
     }
 
-    /// Types text directly into the virtual display using xdotool
+    /// Moves the pointer on the virtual display.
+    pub fn move_mouse(x: i32, y: i32) -> Result<(), String> {
+        Self::run_xdotool(&["mousemove", "--sync", &x.to_string(), &y.to_string()])
+    }
+
+    /// Performs a right click on the virtual display.
+    pub fn right_click(x: i32, y: i32) -> Result<(), String> {
+        Self::run_xdotool(&[
+            "mousemove",
+            "--sync",
+            &x.to_string(),
+            &y.to_string(),
+            "click",
+            "3",
+        ])
+    }
+
+    /// Performs a double click on the virtual display.
+    pub fn double_click(x: i32, y: i32) -> Result<(), String> {
+        Self::run_xdotool(&[
+            "mousemove",
+            "--sync",
+            &x.to_string(),
+            &y.to_string(),
+            "click",
+            "--repeat",
+            "2",
+            "--delay",
+            "120",
+            "1",
+        ])
+    }
+
+    /// Types text directly into the virtual display using xdotool.
     pub fn type_text(text: &str) -> Result<(), String> {
-        Command::new("xdotool")
-            .args(["type", "--delay", "12", text])
-            .env("DISPLAY", GHOST_DISPLAY)
-            .output()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        Self::run_xdotool(&["type", "--delay", "12", text])
     }
 
-    /// Sends a special key into the virtual display
+    /// Sends a special key into the virtual display.
     pub fn key_press(key: &str) -> Result<(), String> {
-        Command::new("xdotool")
-            .args(["key", key])
+        Self::run_xdotool(&["key", key])
+    }
+
+    fn run_xdotool(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("xdotool")
+            .args(args)
             .env("DISPLAY", GHOST_DISPLAY)
             .output()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to run xdotool: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "xdotool {} failed: {}",
+                args.first().copied().unwrap_or(""),
+                if stderr.is_empty() {
+                    format!("exit status {}", output.status)
+                } else {
+                    stderr
+                }
+            ));
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_rejects_shell_metacharacters_as_executable() {
+        let spec = ProgramSpec::new("firefox; rm -rf /");
+        let err = GhostDisplayManager::launch_in_ghost(&spec).unwrap_err();
+        // The command is never handed to a shell, so it simply cannot be found
+        // as an executable.
+        assert!(
+            err.contains("not found")
+                || err.contains("controlled search path")
+                || err.contains("untrusted location"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn launch_rejects_relative_executable_paths() {
+        let spec = ProgramSpec::new("../../bin/sh");
+        let err = GhostDisplayManager::launch_in_ghost(&spec).unwrap_err();
+        assert!(
+            err.contains("untrusted") || err.contains("not found"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn launch_error_is_reported_for_missing_binary() {
+        let spec = ProgramSpec::new("kyro-definitely-missing-binary");
+        let err = GhostDisplayManager::launch_in_ghost(&spec).unwrap_err();
+        assert!(err.contains("not found"), "{}", err);
     }
 }
