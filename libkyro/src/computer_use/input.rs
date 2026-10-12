@@ -1,9 +1,34 @@
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
-static EMERGENCY_ABORT: AtomicBool = AtomicBool::new(false);
+/// The scope used when a caller does not name one explicitly.
+pub const DEFAULT_ABORT_SCOPE: &str = "global";
+
+/// The scope used by agent-driven computer actions.
+///
+/// Every agent run gets its own scope so that one task can never reset or
+/// bypass another task's active emergency stop.
+pub fn agent_abort_scope(run_id: &str) -> String {
+    format!("run:{}", run_id)
+}
+
+/// Registry of active emergency aborts, keyed by scope.
+///
+/// The previous implementation used a single global boolean.  That made it
+/// impossible to (a) tell which task was stopped and (b) prevent an unrelated
+/// task from clearing an active stop.
+static ABORT_SCOPES: Lazy<Mutex<BTreeSet<String>>> = Lazy::new(|| Mutex::new(BTreeSet::new()));
+
+/// A process-wide latch that is set when *any* scope is aborted.
+///
+/// It exists so that callers that do not carry a scope (for example the
+/// desktop HUD) can still observe that automation is currently halted.
+static ANY_ABORT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", content = "params")]
@@ -38,30 +63,88 @@ pub enum ComputerAction {
 
 pub struct InputController {
     enigo: Enigo,
+    /// The scope this controller is bound to.  Actions performed through this
+    /// controller are refused while this scope is aborted.
+    scope: String,
 }
 
 impl InputController {
     pub fn new() -> Result<Self, String> {
+        Self::with_scope(DEFAULT_ABORT_SCOPE)
+    }
+
+    /// Creates a controller bound to a specific abort scope.
+    pub fn with_scope(scope: &str) -> Result<Self, String> {
         let enigo = Enigo::new(&Settings::default())
             .map_err(|e| format!("Failed to initialize input controller: {:?}", e))?;
-        Ok(Self { enigo })
+        Ok(Self {
+            enigo,
+            scope: scope.to_string(),
+        })
     }
 
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Triggers an emergency abort for the given scope.
+    ///
+    /// The abort is scoped: other tasks keep running, but this scope can no
+    /// longer perform input.
+    pub fn trigger_abort_for(scope: &str) {
+        let mut scopes = ABORT_SCOPES.lock().unwrap();
+        scopes.insert(scope.to_string());
+        ANY_ABORT.store(true, Ordering::SeqCst);
+    }
+
+    /// Clears the emergency abort for one scope only.
+    ///
+    /// Clearing a scope never clears a different scope's abort.
+    pub fn reset_abort_for(scope: &str) {
+        let mut scopes = ABORT_SCOPES.lock().unwrap();
+        scopes.remove(scope);
+        let still = !scopes.is_empty();
+        ANY_ABORT.store(still, Ordering::SeqCst);
+    }
+
+    /// Legacy global trigger.  Kept for the desktop HUD, which is not bound to
+    /// a particular agent run.
     pub fn trigger_abort() {
-        EMERGENCY_ABORT.store(true, Ordering::SeqCst);
+        Self::trigger_abort_for(DEFAULT_ABORT_SCOPE);
     }
 
+    /// Legacy global reset.  Only clears the global scope.
     pub fn reset_abort() {
-        EMERGENCY_ABORT.store(false, Ordering::SeqCst);
+        Self::reset_abort_for(DEFAULT_ABORT_SCOPE);
     }
 
+    /// `true` when the given scope is currently aborted.
+    pub fn is_aborted_scope(scope: &str) -> bool {
+        ABORT_SCOPES.lock().unwrap().contains(scope)
+    }
+
+    /// `true` when *any* scope is currently aborted.
     pub fn is_aborted() -> bool {
-        EMERGENCY_ABORT.load(Ordering::SeqCst)
+        ANY_ABORT.load(Ordering::SeqCst)
+    }
+
+    /// The scopes that are currently aborted.
+    pub fn aborted_scopes() -> Vec<String> {
+        ABORT_SCOPES.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Removes a scope entirely.  Used when a run finishes so that a later
+    /// run is not blocked by a stale stop.
+    pub fn release_scope(scope: &str) {
+        Self::reset_abort_for(scope);
     }
 
     pub fn execute(&mut self, action: &ComputerAction) -> Result<(), String> {
-        if Self::is_aborted() {
-            return Err("Execution aborted by safety trigger".to_string());
+        if Self::is_aborted_scope(&self.scope) {
+            return Err(format!(
+                "Execution aborted by safety trigger for scope '{}'",
+                self.scope
+            ));
         }
 
         match action {
@@ -144,7 +227,20 @@ impl InputController {
                 }
             }
             ComputerAction::Wait { ms } => {
-                std::thread::sleep(Duration::from_millis(*ms));
+                // A long wait is broken into short slices so that an abort
+                // that arrives during the wait is honoured promptly.
+                let mut remaining = *ms;
+                while remaining > 0 {
+                    if Self::is_aborted_scope(&self.scope) {
+                        return Err(format!(
+                            "Execution aborted by safety trigger for scope '{}'",
+                            self.scope
+                        ));
+                    }
+                    let slice = remaining.min(50);
+                    std::thread::sleep(Duration::from_millis(slice));
+                    remaining -= slice;
+                }
             }
         }
 
@@ -178,5 +274,62 @@ fn parse_key(k: &str) -> Key {
                 Key::Return
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tests share a process-wide registry, so they run serially and use
+    /// unique scopes.
+    fn unique_scope(tag: &str) -> String {
+        format!("test:{}:{}", tag, uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn abort_is_scoped() {
+        let a = unique_scope("a");
+        let b = unique_scope("b");
+
+        InputController::trigger_abort_for(&a);
+        assert!(InputController::is_aborted_scope(&a));
+        assert!(!InputController::is_aborted_scope(&b));
+
+        // Resetting an unrelated scope must not clear the active stop.
+        InputController::reset_abort_for(&b);
+        assert!(InputController::is_aborted_scope(&a));
+
+        InputController::reset_abort_for(&a);
+        assert!(!InputController::is_aborted_scope(&a));
+    }
+
+    #[test]
+    fn agent_scopes_are_distinct_per_run() {
+        let a = agent_abort_scope("run_1");
+        let b = agent_abort_scope("run_2");
+        assert_ne!(a, b);
+        assert!(a.starts_with("run:"));
+    }
+
+    #[test]
+    fn global_scope_is_independent_of_run_scopes() {
+        let run_scope = agent_abort_scope("run_x");
+        InputController::trigger_abort_for(&run_scope);
+
+        // The legacy global reset must not clear a run-scoped abort.
+        InputController::reset_abort();
+        assert!(InputController::is_aborted_scope(&run_scope));
+
+        InputController::reset_abort_for(&run_scope);
+    }
+
+    #[test]
+    fn aborted_scopes_are_listed() {
+        let scope = unique_scope("list");
+        InputController::trigger_abort_for(&scope);
+        assert!(InputController::aborted_scopes().contains(&scope));
+        InputController::reset_abort_for(&scope);
+        assert!(!InputController::aborted_scopes().contains(&scope));
     }
 }
