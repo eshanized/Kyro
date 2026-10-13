@@ -20,7 +20,12 @@ fn main() {
 
     let db = Database::init(config_dir).expect("Failed to initialize Kyro SQLite database");
     let vault = Vault::new(db.clone());
-    let engine = Arc::new(AgentLoopEngine::new());
+    let browser = Arc::new(kyro_lib::browser::BrowserAutomationManager::new());
+    let dev_servers = Arc::new(kyro_lib::project::DevServerManager::new());
+    let engine = Arc::new(AgentLoopEngine::with_resources(
+        browser.clone(),
+        dev_servers.clone(),
+    ));
     let mcp_manager = McpManager::new(db.clone(), vault.clone());
     let connector_manager = Arc::new(ConnectorManager::new(
         db.clone(),
@@ -35,6 +40,8 @@ fn main() {
         mcp_manager: mcp_manager.clone(),
         connector_manager: connector_manager.clone(),
         pty_session: Mutex::new(None),
+        browser: browser.clone(),
+        dev_servers: dev_servers.clone(),
     };
 
     tauri::Builder::default()
@@ -133,7 +140,16 @@ fn main() {
             get_connector_tools,
             get_account_tools,
             list_account_tool_policies,
-            save_account_tool_policy
+            save_account_tool_policy,
+            get_browser_capabilities,
+            open_browser_session,
+            close_browser_session,
+            list_browser_sessions,
+            discover_projects,
+            list_dev_servers,
+            get_dev_server,
+            get_dev_server_logs,
+            stop_dev_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kyro application");
