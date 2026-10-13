@@ -1,5 +1,7 @@
 use super::cancellation::CancellationToken;
 use super::router::{ChatMessage, MessageContent, ModelRouter, ToolCall, ToolDefinition};
+use crate::agent::tools::{self, ToolOutcome};
+use crate::browser::BrowserAutomationManager;
 use crate::computer_use::{capture_screen, ComputerAction, InputController};
 use crate::ghost::GhostDisplayManager;
 use crate::governance::{AuthDecision, AuthorizationEngine, ExecutionContext, TakeoverController};
@@ -7,6 +9,7 @@ use crate::grounding::SetOfMarksEngine;
 use crate::mcp::McpManager;
 use crate::memory::MemoryStore;
 use crate::multibot::MultiBotOrchestrator;
+use crate::project::devserver::DevServerManager;
 use crate::sandbox::DockerSandbox;
 use crate::storage::{AgentRun, Database, RunEvent, TimelineStepRecord};
 use crate::teach_task::{Skill, SkillReplayer};
@@ -20,8 +23,23 @@ use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, timeout};
 
+/// The event emitted for each agent step.
+///
+/// The event carries the identity of the run and the conversation it belongs
+/// to, so that the frontend can route it to the right timeline even when
+/// several runs are active at the same time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStepEvent {
+    /// The identifier of the run that produced the event.
+    pub run_id: String,
+    /// The conversation the run belongs to, when it is known.
+    pub conversation_id: Option<String>,
+    /// The agent that produced the event, when it is known.
+    pub agent_id: Option<String>,
+    /// The run this event was delegated from, for child-agent output.
+    pub parent_run_id: Option<String>,
+    /// `true` when the event was produced by a delegated child run.
+    pub is_child_run: bool,
     pub step: usize,
     pub thought: String,
     pub tool_calls: Vec<ToolCall>,
@@ -46,6 +64,10 @@ pub struct ActiveRunContext {
 pub struct AgentLoopEngine {
     router: ModelRouter,
     active_runs: Arc<TokioMutex<HashMap<String, ActiveRunContext>>>,
+    /// The managed browser automation subsystem.
+    pub browser: Arc<BrowserAutomationManager>,
+    /// The managed development-server subsystem.
+    pub dev_servers: Arc<DevServerManager>,
 }
 
 impl Default for AgentLoopEngine {
@@ -56,9 +78,24 @@ impl Default for AgentLoopEngine {
 
 impl AgentLoopEngine {
     pub fn new() -> Self {
+        Self::with_resources(
+            Arc::new(BrowserAutomationManager::new()),
+            Arc::new(DevServerManager::new()),
+        )
+    }
+
+    /// Creates an engine that shares the browser and development-server
+    /// managers with the rest of the application, so that the Tauri commands
+    /// and the agent operate on the same resources.
+    pub fn with_resources(
+        browser: Arc<BrowserAutomationManager>,
+        dev_servers: Arc<DevServerManager>,
+    ) -> Self {
         Self {
             router: ModelRouter::new(),
             active_runs: Arc::new(TokioMutex::new(HashMap::new())),
+            browser,
+            dev_servers,
         }
     }
 
@@ -217,13 +254,16 @@ impl AgentLoopEngine {
             },
             ToolDefinition {
                 name: "launch_ghost_app".to_string(),
-                description: "Launch an application inside the isolated virtual Ghost Display (:99).".to_string(),
+                description: "Launch an application inside the isolated virtual Ghost Display (:99). \
+The program is started as an explicit executable plus argument vector; free-form shell commands are rejected."
+                    .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "The application command line to launch in the virtual display" }
+                        "executable": { "type": "string", "description": "Program name or absolute path of the application to launch (e.g. 'firefox' or '/usr/bin/firefox')" },
+                        "args": { "type": "array", "items": { "type": "string" }, "description": "Argument vector passed verbatim to the executable" }
                     },
-                    "required": ["command"]
+                    "required": ["executable"]
                 }),
             },
             ToolDefinition {
@@ -251,6 +291,9 @@ impl AgentLoopEngine {
                 }),
             },
         ]
+        .into_iter()
+        .chain(tools::tool_definitions())
+        .collect()
     }
 
     /// Execute an autonomous agent run step with cancellation, centralized authorization, and timeline persistence
@@ -319,11 +362,13 @@ impl AgentLoopEngine {
         }
 
         // Determine active agent ID from run or default to apex
-        let active_agent_id = if let Ok(Some(r)) = db.get_run(run_id) {
-            r.agent_id
-        } else {
-            "apex-orchestrator".to_string()
-        };
+        let (active_agent_id, run_conversation_id, run_parent_id) =
+            if let Ok(Some(r)) = db.get_run(run_id) {
+                (r.agent_id, r.conversation_id, r.parent_run_id)
+            } else {
+                ("apex-orchestrator".to_string(), None, None)
+            };
+        let is_child_run = run_parent_id.is_some();
 
         // Extract last user prompt for relevance matching
         let last_prompt = history
@@ -392,6 +437,11 @@ impl AgentLoopEngine {
             if resp.tool_calls.is_empty() {
                 final_content = resp.content.clone();
                 on_event(AgentStepEvent {
+                    run_id: run_id.to_string(),
+                    conversation_id: run_conversation_id.clone(),
+                    agent_id: Some(active_agent_id.clone()),
+                    parent_run_id: run_parent_id.clone(),
+                    is_child_run,
                     step,
                     thought: resp.content,
                     tool_calls: vec![],
@@ -492,6 +542,11 @@ impl AgentLoopEngine {
             }
 
             on_event(AgentStepEvent {
+                run_id: run_id.to_string(),
+                conversation_id: run_conversation_id.clone(),
+                agent_id: Some(active_agent_id.clone()),
+                parent_run_id: run_parent_id.clone(),
+                is_child_run,
                 step,
                 thought: resp.content,
                 tool_calls: resp.tool_calls,
@@ -557,6 +612,21 @@ impl AgentLoopEngine {
             workspace_root: workspace_root.clone(),
         };
 
+        // The shell analysis is computed once, before authorisation, so that the
+        // exact argument vector that was inspected is also the argument vector
+        // that is executed.  Authorisation and execution can therefore never
+        // disagree about what runs.
+        let shell_analysis = if matches!(tc.name.as_str(), "execute_shell" | "bash" | "terminal") {
+            let policy = crate::governance::PolicyEngine::load(db);
+            Some(AuthorizationEngine::analyze_shell_command(
+                &policy,
+                workspace_root.as_deref(),
+                &tc.arguments,
+            ))
+        } else {
+            None
+        };
+
         // 1. Evaluate centralized policy decision
         let decision = if let Some(conn_mgr) = connector_manager {
             if let Some(dec) = conn_mgr
@@ -564,12 +634,19 @@ impl AgentLoopEngine {
                 .await
             {
                 dec
+            } else if let Some(sa) = &shell_analysis {
+                sa.decision.clone()
             } else {
                 AuthorizationEngine::evaluate(db, &ctx, &tc.name, &tc.arguments)
             }
+        } else if let Some(sa) = &shell_analysis {
+            sa.decision.clone()
         } else {
             AuthorizationEngine::evaluate(db, &ctx, &tc.name, &tc.arguments)
         };
+
+        let authorized_argv: Option<Vec<String>> =
+            shell_analysis.as_ref().and_then(|s| s.argv.clone());
 
         match decision {
             AuthDecision::Deny { reason } => {
@@ -608,6 +685,7 @@ impl AgentLoopEngine {
                     mcp_manager,
                     token,
                     None,
+                    authorized_argv.as_deref(),
                 )
                 .await
             }
@@ -703,6 +781,7 @@ impl AgentLoopEngine {
                                     mcp_manager,
                                     token,
                                     Some(&proof),
+                                    authorized_argv.as_deref(),
                                 )
                                 .await;
                         } else if status.status == "denied" {
@@ -745,6 +824,7 @@ impl AgentLoopEngine {
                     mcp_manager,
                     token,
                     None,
+                    authorized_argv.as_deref(),
                 )
                 .await
             }
@@ -760,6 +840,7 @@ impl AgentLoopEngine {
                     mcp_manager,
                     token,
                     None,
+                    authorized_argv.as_deref(),
                 )
                 .await
             }
@@ -780,6 +861,7 @@ impl AgentLoopEngine {
         mcp_manager: Option<&McpManager>,
         token: &CancellationToken,
         auth_proof: Option<&crate::connector::InvocationAuthProof>,
+        authorized_argv: Option<&[String]>,
     ) -> (String, bool, Option<String>) {
         match tc.name.as_str() {
             "execute_shell" => {
@@ -801,10 +883,18 @@ impl AgentLoopEngine {
                         Err(e) => (format!("Sandbox execution failed: {}", e), true, None),
                     }
                 } else {
-                    let mut cmd_builder = Command::new("sh");
+                    // Execute the *authorised* argument vector directly whenever
+                    // the command was classified as simple.  Only commands that
+                    // genuinely require shell semantics (and therefore went
+                    // through the approval flow) are handed to `sh -c`.
+                    let (program, args): (String, Vec<String>) = match authorized_argv {
+                        Some(argv) if !argv.is_empty() => (argv[0].clone(), argv[1..].to_vec()),
+                        _ => ("sh".to_string(), vec!["-c".to_string(), cmd.to_string()]),
+                    };
+
+                    let mut cmd_builder = Command::new(&program);
                     cmd_builder
-                        .arg("-c")
-                        .arg(cmd)
+                        .args(&args)
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
@@ -819,7 +909,11 @@ impl AgentLoopEngine {
                     let child = match cmd_builder.spawn() {
                         Ok(c) => c,
                         Err(e) => {
-                            return (format!("Failed to spawn shell process: {}", e), true, None)
+                            return (
+                                format!("Failed to spawn process '{}': {}", program, e),
+                                true,
+                                None,
+                            )
                         }
                     };
 
@@ -869,7 +963,13 @@ impl AgentLoopEngine {
                             }
 
                             (
-                                format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr),
+                                format!(
+                                    "EXIT_CODE: {}\nCOMMAND: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                                    out.status.code().unwrap_or(-1),
+                                    program,
+                                    stdout,
+                                    stderr
+                                ),
                                 !out.status.success(),
                                 None,
                             )
@@ -1211,163 +1311,359 @@ impl AgentLoopEngine {
                     .unwrap_or_default()
                     .to_string();
 
+                // The action vocabulary is closed: an unknown action is an
+                // explicit failure, never a generic success.
+                const SUPPORTED: &[&str] = &[
+                    "mouse_move",
+                    "left_click",
+                    "right_click",
+                    "double_click",
+                    "type",
+                    "key",
+                    "wait",
+                ];
+                if !SUPPORTED.contains(&action_str) {
+                    return (
+                        format!(
+                            "Unsupported computer action '{}'. Supported actions: {}",
+                            action_str,
+                            SUPPORTED.join(", ")
+                        ),
+                        true,
+                        None,
+                    );
+                }
+
                 if GhostDisplayManager::is_enabled() {
-                    match action_str {
+                    let outcome = match action_str {
+                        "mouse_move" => {
+                            let (cx, cy) = match (x, y) {
+                                (Some(cx), Some(cy)) => (cx, cy),
+                                _ => return (
+                                    "Ghost Mode mouse_move requires both 'x' and 'y' coordinates"
+                                        .to_string(),
+                                    true,
+                                    None,
+                                ),
+                            };
+                            GhostDisplayManager::move_mouse(cx, cy)
+                                .map(|_| "moved the pointer".to_string())
+                        }
                         "left_click" => {
-                            let _ = GhostDisplayManager::click(x.unwrap_or(0), y.unwrap_or(0));
-                            (
-                                "Ghost Mode: Clicked virtual display :99".to_string(),
-                                false,
-                                None,
-                            )
+                            let (cx, cy) = match (x, y) {
+                                (Some(cx), Some(cy)) => (cx, cy),
+                                _ => return (
+                                    "Ghost Mode left_click requires both 'x' and 'y' coordinates"
+                                        .to_string(),
+                                    true,
+                                    None,
+                                ),
+                            };
+                            GhostDisplayManager::click(cx, cy).map(|_| "left-clicked".to_string())
+                        }
+                        "right_click" => {
+                            let (cx, cy) = match (x, y) {
+                                (Some(cx), Some(cy)) => (cx, cy),
+                                _ => return (
+                                    "Ghost Mode right_click requires both 'x' and 'y' coordinates"
+                                        .to_string(),
+                                    true,
+                                    None,
+                                ),
+                            };
+                            GhostDisplayManager::right_click(cx, cy)
+                                .map(|_| "right-clicked".to_string())
+                        }
+                        "double_click" => {
+                            let (cx, cy) = match (x, y) {
+                                (Some(cx), Some(cy)) => (cx, cy),
+                                _ => return (
+                                    "Ghost Mode double_click requires both 'x' and 'y' coordinates"
+                                        .to_string(),
+                                    true,
+                                    None,
+                                ),
+                            };
+                            GhostDisplayManager::double_click(cx, cy)
+                                .map(|_| "double-clicked".to_string())
                         }
                         "type" => {
-                            let _ = GhostDisplayManager::type_text(&text);
-                            ("Ghost Mode: Typed text on :99".to_string(), false, None)
+                            if text.is_empty() {
+                                return (
+                                    "Ghost Mode type requires a non-empty 'text' value".to_string(),
+                                    true,
+                                    None,
+                                );
+                            }
+                            GhostDisplayManager::type_text(&text)
+                                .map(|_| format!("typed {} characters", text.chars().count()))
                         }
                         "key" => {
-                            let _ = GhostDisplayManager::key_press(&text);
-                            ("Ghost Mode: Pressed key on :99".to_string(), false, None)
+                            if text.is_empty() {
+                                return (
+                                    "Ghost Mode key requires a non-empty 'text' value".to_string(),
+                                    true,
+                                    None,
+                                );
+                            }
+                            GhostDisplayManager::key_press(&text)
+                                .map(|_| format!("pressed key '{}'", text))
                         }
-                        _ => ("Ghost Mode action completed".to_string(), false, None),
-                    }
-                } else {
-                    let action = match action_str {
-                        "mouse_move" => ComputerAction::MouseMove {
-                            x: x.unwrap_or(0),
-                            y: y.unwrap_or(0),
-                        },
-                        "left_click" => ComputerAction::LeftClick { x, y },
-                        "right_click" => ComputerAction::RightClick { x, y },
-                        "double_click" => ComputerAction::DoubleClick { x, y },
-                        "type" => ComputerAction::Type { text: text.clone() },
-                        "key" => ComputerAction::Key { text: text.clone() },
-                        "wait" => ComputerAction::Wait { ms: 500 },
-                        other => {
-                            return (format!("Unknown computer action: {}", other), true, None)
+                        "wait" => {
+                            sleep(Duration::from_millis(500)).await;
+                            Ok("waited 500ms".to_string())
                         }
+                        other => Err(format!("Unsupported computer action '{}'", other)),
                     };
 
-                    let before_shot = capture_screen(0).ok();
+                    return match outcome {
+                        Ok(performed) => (
+                            serde_json::json!({
+                                "status": "success",
+                                "display": "ghost",
+                                "action": action_str,
+                                "performed": performed,
+                                "x": x,
+                                "y": y,
+                            })
+                            .to_string(),
+                            false,
+                            None,
+                        ),
+                        Err(e) => (
+                            serde_json::json!({
+                                "status": "failed",
+                                "display": "ghost",
+                                "action": action_str,
+                                "error": e,
+                                "x": x,
+                                "y": y,
+                            })
+                            .to_string(),
+                            true,
+                            None,
+                        ),
+                    };
+                }
 
-                    match InputController::new() {
-                        Ok(mut controller) => match controller.execute(&action) {
-                            Ok(_) => {
-                                // Record action to Teach-a-Task recorder if recording session is active
-                                if crate::teach_task::TaskRecorder::is_recording() {
-                                    let (act_type, ax, ay, atxt, akey) = match &action {
-                                        ComputerAction::MouseMove { x, y } => {
-                                            ("move", Some(*x), Some(*y), None, None)
-                                        }
-                                        ComputerAction::LeftClick { x, y } => {
-                                            ("click", *x, *y, None, None)
-                                        }
-                                        ComputerAction::RightClick { x, y } => {
-                                            ("right_click", *x, *y, None, None)
-                                        }
-                                        ComputerAction::DoubleClick { x, y } => {
-                                            ("double_click", *x, *y, None, None)
-                                        }
-                                        ComputerAction::LeftClickDrag { x, y } => {
-                                            ("drag", Some(*x), Some(*y), None, None)
-                                        }
-                                        ComputerAction::Type { text } => {
-                                            ("type", None, None, Some(text.clone()), None)
-                                        }
-                                        ComputerAction::Key { text } => {
-                                            ("key", None, None, None, Some(text.clone()))
-                                        }
-                                        ComputerAction::Hotkey { keys } => {
-                                            ("key", None, None, None, Some(keys.join("+")))
-                                        }
-                                        ComputerAction::Wait { .. } => {
-                                            ("delay", None, None, None, None)
-                                        }
-                                    };
-                                    let _ = crate::teach_task::TaskRecorder::record_action(
-                                        act_type, ax, ay, atxt, akey,
-                                    );
-                                }
+                let action = match action_str {
+                    "mouse_move" => ComputerAction::MouseMove {
+                        x: x.unwrap_or(0),
+                        y: y.unwrap_or(0),
+                    },
+                    "left_click" => ComputerAction::LeftClick { x, y },
+                    "right_click" => ComputerAction::RightClick { x, y },
+                    "double_click" => ComputerAction::DoubleClick { x, y },
+                    "type" => ComputerAction::Type { text: text.clone() },
+                    "key" => ComputerAction::Key { text: text.clone() },
+                    "wait" => ComputerAction::Wait { ms: 500 },
+                    other => return (format!("Unknown computer action: {}", other), true, None),
+                };
 
-                                // Record timeline step with real diff calculation
-                                if let (Some(cx), Some(cy)) = (x, y) {
-                                    sleep(Duration::from_millis(150)).await;
-                                    let after_shot = capture_screen(0).ok();
-                                    let diff_percent = if let (Some(ref b_shot), Some(ref a_shot)) =
-                                        (&before_shot, &after_shot)
-                                    {
-                                        use base64::Engine;
-                                        if let (Ok(b_bytes), Ok(a_bytes)) = (
-                                            base64::engine::general_purpose::STANDARD
-                                                .decode(&b_shot.base64_png),
-                                            base64::engine::general_purpose::STANDARD
-                                                .decode(&a_shot.base64_png),
+                let before_shot = capture_screen(0).ok();
+
+                match InputController::new() {
+                    Ok(mut controller) => match controller.execute(&action) {
+                        Ok(_) => {
+                            // Record action to Teach-a-Task recorder if recording session is active
+                            if crate::teach_task::TaskRecorder::is_recording() {
+                                let (act_type, ax, ay, atxt, akey) = match &action {
+                                    ComputerAction::MouseMove { x, y } => {
+                                        ("move", Some(*x), Some(*y), None, None)
+                                    }
+                                    ComputerAction::LeftClick { x, y } => {
+                                        ("click", *x, *y, None, None)
+                                    }
+                                    ComputerAction::RightClick { x, y } => {
+                                        ("right_click", *x, *y, None, None)
+                                    }
+                                    ComputerAction::DoubleClick { x, y } => {
+                                        ("double_click", *x, *y, None, None)
+                                    }
+                                    ComputerAction::LeftClickDrag { x, y } => {
+                                        ("drag", Some(*x), Some(*y), None, None)
+                                    }
+                                    ComputerAction::Type { text } => {
+                                        ("type", None, None, Some(text.clone()), None)
+                                    }
+                                    ComputerAction::Key { text } => {
+                                        ("key", None, None, None, Some(text.clone()))
+                                    }
+                                    ComputerAction::Hotkey { keys } => {
+                                        ("key", None, None, None, Some(keys.join("+")))
+                                    }
+                                    ComputerAction::Wait { .. } => {
+                                        ("delay", None, None, None, None)
+                                    }
+                                };
+                                let _ = crate::teach_task::TaskRecorder::record_action(
+                                    act_type, ax, ay, atxt, akey,
+                                );
+                            }
+
+                            // Record timeline step with real diff calculation
+                            let mut diff_percent = 0.0f32;
+                            let mut after_png = String::new();
+                            if let (Some(cx), Some(cy)) = (x, y) {
+                                sleep(Duration::from_millis(150)).await;
+                                let after_shot = capture_screen(0).ok();
+                                after_png = after_shot
+                                    .as_ref()
+                                    .map(|s| s.base64_png.clone())
+                                    .unwrap_or_default();
+                                diff_percent = if let (Some(ref b_shot), Some(ref a_shot)) =
+                                    (&before_shot, &after_shot)
+                                {
+                                    use base64::Engine;
+                                    if let (Ok(b_bytes), Ok(a_bytes)) = (
+                                        base64::engine::general_purpose::STANDARD
+                                            .decode(&b_shot.base64_png),
+                                        base64::engine::general_purpose::STANDARD
+                                            .decode(&a_shot.base64_png),
+                                    ) {
+                                        if let (Ok(b_img), Ok(a_img)) = (
+                                            image::load_from_memory(&b_bytes),
+                                            image::load_from_memory(&a_bytes),
                                         ) {
-                                            if let (Ok(b_img), Ok(a_img)) = (
-                                                image::load_from_memory(&b_bytes),
-                                                image::load_from_memory(&a_bytes),
-                                            ) {
-                                                crate::timeline::TimelineEngine::compute_diff_percent(
-                                                    &b_img.to_rgba8(),
-                                                    &a_img.to_rgba8(),
-                                                )
-                                            } else {
-                                                0.0
-                                            }
+                                            crate::timeline::TimelineEngine::compute_diff_percent(
+                                                &b_img.to_rgba8(),
+                                                &a_img.to_rgba8(),
+                                            )
                                         } else {
                                             0.0
                                         }
                                     } else {
                                         0.0
-                                    };
+                                    }
+                                } else {
+                                    0.0
+                                };
 
-                                    let step_rec = TimelineStepRecord {
-                                        id: format!("tl_ca_{}", uuid::Uuid::new_v4()),
-                                        run_id: Some(run_id.to_string()),
-                                        step: 1,
-                                        action_name: action_str.to_string(),
-                                        click_x: Some(cx),
-                                        click_y: Some(cy),
-                                        before_base64: before_shot
-                                            .map(|s| s.base64_png)
-                                            .unwrap_or_default(),
-                                        after_base64: after_shot
-                                            .map(|s| s.base64_png)
-                                            .unwrap_or_default(),
-                                        diff_percent,
-                                        timestamp: chrono::Utc::now().timestamp_millis(),
-                                    };
-                                    let _ = db.save_timeline_step(&step_rec);
-                                }
-                                (
-                                    format!("Successfully executed computer action: {:?}", action),
-                                    false,
-                                    None,
-                                )
+                                let step_rec = TimelineStepRecord {
+                                    id: format!("tl_ca_{}", uuid::Uuid::new_v4()),
+                                    run_id: Some(run_id.to_string()),
+                                    step: 1,
+                                    action_name: action_str.to_string(),
+                                    click_x: Some(cx),
+                                    click_y: Some(cy),
+                                    before_base64: before_shot
+                                        .map(|s| s.base64_png)
+                                        .unwrap_or_default(),
+                                    after_base64: after_png.clone(),
+                                    diff_percent,
+                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                };
+                                let _ = db.save_timeline_step(&step_rec);
                             }
-                            Err(e) => (format!("Computer action error: {}", e), true, None),
-                        },
+
+                            // The action was dispatched successfully.  Whether
+                            // the *intended* transition happened is reported
+                            // separately so the model does not mistake a
+                            // successful dispatch for a confirmed effect.
+                            let status = if x.is_some() && y.is_some() {
+                                if diff_percent > 0.05 {
+                                    "success"
+                                } else {
+                                    "uncertain"
+                                }
+                            } else {
+                                "success"
+                            };
+                            (
+                                serde_json::json!({
+                                    "status": status,
+                                    "display": "physical",
+                                    "action": action_str,
+                                    "performed": format!("dispatched {:?}", action),
+                                    "x": x,
+                                    "y": y,
+                                    "visual_change_percent": diff_percent,
+                                    "note": if status == "uncertain" {
+                                        "The input was delivered but no visual change was detected; the target may not have changed state."
+                                    } else {
+                                        ""
+                                    },
+                                })
+                                .to_string(),
+                                false,
+                                if after_png.is_empty() {
+                                    None
+                                } else {
+                                    Some(after_png)
+                                },
+                            )
+                        }
                         Err(e) => (
-                            format!("Failed to init input controller: {}", e),
+                            serde_json::json!({
+                                "status": "failed",
+                                "display": "physical",
+                                "action": action_str,
+                                "error": e.to_string(),
+                                "x": x,
+                                "y": y,
+                            })
+                            .to_string(),
                             true,
                             None,
                         ),
-                    }
+                    },
+                    Err(e) => (
+                        format!("Failed to init input controller: {}", e),
+                        true,
+                        None,
+                    ),
                 }
             }
             "launch_ghost_app" => {
-                let cmd = tc.arguments["command"].as_str().unwrap_or_default();
-                match GhostDisplayManager::launch_in_ghost(cmd) {
-                    Ok(_) => (
-                        format!(
-                            "Successfully launched '{}' in isolated Ghost Display (:99)",
-                            cmd
-                        ),
+                // The launch is expressed as an explicit executable plus an
+                // argument vector.  No free-form command string is accepted
+                // and nothing is ever passed through a shell.
+                let executable = tc.arguments["executable"].as_str().unwrap_or_default();
+                let args: Vec<String> = tc.arguments["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if executable.trim().is_empty() {
+                    return (
+                        "launch_ghost_app requires an 'executable' field naming the program to start"
+                            .to_string(),
+                        true,
+                        None,
+                    );
+                }
+
+                let spec = crate::execution::launcher::ProgramSpec {
+                    executable: executable.to_string(),
+                    args: args.clone(),
+                    cwd: None,
+                    env: Vec::new(),
+                };
+
+                match GhostDisplayManager::launch_in_ghost(&spec) {
+                    Ok(res) => (
+                        serde_json::json!({
+                            "status": "success",
+                            "executable": res.executable,
+                            "args": res.args,
+                            "pid": res.pid,
+                            "display": res.display,
+                        })
+                        .to_string(),
                         false,
                         None,
                     ),
                     Err(e) => (
-                        format!("Failed to launch in Ghost Display: {}", e),
+                        serde_json::json!({
+                            "status": "failed",
+                            "executable": executable,
+                            "error": e,
+                        })
+                        .to_string(),
                         true,
                         None,
                     ),
@@ -1571,6 +1867,91 @@ impl AgentLoopEngine {
                     }
                 }
             }
+            // ---- Project, development server and browser tools ----------
+            "discover_project" => {
+                let outcome = tools::discover_project(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "inspect_project" => {
+                let outcome = tools::inspect_project(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "start_dev_server" => {
+                let outcome =
+                    tools::start_dev_server(&tc.arguments, &self.dev_servers, run_id).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "dev_server_status" => {
+                let outcome = tools::dev_server_status(&tc.arguments, &self.dev_servers).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "dev_server_logs" => {
+                let outcome = tools::dev_server_logs(&tc.arguments, &self.dev_servers).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "stop_dev_server" => {
+                let outcome = tools::stop_dev_server(&tc.arguments, &self.dev_servers).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_capabilities" => {
+                let outcome = tools::browser_capabilities(&self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_open" => {
+                let policy = crate::governance::PolicyEngine::load(db);
+                let outcome = tools::browser_open(
+                    &tc.arguments,
+                    &self.browser,
+                    run_id,
+                    &policy.blocked_domains,
+                )
+                .await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_navigate" => {
+                let outcome = tools::browser_navigate(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_snapshot" => {
+                let outcome = tools::browser_snapshot(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_click" => {
+                let outcome = tools::browser_click(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_fill" => {
+                let outcome = tools::browser_fill(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_press" => {
+                let outcome = tools::browser_press(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_screenshot" => {
+                let outcome = tools::browser_screenshot(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_console" => {
+                let outcome = tools::browser_console(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_network" => {
+                let outcome = tools::browser_network(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_tabs" => {
+                let outcome = tools::browser_tabs(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "browser_close" => {
+                let outcome = tools::browser_close(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "audit_ui" => {
+                let outcome = self.run_ui_audit(run_id, &tc.arguments, db, token).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
             custom => {
                 // 1. Try connector runtime tool execution (Native, Remote MCP, or unified)
                 if let Some(conn_mgr) = connector_manager {
@@ -1595,6 +1976,233 @@ impl AgentLoopEngine {
                 }
                 (format!("Unknown or unhandled tool: {}", custom), true, None)
             }
+        }
+    }
+
+    /// Runs the complete UI audit workflow.
+    ///
+    /// The workflow asks for approval for the *exact* development-server
+    /// command before executing any repository-controlled code, then drives the
+    /// browser and produces a Markdown report with evidence.
+    async fn run_ui_audit(
+        &self,
+        run_id: &str,
+        args: &serde_json::Value,
+        db: &Database,
+        token: &CancellationToken,
+    ) -> ToolOutcome {
+        let project_name = args["project_name"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if project_name.is_empty() {
+            return ToolOutcome::fail("audit_ui requires a 'project_name' parameter.");
+        }
+
+        let search_root = match tools::resolve_search_root(args) {
+            Ok(r) => r,
+            Err(e) => return ToolOutcome::fail(e),
+        };
+
+        let browser = args["browser"]
+            .as_str()
+            .unwrap_or("firefox")
+            .trim()
+            .to_string();
+        if !browser.eq_ignore_ascii_case("firefox") {
+            return ToolOutcome::fail(format!(
+                "Kyro can only drive Firefox. '{}' was requested, and Kyro will not silently \
+substitute a different browser.",
+                browser
+            ));
+        }
+
+        let options = crate::audit::workflow::AuditOptions {
+            project_name,
+            search_root,
+            browser,
+            headless: args["headless"].as_bool().unwrap_or(true),
+            keep_server_running: args["keep_server_running"].as_bool().unwrap_or(false),
+            ..Default::default()
+        };
+
+        let workflow = crate::audit::workflow::UiAuditWorkflow::new(
+            self.browser.clone(),
+            self.dev_servers.clone(),
+        );
+
+        let mut progress_log: Vec<String> = Vec::new();
+        let mut on_progress = |p: crate::audit::workflow::AuditProgress| {
+            progress_log.push(format!("[{}] {}", p.stage.as_str(), p.message));
+        };
+
+        // Build the plan first, so that the approval names the exact project
+        // directory and command that will be executed.
+        let plan = match workflow.plan(&options).await {
+            Ok(p) => p,
+            Err(e) => {
+                return ToolOutcome::fail(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": e,
+                    })
+                    .to_string(),
+                )
+            }
+        };
+
+        let approved = self
+            .await_approval(
+                db,
+                run_id,
+                "start_dev_server",
+                &format!(
+                    "Start `{}` in `{}`",
+                    plan.command.display(),
+                    plan.command.working_directory.display()
+                ),
+                &serde_json::json!({
+                    "command": plan.command.display(),
+                    "working_directory": plan.command.working_directory,
+                    "script": plan.command.script,
+                    "project_path": plan.project.path,
+                }),
+                crate::execution::permissions::RiskLevel::Moderate,
+                "Running a project's development script executes repository-controlled code",
+                token,
+            )
+            .await;
+
+        match approved {
+            Ok(true) => {}
+            Ok(false) => {
+                return ToolOutcome::fail(
+                    serde_json::json!({
+                        "status": "cancelled",
+                        "error": "The development server was not started: the request was not approved. Nothing was executed.",
+                    })
+                    .to_string(),
+                )
+            }
+            Err(e) => {
+                return ToolOutcome::fail(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": e,
+                    })
+                    .to_string(),
+                )
+            }
+        }
+
+        let outcome = match workflow.execute(&options, plan, &mut on_progress).await {
+            Ok(o) => o,
+            Err(e) => {
+                return ToolOutcome::fail(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": e,
+                        "progress": progress_log,
+                    })
+                    .to_string(),
+                )
+            }
+        };
+
+        // Store the report through Kyro's artifact registry so that the
+        // evidence does not end up scattered on the Desktop.
+        let report_name = format!("ui-audit-{}.md", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+        let artifacts_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("kyro")
+            .join("artifacts");
+        if let Err(e) = std::fs::create_dir_all(&artifacts_dir) {
+            return ToolOutcome::fail(format!("Could not create the artifact directory: {}", e));
+        }
+        let artifact_id = format!("art_{}", uuid::Uuid::new_v4());
+        let report_path = artifacts_dir.join(format!("{}_{}", &artifact_id[4..12], report_name));
+        if let Err(e) = std::fs::write(&report_path, &outcome.report_markdown) {
+            return ToolOutcome::fail(format!("Could not write the bug report: {}", e));
+        }
+
+        let conv_id = db
+            .get_run(run_id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.conversation_id);
+        let rec = crate::storage::ArtifactRecord {
+            id: artifact_id.clone(),
+            run_id: Some(run_id.to_string()),
+            conversation_id: conv_id,
+            name: report_name.clone(),
+            file_path: report_path.to_string_lossy().to_string(),
+            artifact_type: "markdown".to_string(),
+            mime_type: "text/markdown".to_string(),
+            size_bytes: outcome.report_markdown.len() as i64,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            metadata_json: Some(
+                serde_json::json!({
+                    "preview": outcome.report_markdown.chars().take(400).collect::<String>(),
+                    "findings": outcome.findings.len(),
+                    "routes_discovered": outcome.context.routes_discovered,
+                    "routes_inspected": outcome.context.routes_inspected,
+                })
+                .to_string(),
+            ),
+        };
+        let _ = db.create_artifact(&rec);
+
+        let payload = serde_json::json!({
+            "status": "success",
+            "report_artifact_id": artifact_id,
+            "report_path": report_path.to_string_lossy(),
+            "progress": progress_log,
+            "context": outcome.context,
+            "finding_count": outcome.findings.len(),
+            "findings": outcome.findings,
+            "route_inventory": outcome.route_inventory,
+            "dev_server": outcome.dev_server,
+        });
+        ToolOutcome::ok(payload.to_string())
+    }
+
+    /// Requests an approval and waits for it to be resolved.
+    #[allow(clippy::too_many_arguments)]
+    async fn await_approval(
+        &self,
+        db: &Database,
+        run_id: &str,
+        tool_name: &str,
+        summary: &str,
+        args: &serde_json::Value,
+        risk: crate::execution::permissions::RiskLevel,
+        reason: &str,
+        token: &CancellationToken,
+    ) -> Result<bool, String> {
+        let request = AuthorizationEngine::request_approval(
+            db, run_id, tool_name, summary, args, risk, reason,
+        )
+        .map_err(|e| format!("Could not queue the approval request: {}", e))?;
+
+        loop {
+            if token.is_cancelled() {
+                let _ = db.resolve_approval_request(&request.id, "cancelled", "user_cancellation");
+                return Err("The request was cancelled while waiting for approval.".to_string());
+            }
+            if let Ok(Some(status)) = db.get_approval_request(&request.id) {
+                match status.status.as_str() {
+                    "approved" => return Ok(true),
+                    "denied" => return Ok(false),
+                    "cancelled" => return Ok(false),
+                    "expired" => {
+                        let _ = db.expire_overdue_approvals(chrono::Utc::now().timestamp_millis());
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+            sleep(Duration::from_millis(300)).await;
         }
     }
 }
