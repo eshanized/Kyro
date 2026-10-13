@@ -1,4 +1,6 @@
 pub mod agent;
+pub mod audit;
+pub mod browser;
 pub mod commands;
 pub mod computer_use;
 pub mod connector;
@@ -9,6 +11,7 @@ pub mod grounding;
 pub mod mcp;
 pub mod memory;
 pub mod multibot;
+pub mod project;
 pub mod sandbox;
 pub mod storage;
 pub mod teach_task;

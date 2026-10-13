@@ -2810,6 +2810,7 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-shell",
  "tokio",
+ "url",
  "uuid",
  "xcap",
 ]
