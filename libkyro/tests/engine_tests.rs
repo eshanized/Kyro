@@ -241,11 +241,19 @@ fn test_centralized_authorization_engine() {
     let res_sys = AuthorizationEngine::evaluate(&db, &ctx, "write_file", &sys_write);
     assert!(matches!(res_sys, AuthDecision::Deny { .. }));
 
-    // 6. Blocked domain -> Deny
-    let blocked_action =
-        serde_json::json!({ "command": "google-chrome https://www.paypal.com/login" });
+    // 6. Blocked domain -> Deny (the launch is expressed as an executable
+    //    plus an argument vector).
+    let blocked_action = serde_json::json!({
+        "executable": "firefox",
+        "args": ["https://www.paypal.com/login"]
+    });
     let res_blocked = AuthorizationEngine::evaluate(&db, &ctx, "launch_ghost_app", &blocked_action);
     assert!(matches!(res_blocked, AuthDecision::Deny { .. }));
+
+    // 6b. A free-form command string is no longer accepted for a launch.
+    let free_form = serde_json::json!({ "command": "firefox https://example.com" });
+    let res_free_form = AuthorizationEngine::evaluate(&db, &ctx, "launch_ghost_app", &free_form);
+    assert!(matches!(res_free_form, AuthDecision::Deny { .. }));
 
     // 7. Credential sensitive keyword -> RequireTakeover
     let pass_action = serde_json::json!({ "action": "type", "text": "secret_password_123" });
@@ -479,10 +487,33 @@ fn test_self_healing_and_parameterization() {
 
 #[test]
 fn test_set_of_marks_grounding() {
-    let dummy_img = RgbaImage::new(800, 600);
-    let grounded = SetOfMarksEngine::ground_image(dummy_img);
-    assert!(!grounded.marks.is_empty());
+    // A blank frame contains no interactive elements, so no marks may be
+    // manufactured for it.
+    let blank = RgbaImage::from_pixel(800, 600, image::Rgba([255, 255, 255, 255]));
+    let grounded = SetOfMarksEngine::ground_image(blank);
+    assert!(
+        grounded.marks.is_empty(),
+        "a blank screen must not produce grounding marks"
+    );
+    assert!(grounded.low_confidence);
+
+    // A frame with a visible, high-contrast control produces a mark that
+    // carries the measurements that produced it.
+    let mut frame = RgbaImage::from_pixel(800, 600, image::Rgba([255, 255, 255, 255]));
+    for y in 100..140u32 {
+        for x in 120..260u32 {
+            frame.put_pixel(x, y, image::Rgba([30, 90, 200, 255]));
+        }
+    }
+    let grounded = SetOfMarksEngine::ground_image(frame);
+    assert!(
+        !grounded.marks.is_empty(),
+        "a high-contrast control must be detected"
+    );
     assert_eq!(grounded.marks[0].id, 1);
+    assert!(grounded.marks[0].confidence >= 0.45);
+    assert!(grounded.marks[0].has_verified_measurements());
+    assert!(grounded.marks[0].measurements().is_some());
 
     // Resolve mark lookup
     let resolved = SetOfMarksEngine::resolve_mark(1);

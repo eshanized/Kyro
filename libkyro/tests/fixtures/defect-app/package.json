@@ -1,0 +1,9 @@
+{
+  "name": "defect-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A deliberately defective fixture application used by Kyro's UI audit tests.",
+  "scripts": {
+    "dev": "node server.js"
+  }
+}

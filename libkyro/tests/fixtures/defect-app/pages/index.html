@@ -1,0 +1,23 @@
+<h1>Defect App</h1>
+<p>Welcome to the deliberately defective fixture application.</p>
+
+<!-- Defect 1: a button that does nothing when it is activated. -->
+<button id="noop" type="button">Open details</button>
+
+<!-- Defect 2: an image that does not exist. -->
+<img id="logo" src="/assets/missing-logo.png" alt="Company logo" width="120" />
+
+<!-- Defect 3: a field that claims to be an email address but accepts anything. -->
+<form id="contact" onsubmit="return false;">
+  <label for="email">Email address</label>
+  <input id="email" name="email" type="text" required />
+  <button type="submit">Subscribe</button>
+</form>
+
+<!-- Defect 4: a visible JavaScript error. -->
+<script>
+  console.error("Defect App: the widget service is unavailable");
+  setTimeout(function () {
+    throw new Error("Defect App: uncaught widget failure");
+  }, 0);
+</script>
