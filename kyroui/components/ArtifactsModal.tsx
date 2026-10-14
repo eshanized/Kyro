@@ -13,6 +13,7 @@ import {
   Layers,
   FileCheck,
 } from "lucide-react";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ArtifactsModalProps {
   isOpen: boolean;
@@ -34,6 +35,8 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [exportPath, setExportPath] = useState("");
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [artifactPendingDeletion, setArtifactPendingDeletion] = useState<ArtifactRecord | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -68,8 +71,11 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
   };
 
   const handleDelete = async (id: string) => {
+    setIsDeleting(true);
     try {
       await invoke("delete_artifact", { id });
+      // The record is only removed from the UI once the backend confirmed
+      // the deletion, so a failed delete never loses the entry.
       setArtifacts((prev) => prev.filter((a) => a.id !== id));
       if (selectedArtifact?.id === id) {
         setSelectedArtifact(null);
@@ -78,6 +84,9 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
       setStatusMessage("Artifact deleted successfully.");
     } catch (e: any) {
       setStatusMessage(`Error deleting artifact: ${e}`);
+    } finally {
+      setIsDeleting(false);
+      setArtifactPendingDeletion(null);
     }
   };
 
@@ -239,7 +248,7 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
                   </div>
                   <div className="flex items-center gap-2">
                     <button
-                      onClick={() => handleDelete(selectedArtifact.id)}
+                      onClick={() => setArtifactPendingDeletion(selectedArtifact)}
                       className="px-2.5 py-1.5 rounded-lg bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/30 text-xs flex items-center gap-1 transition"
                       title="Delete Artifact"
                     >
@@ -288,6 +297,23 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={artifactPendingDeletion !== null}
+        title="Delete this artifact?"
+        message={
+          artifactPendingDeletion
+            ? `"${artifactPendingDeletion.name}" will be removed from the artifact registry and its file will be deleted from disk. This cannot be undone.`
+            : ""
+        }
+        confirmLabel="Delete artifact"
+        destructive
+        isBusy={isDeleting}
+        onCancel={() => setArtifactPendingDeletion(null)}
+        onConfirm={() => {
+          if (artifactPendingDeletion) handleDelete(artifactPendingDeletion.id);
+        }}
+      />
     </div>
   );
 };

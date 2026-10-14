@@ -396,7 +396,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                   className={`p-3 rounded-xl cursor-pointer transition flex items-center justify-between border ${
                     selectedIndex === idx
                       ? "bg-neutral-800 text-neutral-100 border-neutral-700"
-                      : "border-transparent hover:bg-neutral-850 text-neutral-300"
+                      : "border-transparent hover:bg-surface-hover text-neutral-300"
                   }`}
                 >
                   <div className="flex items-center gap-3 min-w-0 pr-2">
@@ -427,7 +427,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                 className={`p-3 rounded-xl cursor-pointer transition flex items-center justify-between border ${
                   selectedIndex === idx
                     ? "bg-neutral-800 text-neutral-100 border-neutral-700"
-                    : "border-transparent hover:bg-neutral-850 text-neutral-300"
+                    : "border-transparent hover:bg-surface-hover text-neutral-300"
                 }`}
               >
                 <div className="flex items-center gap-3">

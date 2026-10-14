@@ -2,6 +2,8 @@ import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { McpServerRecord } from "../types/agent";
 import { Plug, Plus, Trash2, X, Server } from "lucide-react";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { InlineNotice } from "./InlineNotice";
 
 interface McpModalProps {
   isOpen: boolean;
@@ -14,6 +16,9 @@ export const McpModal: React.FC<McpModalProps> = ({ isOpen, onClose }) => {
   const [name, setName] = useState("");
   const [command, setCommand] = useState("npx");
   const [args, setArgs] = useState("-y @modelcontextprotocol/server-filesystem /home/snigdha");
+  const [error, setError] = useState<string | null>(null);
+  const [serverPendingDeletion, setServerPendingDeletion] = useState<McpServerRecord | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -48,18 +53,25 @@ export const McpModal: React.FC<McpModalProps> = ({ isOpen, onClose }) => {
       setName("");
       setCommand("npx");
       setArgs("");
+      setError(null);
       await loadServers();
     } catch (err: any) {
-      alert("Failed to add MCP server: " + err);
+      setError("Failed to add MCP server: " + err);
     }
   };
 
   const handleDelete = async (id: string) => {
+    setIsDeleting(true);
     try {
       await invoke("delete_mcp_server", { id });
-      await loadServers();
+      // The row is only removed once the backend confirmed the deletion.
+      setServers((prev) => prev.filter((s) => s.id !== id));
+      setError(null);
     } catch (err: any) {
-      alert("Failed to delete MCP server: " + err);
+      setError("Failed to delete MCP server: " + err);
+    } finally {
+      setIsDeleting(false);
+      setServerPendingDeletion(null);
     }
   };
 
@@ -173,7 +185,8 @@ export const McpModal: React.FC<McpModalProps> = ({ isOpen, onClose }) => {
                     </div>
                   </div>
                   <button
-                    onClick={() => handleDelete(s.id)}
+                    onClick={() => setServerPendingDeletion(s)}
+                    aria-label={`Delete ${s.name}`}
                     className="p-1.5 text-neutral-400 hover:text-red-400 rounded-lg hover:bg-neutral-800 transition"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -183,7 +196,30 @@ export const McpModal: React.FC<McpModalProps> = ({ isOpen, onClose }) => {
             </div>
           )}
         </div>
+
+        {error && (
+          <div className="px-4 py-3 border-t border-[#262626]">
+            <InlineNotice tone="error" message={error} onDismiss={() => setError(null)} />
+          </div>
+        )}
       </div>
+
+      <ConfirmDialog
+        isOpen={serverPendingDeletion !== null}
+        title="Remove this MCP server?"
+        message={
+          serverPendingDeletion
+            ? `"${serverPendingDeletion.name}" will be removed from Kyro and its process will be stopped. This cannot be undone.`
+            : ""
+        }
+        confirmLabel="Remove server"
+        destructive
+        isBusy={isDeleting}
+        onCancel={() => setServerPendingDeletion(null)}
+        onConfirm={() => {
+          if (serverPendingDeletion) handleDelete(serverPendingDeletion.id);
+        }}
+      />
     </div>
   );
 };

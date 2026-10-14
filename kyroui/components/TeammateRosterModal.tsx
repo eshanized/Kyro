@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { BotRecord, BotStatus } from "../types/agent";
 import { Users, Plus, Trash2, X, Sparkles, Check, Activity, Bot, Zap, Wrench, Globe, Terminal, Code, Cpu, Shield, User } from "lucide-react";
 import { AgentAvatar } from "./AgentAvatar";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { InlineNotice } from "./InlineNotice";
 
 interface TeammateRosterModalProps {
   isOpen: boolean;
@@ -20,6 +22,9 @@ export const TeammateRosterModal: React.FC<TeammateRosterModalProps> = ({
   const [bots, setBots] = useState<BotRecord[]>([]);
   const [statuses, setStatuses] = useState<Record<string, BotStatus>>({});
   const [isCreating, setIsCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [botPendingDeletion, setBotPendingDeletion] = useState<BotRecord | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [name, setName] = useState("");
   const [avatar, setAvatar] = useState("bot");
   const [role, setRole] = useState("");
@@ -75,17 +80,24 @@ export const TeammateRosterModal: React.FC<TeammateRosterModalProps> = ({
       setRole("");
       setSystemPrompt("");
       await loadBotsAndStatuses();
+      setError(null);
     } catch (err: any) {
-      alert("Failed to create bot: " + err);
+      setError("Failed to create bot: " + err);
     }
   };
 
   const handleDelete = async (id: string) => {
+    setIsDeleting(true);
     try {
       await invoke("delete_bot", { id });
-      await loadBotsAndStatuses();
+      // The row is only removed once the backend confirmed the deletion.
+      setBots((prev) => prev.filter((b) => b.id !== id));
+      setError(null);
     } catch (err: any) {
-      alert("Failed to delete bot: " + err);
+      setError("Failed to delete bot: " + err);
+    } finally {
+      setIsDeleting(false);
+      setBotPendingDeletion(null);
     }
   };
 
@@ -252,8 +264,9 @@ export const TeammateRosterModal: React.FC<TeammateRosterModalProps> = ({
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleDelete(b.id);
+                            setBotPendingDeletion(b);
                           }}
+                          aria-label={`Remove teammate ${b.name}`}
                           className="p-1.5 text-neutral-500 hover:text-red-400 rounded-lg hover:bg-neutral-800 transition"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -272,8 +285,31 @@ export const TeammateRosterModal: React.FC<TeammateRosterModalProps> = ({
               );
             })}
           </div>
+
+          {error && (
+            <div className="px-4 py-3 border-t border-neutral-800">
+              <InlineNotice tone="error" message={error} onDismiss={() => setError(null)} />
+            </div>
+          )}
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={botPendingDeletion !== null}
+        title="Remove this teammate?"
+        message={
+          botPendingDeletion
+            ? `"${botPendingDeletion.name}" will be removed from the roster and can no longer receive delegated tasks. This cannot be undone.`
+            : ""
+        }
+        confirmLabel="Remove teammate"
+        destructive
+        isBusy={isDeleting}
+        onCancel={() => setBotPendingDeletion(null)}
+        onConfirm={() => {
+          if (botPendingDeletion) handleDelete(botPendingDeletion.id);
+        }}
+      />
     </div>
   );
 };

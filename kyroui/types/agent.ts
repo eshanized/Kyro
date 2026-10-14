@@ -25,6 +25,16 @@ export interface ToolResult {
 }
 
 export interface AgentStepEvent {
+  /** The run that produced the event. */
+  run_id: string;
+  /** The conversation the run belongs to, when it is known. */
+  conversation_id?: string | null;
+  /** The agent that produced the event, when it is known. */
+  agent_id?: string | null;
+  /** The run this event was delegated from, for child-agent output. */
+  parent_run_id?: string | null;
+  /** True when the event was produced by a delegated child run. */
+  is_child_run?: boolean;
   step: number;
   thought: string;
   tool_calls: ToolCall[];
@@ -198,7 +208,16 @@ export interface GroundedMark {
   id: number;
   x: number;
   y: number;
+  /** The bounding box of the detected element. */
+  width: number;
+  height: number;
   label: string;
+  /** The detected role, or "candidate" when the role could not be established. */
+  role: string;
+  /** Confidence in the detection (0..1). */
+  confidence: number;
+  /** The target identity: a semantic element or a visual candidate. */
+  target: { kind: string; value: any };
 }
 
 export interface GroundedScreenResult {
@@ -206,6 +225,12 @@ export interface GroundedScreenResult {
   height: number;
   base64_png: string;
   marks: GroundedMark[];
+  /** How the marks were produced ("visual_candidate_detection" or "browser_semantic"). */
+  source: string;
+  /** The fingerprint of the analysed frame; marks are bound to it. */
+  fingerprint: string;
+  /** True when no candidate cleared the confidence threshold. */
+  low_confidence: boolean;
 }
 
 export interface TimelineStepRecord {

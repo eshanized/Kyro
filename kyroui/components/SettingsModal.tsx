@@ -24,6 +24,8 @@ import {
   FileCode,
 } from "lucide-react";
 import { KyroLogo } from "./Logo";
+import { InlineNotice } from "./InlineNotice";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { TelegramIcon, NvidiaIcon } from "./BrandIcons";
 
 interface SettingsModalProps {
@@ -41,6 +43,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSelectModel,
   initialTab,
 }) => {
+  const [notice, setNotice] = useState<{ tone: "error" | "success" | "info"; message: string } | null>(
+    null
+  );
+  const [secretPendingDeletion, setSecretPendingDeletion] = useState<string | null>(null);
+  const [isDeletingSecret, setIsDeletingSecret] = useState(false);
   const [activeTab, setActiveTab] = useState<
     "model" | "governance" | "telegram" | "sandbox" | "templates" | "diagnostics"
   >("model");
@@ -126,18 +133,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       await loadSettings();
       setTimeout(() => setIsSaved(false), 2000);
     } catch (err) {
-      alert("Failed to save settings: " + err);
+      setNotice({ tone: "error", message: "Failed to save settings: " + err });
     } finally {
       setLoading(false);
     }
   };
 
   const handleDeleteSecret = async (key: string) => {
+    setIsDeletingSecret(true);
     try {
       await invoke("delete_secret_key", { key });
       await loadSettings();
+      setNotice({ tone: "success", message: `The ${key} key was removed.` });
     } catch (e) {
-      alert("Failed to delete key: " + e);
+      // The key is only reported as removed once the backend confirmed it.
+      setNotice({ tone: "error", message: "Failed to delete key: " + e });
+    } finally {
+      setIsDeletingSecret(false);
+      setSecretPendingDeletion(null);
     }
   };
 
@@ -181,6 +194,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 select-text">
       <div className="w-full max-w-3xl bg-[#111111] border border-neutral-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+        {notice && (
+          <div className="px-6 pt-4">
+            <InlineNotice
+              tone={notice.tone}
+              message={notice.message}
+              onDismiss={() => setNotice(null)}
+            />
+          </div>
+        )}
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800 bg-[#141414]">
           <div className="flex items-center gap-2.5">
@@ -315,7 +337,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                   {metadata.nvidia_configured && (
                     <button
-                      onClick={() => handleDeleteSecret("nvidia")}
+                      onClick={() => setSecretPendingDeletion("nvidia")}
                       className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
                       title="Purge key from secure vault"
                     >
@@ -434,7 +456,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                   {metadata.telegram_configured && (
                     <button
-                      onClick={() => handleDeleteSecret("telegram_bot_token")}
+                      onClick={() => setSecretPendingDeletion("telegram_bot_token")}
                       className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
                     >
                       <Trash2 className="w-3.5 h-3.5" /> Purge
@@ -696,6 +718,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={secretPendingDeletion !== null}
+        title="Remove this stored key?"
+        message={
+          secretPendingDeletion
+            ? `The ${secretPendingDeletion} key will be purged from the secure vault. Kyro will not be able to use it until you enter it again.`
+            : ""
+        }
+        confirmLabel="Purge key"
+        destructive
+        isBusy={isDeletingSecret}
+        onCancel={() => setSecretPendingDeletion(null)}
+        onConfirm={() => {
+          if (secretPendingDeletion) handleDeleteSecret(secretPendingDeletion);
+        }}
+      />
     </div>
   );
 };

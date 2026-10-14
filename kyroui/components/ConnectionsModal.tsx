@@ -1029,7 +1029,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
         {/* CONNECT MODAL DIALOG */}
         {connectingItem && (
-          <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
             <div className="w-full max-w-md bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4">
               <div className="flex items-center justify-between border-b border-[#262626] pb-3">
                 <div className="flex items-center gap-2.5">
@@ -1281,7 +1281,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
         {/* MANAGE POLICIES DIALOG */}
         {managingAccount && (
-          <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
             <div className="w-full max-w-2xl bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4 max-h-[85vh] flex flex-col">
               <div className="flex items-center justify-between border-b border-[#262626] pb-3">
                 <div>

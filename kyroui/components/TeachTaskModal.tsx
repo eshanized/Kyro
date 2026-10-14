@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   Info,
 } from "lucide-react";
+import { InlineNotice } from "./InlineNotice";
 
 interface TeachTaskModalProps {
   isOpen: boolean;
@@ -55,6 +56,11 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
   const [taskToDelete, setTaskToDelete] = useState<DeleteTarget | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Inline notice for operation failures (never a blocking browser dialog).
+  const [notice, setNotice] = useState<{ tone: "error" | "success" | "info"; message: string } | null>(
+    null
+  );
 
   // New routine fields
   const [routineName, setRoutineName] = useState("");
@@ -102,14 +108,15 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
 
   const handleStartRecord = async () => {
     if (!recordName.trim()) {
-      alert("Please provide a name for this workflow");
+      setNotice({ tone: "error", message: "Please provide a name for this workflow." });
       return;
     }
     try {
       await invoke("start_teach_task", { name: recordName, description: recordDesc });
       setIsRecording(true);
+      setNotice(null);
     } catch (err: any) {
-      alert("Error starting recording: " + err);
+      setNotice({ tone: "error", message: "Error starting recording: " + err });
     }
   };
 
@@ -120,9 +127,10 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
       setRecordName("");
       setRecordDesc("");
       setActiveTab("skills");
+      setNotice(null);
       await loadData();
     } catch (err: any) {
-      alert("Error stopping recording: " + err);
+      setNotice({ tone: "error", message: "Error stopping recording: " + err });
     }
   };
 
@@ -130,8 +138,9 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
     setReplayingId(id);
     try {
       await invoke("replay_skill", { skillId: id });
+      setNotice(null);
     } catch (err: any) {
-      alert("Error replaying skill: " + err);
+      setNotice({ tone: "error", message: "Error replaying skill: " + err });
     } finally {
       setReplayingId(null);
     }
@@ -152,9 +161,10 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
         },
       });
       setRoutineName("");
+      setNotice(null);
       await loadData();
     } catch (err: any) {
-      alert("Error creating routine: " + err);
+      setNotice({ tone: "error", message: "Error creating routine: " + err });
     }
   };
 
@@ -322,6 +332,13 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {notice && (
+            <InlineNotice
+              tone={notice.tone}
+              message={notice.message}
+              onDismiss={() => setNotice(null)}
+            />
+          )}
           {/* TAB 1: SAVED SKILLS */}
           {activeTab === "skills" && (
             <div className="space-y-4">
@@ -724,7 +741,7 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
 
       {/* EXPLICIT CONFIRMATION DIALOG */}
       {taskToDelete && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
           <div
             className="w-full max-w-md bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4"
             role="dialog"
