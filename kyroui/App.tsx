@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -20,6 +20,7 @@ import { ConnectionsModal } from "./components/ConnectionsModal";
 import { TimelineDrawer } from "./components/TimelineDrawer";
 import { ArtifactsModal } from "./components/ArtifactsModal";
 import { CommandPalette } from "./components/CommandPalette";
+import { InlineNotice } from "./components/InlineNotice";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import { KyroLogo } from "./components/Logo";
 import { AgentAvatar } from "./components/AgentAvatar";
@@ -94,8 +95,19 @@ export const App: React.FC = () => {
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequest[]>([]);
-  const [liveSteps, setLiveSteps] = useState<AgentStepEvent[]>([]);
+  /**
+   * Live step events, grouped by the run that produced them.
+   *
+   * Grouping by run keeps simultaneous runs apart, and it means the events of
+   * a background run are preserved when the user switches conversation
+   * instead of being lost.
+   */
+  const [liveStepsByRun, setLiveStepsByRun] = useState<Record<string, AgentStepEvent[]>>({});
   const [screenPreview, setScreenPreview] = useState<string | null>(null);
+  /** Non-blocking feedback for operations that failed outside of a modal. */
+  const [notice, setNotice] = useState<{ tone: "error" | "success" | "info"; message: string } | null>(
+    null
+  );
   const [groundedResult, setGroundedResult] = useState<GroundedScreenResult | null>(null);
 
   // Voice Dictation & Text-to-Speech
@@ -176,12 +188,36 @@ export const App: React.FC = () => {
     };
     window.addEventListener("keydown", handleGlobalKeyDown);
 
-    // Listen to real-time agent turn step updates from Rust engine
+    // Listen to real-time agent turn step updates from Rust engine.
+    //
+    // Every event carries the identity of the run and the conversation it
+    // belongs to, so that events from concurrent runs are routed to the right
+    // timeline and events for another conversation never update this one.
     const unlistenPromise = listen<AgentStepEvent>("agent:step", (event) => {
-      setLiveSteps((prev) => {
-        const existing = prev.filter((s) => s.step !== event.payload.step);
-        return [...existing, event.payload].sort((a, b) => a.step - b.step);
+      const payload = event.payload;
+      if (!payload || !payload.run_id) {
+        // An event without a run identity cannot be attributed safely.
+        return;
+      }
+
+      setLiveStepsByRun((prev) => {
+        const runSteps = prev[payload.run_id] ?? [];
+        const withoutSameStep = runSteps.filter((s) => s.step !== payload.step);
+        return {
+          ...prev,
+          [payload.run_id]: [...withoutSameStep, payload].sort((a, b) => a.step - b.step),
+        };
       });
+
+      const currentConversation = activeConvIdRef.current;
+      const belongsToActiveConversation =
+        !payload.conversation_id || !currentConversation
+          ? false
+          : payload.conversation_id === currentConversation;
+
+      if (belongsToActiveConversation) {
+        setActiveRunId(payload.run_id);
+      }
     });
 
     // Governance & Takeover polling
@@ -210,8 +246,11 @@ export const App: React.FC = () => {
       loadMessages(activeConvId);
     } else {
       setMessages([]);
-      setLiveSteps([]);
     }
+    // The live steps of the previous conversation are kept in the per-run
+    // store, so switching back to it restores its timeline.  Only the
+    // selection of the "current" run is reset here.
+    setActiveRunId(null);
   }, [activeConvId]);
 
   useEffect(() => {
@@ -225,9 +264,55 @@ export const App: React.FC = () => {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [sessionToDelete, isDeletingSession]);
 
+  /**
+   * The live steps that belong to the conversation that is currently open.
+   *
+   * When a specific run is active its steps are shown; otherwise the most
+   * recently updated run of the active conversation is used.  Runs belonging
+   * to other conversations are never shown here.
+   */
+  const liveSteps = useMemo<AgentStepEvent[]>(() => {
+    const byConversation = Object.values(liveStepsByRun).filter((steps) => {
+      const first = steps[0];
+      if (!first) return false;
+      if (!first.conversation_id) return false;
+      return first.conversation_id === activeConvId;
+    });
+    if (activeRunId && liveStepsByRun[activeRunId]) {
+      const candidate = liveStepsByRun[activeRunId];
+      const first = candidate[0];
+      if (!first?.conversation_id || first.conversation_id === activeConvId) {
+        return candidate;
+      }
+    }
+    if (byConversation.length === 0) return [];
+    return byConversation.reduce((latest, current) => {
+      const latestStep = latest[0];
+      const currentStep = current[0];
+      if (!latestStep || !currentStep) return current;
+      return currentStep.step >= latestStep.step ? current : latest;
+    });
+  }, [liveStepsByRun, activeRunId, activeConvId]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, liveSteps]);
+
+  /**
+   * Clears the live steps of a single run.
+   *
+   * The steps of other runs are left untouched, so clearing one run never
+   * removes the timeline of a concurrent one.
+   */
+  const clearRunSteps = (runId: string | null) => {
+    if (!runId) return;
+    setLiveStepsByRun((prev) => {
+      if (!(runId in prev)) return prev;
+      const next = { ...prev };
+      delete next[runId];
+      return next;
+    });
+  };
 
   const sendNotification = (title: string, body: string) => {
     if ("Notification" in window && Notification.permission === "granted") {
@@ -258,7 +343,7 @@ export const App: React.FC = () => {
       if (list.length === 0) {
         setActiveConvId(null);
         setMessages([]);
-        setLiveSteps([]);
+        setLiveStepsByRun({});
       } else if (!currentId || !list.some((c) => c.id === currentId)) {
         setActiveConvId(list[0].id);
       }
@@ -307,7 +392,7 @@ export const App: React.FC = () => {
         } else {
           setActiveConvId(null);
           setMessages([]);
-          setLiveSteps([]);
+          setLiveStepsByRun({});
         }
       } else {
         if (!updatedList.some((c) => c.id === activeConvIdRef.current)) {
@@ -318,7 +403,7 @@ export const App: React.FC = () => {
           } else {
             setActiveConvId(null);
             setMessages([]);
-            setLiveSteps([]);
+            setLiveStepsByRun({});
           }
         }
       }
@@ -337,7 +422,8 @@ export const App: React.FC = () => {
       const msgs = await invoke<Message[]>("get_messages", { conversationId: convId });
       if (activeConvIdRef.current === convId) {
         setMessages(msgs);
-        setLiveSteps([]);
+        // The live steps of the runs of this conversation are kept, so that a
+        // background run is not interrupted by reloading the history.
       }
     } catch (err) {
       console.error("Failed to load messages:", err);
@@ -356,7 +442,7 @@ export const App: React.FC = () => {
       setConversations([newConv, ...conversations]);
       setActiveConvId(id);
       setMessages([]);
-      setLiveSteps([]);
+      setLiveStepsByRun({});
     } catch (err) {
       console.error("Failed to create conversation:", err);
     }
@@ -391,7 +477,10 @@ export const App: React.FC = () => {
 
   const toggleVoiceDictation = () => {
     if (!recognitionRef.current) {
-      alert("Speech recognition is not supported in this browser/webview engine.");
+      setNotice({
+        tone: "error",
+        message: "Speech recognition is not supported in this browser/webview engine.",
+      });
       return;
     }
     if (isListening) {
@@ -513,7 +602,7 @@ export const App: React.FC = () => {
     const runId = "run_" + crypto.randomUUID();
     setActiveRunId(runId);
     setIsAgentRunning(true);
-    setLiveSteps([]);
+    clearRunSteps(runId);
 
     const priorHistory = messages.map((m) => ({
       role: m.role,
@@ -601,7 +690,7 @@ export const App: React.FC = () => {
       const res = await invoke<any>("take_screenshot");
       setScreenPreview(`data:image/png;base64,${res.base64_png}`);
     } catch (err) {
-      alert("Screen capture error: " + err);
+      setNotice({ tone: "error", message: "Screen capture error: " + err });
     }
   };
 
@@ -611,7 +700,7 @@ export const App: React.FC = () => {
       await invoke("toggle_ghost_mode", { enabled: next });
       setIsGhostMode(next);
     } catch (err: any) {
-      alert("Error toggling Ghost Mode: " + err);
+      setNotice({ tone: "error", message: "Error toggling Ghost Mode: " + err });
     }
   };
 
@@ -620,7 +709,7 @@ export const App: React.FC = () => {
       const res = await invoke<GroundedScreenResult>("capture_grounded_screen");
       setGroundedResult(res);
     } catch (err: any) {
-      alert("Set-of-Marks grounding error: " + err);
+      setNotice({ tone: "error", message: "Set-of-Marks grounding error: " + err });
     }
   };
 
@@ -999,7 +1088,10 @@ export const App: React.FC = () => {
               <div className="text-xs text-neutral-200">
                 <div className="font-semibold">Set-of-Marks (SoM) Grounding Active</div>
                 <div className="text-[11px] text-neutral-400">
-                  {groundedResult.marks.length} interactive tags calibrated. Model clicks by mark ID with 100% precision.
+                  {groundedResult.marks.length} grounded element
+                  {groundedResult.marks.length === 1 ? "" : "s"} detected (
+                  {groundedResult.source}). Each tag carries the measurements that produced it; a
+                  tag becomes stale when the screen changes.
                 </div>
               </div>
             </div>
@@ -1009,6 +1101,17 @@ export const App: React.FC = () => {
             >
               Dismiss
             </button>
+          </div>
+        )}
+
+        {/* Non-blocking operation feedback */}
+        {notice && (
+          <div className="px-4 pt-3">
+            <InlineNotice
+              tone={notice.tone}
+              message={notice.message}
+              onDismiss={() => setNotice(null)}
+            />
           </div>
         )}
 
@@ -1128,10 +1231,16 @@ export const App: React.FC = () => {
 
               {/* Real-time Tool Action Cards & Thoughts */}
               {liveSteps.map((step) => (
-                <React.Fragment key={step.step}>
+                <React.Fragment key={`${step.run_id}-${step.step}`}>
                   {step.thought && (
                     <div className="flex flex-col items-start my-2 max-w-2xl">
                       <div className="px-4 py-3 rounded-2xl rounded-bl-none bg-[#121212] text-[#ededed] border border-[#262626] shadow-sm text-sm">
+                        {step.is_child_run && (
+                          <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-mono">
+                            Delegated agent
+                            {step.agent_id ? ` · ${step.agent_id}` : ""}
+                          </div>
+                        )}
                         <MarkdownRenderer content={step.thought} />
                       </div>
                     </div>
@@ -1335,7 +1444,7 @@ export const App: React.FC = () => {
 
       {/* Confirmation Dialog for Session Deletion */}
       {sessionToDelete && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
           <div
             className="w-full max-w-md bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4"
             role="dialog"
