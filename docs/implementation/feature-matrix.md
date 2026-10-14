@@ -45,3 +45,9 @@ This matrix tracks the authoritative implementation and verification status of a
 | **Telegram Remote Bridge** | P1 | `verified` | `TelegramBridge` fail-closed authentication (rejects empty or mismatched `allowed_chat_id`), dispatches tasks to `AgentLoopEngine`, mobile approvals |
 | **Floating HUD Widget** | P1 | `verified` | `HudPanel.tsx`, `toggle_hud_window` |
 | **Screen Region Snipper** | P1 | `verified` | `Snipper.tsx`, `take_region_screenshot` |
+| **Authoritative Browser Capability Registry** | P0 | `verified` | `browser_capabilities_reports_supported_and_unsupported_browsers`, platform discovery of Firefox, Chrome, Chromium, Edge, Brave, Vivaldi, Opera |
+| **Provider-Neutral Browser Automation Interface** | P0 | `verified` | `worker.mjs` native WebSocket protocol adapter supporting WebDriver BiDi (Firefox) and CDP (Chromium/Brave/Edge/Chrome) with session isolation |
+| **Strict Browser Selection Priority & Non-Substitution** | P0 | `verified` | `kyro_does_not_silently_substitute_another_browser`, `unsupported_browser_rejection_names_alternatives` (fails closed, lists available alternatives) |
+| **Dynamic Project Discovery & Resolution** | P0 | `verified` | `test_ui_audit_reports_missing_projects_honestly`, `plan_rejects_missing_project_name_and_path`, `plan_uses_explicit_project_path`, `unrelated_projects_are_not_included_in_candidates` |
+| **Autonomous UI Audit Workflow** | P1 | `verified` | `test_ui_audit_finds_the_known_defects` (verifies dev server ready URL, routes, viewports, reproducible console/network/form/image/responsive bugs) |
+| **Browser Preferences & Settings UI** | P1 | `verified` | `browser_settings.test.tsx`, `SettingsModal.tsx` Browser tab, `save_browser_settings`, `get_browser_settings` |

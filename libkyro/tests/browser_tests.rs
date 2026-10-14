@@ -67,10 +67,10 @@ async fn prerequisites() -> Option<String> {
     let manager = BrowserAutomationManager::new();
     match manager.capabilities().await {
         Ok(caps) => {
-            if caps.browsers.iter().any(|b| b.available) {
+            if caps.browsers.iter().any(|b| b.available && b.automatable) {
                 None
             } else {
-                Some("No usable Firefox binary was found. Install Firefox and re-run.".to_string())
+                Some("No usable automatable browser binary was found. Install a supported browser and re-run.".to_string())
             }
         }
         Err(e) => Some(format!("Browser capabilities unavailable: {}", e)),
@@ -499,7 +499,7 @@ async fn a_closed_session_cannot_be_used() {
 }
 
 #[tokio::test]
-#[ignore = "requires Firefox and Node.js; run with --ignored"]
+#[ignore = "requires Node.js and an automatable browser; run with --ignored"]
 async fn kyro_does_not_silently_substitute_another_browser() {
     if let Some(reason) = prerequisites().await {
         eprintln!("SKIPPED: {}", reason);
@@ -508,12 +508,101 @@ async fn kyro_does_not_silently_substitute_another_browser() {
 
     let manager = BrowserAutomationManager::new();
     let err = manager
-        .create_session("chromium", true, Some("run_browser_test"), &[])
+        .create_session("safari", true, Some("run_browser_test"), &[])
         .await
-        .expect_err("another browser must be refused");
+        .expect_err("an unsupported browser must be refused");
     assert!(
-        err.contains("firefox") || err.contains("Firefox"),
-        "the error must name the missing prerequisite: {}",
+        err.contains("safari") && (err.contains("Available supported alternatives") || err.contains("Available supported browsers")),
+        "the error must explain why the requested browser cannot be automated and list alternatives: {}",
         err
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium and Node.js; run with --ignored"]
+async fn browser_session_starts_with_chromium_and_navigates() {
+    if kyro_lib::browser::worker::find_node().is_none() {
+        return;
+    }
+    let server = FixtureServer::start(FIXTURE);
+    let manager = BrowserAutomationManager::new();
+    let caps = manager.capabilities().await.expect("caps");
+    if !caps
+        .browsers
+        .iter()
+        .any(|b| b.id == "chromium" && b.available && b.automatable)
+    {
+        eprintln!("SKIPPED: chromium is not available or automatable");
+        return;
+    }
+
+    let session = manager
+        .create_session("chromium", true, Some("run_chromium_test"), &[])
+        .await
+        .expect("chromium session should start");
+
+    assert_eq!(session.browser, "chromium");
+    assert_eq!(session.driver, "cdp");
+    assert!(session.profile_isolated);
+
+    let nav = manager
+        .navigate(&session.session_id, &server.url("/"), 30000, false)
+        .await
+        .expect("navigation");
+    assert_eq!(nav.status, "success");
+    assert_eq!(nav.title.as_deref(), Some("Kyro Fixture"));
+
+    let snapshot = manager
+        .snapshot(&session.session_id)
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.status, "success");
+
+    let elements = snapshot.data["elements"].as_array().expect("elements");
+    assert!(!elements.is_empty());
+
+    manager.close_session(&session.session_id).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires Brave and Node.js; run with --ignored"]
+async fn browser_session_starts_with_brave_and_navigates() {
+    if kyro_lib::browser::worker::find_node().is_none() {
+        return;
+    }
+    let server = FixtureServer::start(FIXTURE);
+    let manager = BrowserAutomationManager::new();
+    let caps = manager.capabilities().await.expect("caps");
+    if !caps
+        .browsers
+        .iter()
+        .any(|b| b.id == "brave" && b.available && b.automatable)
+    {
+        eprintln!("SKIPPED: brave is not available or automatable");
+        return;
+    }
+
+    let session = manager
+        .create_session("brave", true, Some("run_brave_test"), &[])
+        .await
+        .expect("brave session should start");
+
+    assert_eq!(session.browser, "brave");
+    assert_eq!(session.driver, "cdp");
+    assert!(session.profile_isolated);
+
+    let nav = manager
+        .navigate(&session.session_id, &server.url("/"), 30000, false)
+        .await
+        .expect("navigation");
+    assert_eq!(nav.status, "success");
+    assert_eq!(nav.title.as_deref(), Some("Kyro Fixture"));
+
+    let snapshot = manager
+        .snapshot(&session.session_id)
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.status, "success");
+
+    manager.close_session(&session.session_id).await.ok();
 }

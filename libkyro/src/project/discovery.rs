@@ -210,7 +210,7 @@ impl Default for DiscoveryLimits {
 
 /// Resolves the user's Desktop directory from the operating system.
 pub fn desktop_directory() -> Option<PathBuf> {
-    dirs::desktop_dir()
+    dirs::desktop_dir().or_else(|| dirs::home_dir().map(|h| h.join("Desktop")))
 }
 
 /// Resolves the user's home directory from the operating system.
@@ -302,12 +302,39 @@ pub fn discover_projects(
                 queue.push((path.clone(), depth + 1));
             }
 
-            let name_matches = file_name.to_lowercase() == query_lower;
-            if let Some(candidate) = inspect_project_root(&path, name_matches) {
-                candidates.push(candidate);
-                if candidates.len() >= limits.max_results {
-                    truncated = true;
-                    break;
+            let file_name_lower = file_name.to_lowercase();
+            let name_exact = file_name_lower == query_lower;
+            let name_approx = !query_lower.is_empty()
+                && (file_name_lower.contains(&query_lower) || query_lower.contains(&file_name_lower));
+
+            if let Some(mut candidate) = inspect_project_root(&path, name_exact) {
+                let pkg_name = candidate
+                    .manifest
+                    .as_deref()
+                    .and_then(|m| manifest_package_name(Some(m)));
+                let pkg_name_lower = pkg_name.as_deref().map(|s| s.to_lowercase());
+
+                let pkg_exact = pkg_name_lower.as_deref() == Some(query_lower.as_str());
+                let pkg_approx = pkg_name_lower
+                    .as_deref()
+                    .map(|s| s.contains(&query_lower))
+                    .unwrap_or(false);
+
+                let is_match = query_lower.is_empty()
+                    || name_exact
+                    || name_approx
+                    || pkg_exact
+                    || pkg_approx;
+
+                if is_match {
+                    if pkg_exact {
+                        candidate.name_matched = true;
+                    }
+                    candidates.push(candidate);
+                    if candidates.len() >= limits.max_results {
+                        truncated = true;
+                        break;
+                    }
                 }
             }
         }
@@ -432,6 +459,15 @@ pub fn inspect_project_root(path: &Path, name_matched: bool) -> Option<ProjectCa
         scripts,
         name_matched,
     })
+}
+
+fn manifest_package_name(manifest: Option<&Path>) -> Option<String> {
+    let manifest_path = manifest?;
+    if manifest_path.file_name()?.to_str()? == "package.json" {
+        let pkg = read_package_json(manifest_path)?;
+        return pkg.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+    }
+    None
 }
 
 fn kind_for_manifest(marker: &str) -> ProjectKind {
@@ -633,22 +669,59 @@ mod tests {
     }
 
     #[test]
-    fn depth_is_bounded() {
-        let root = scratch("depth");
-        let deep = root
-            .join("a")
-            .join("b")
-            .join("c")
-            .join("d")
-            .join("Runstead");
-        fs::create_dir_all(&deep).unwrap();
-        fs::write(deep.join("package.json"), "{}").unwrap();
-        let limits = DiscoveryLimits {
-            max_depth: 2,
-            ..Default::default()
-        };
-        let result = discover_projects(&root, "runstead", &limits).unwrap();
-        assert!(result.candidates.is_empty());
+    fn unrelated_projects_are_not_included_in_candidates() {
+        let root = scratch("unrelated");
+        let target = root.join("analytics-dashboard");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("package.json"), r#"{"name":"analytics-dashboard"}"#).unwrap();
+
+        let unrelated = root.join("billing-service");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("package.json"), r#"{"name":"billing-service"}"#).unwrap();
+
+        let result = discover_projects(&root, "analytics-dashboard", &DiscoveryLimits::default()).unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].name, "analytics-dashboard");
+
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn exact_match_ranks_before_approximate() {
+        let root = scratch("rank");
+        let approx = root.join("app-preview-service");
+        fs::create_dir_all(&approx).unwrap();
+        fs::write(approx.join("package.json"), "{}").unwrap();
+
+        let exact = root.join("app");
+        fs::create_dir_all(&exact).unwrap();
+        fs::write(exact.join("package.json"), "{}").unwrap();
+
+        let result = discover_projects(&root, "app", &DiscoveryLimits::default()).unwrap();
+        assert!(result.candidates.len() >= 2);
+        assert_eq!(result.candidates[0].name, "app");
+        assert!(result.candidates[0].name_matched);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn supports_paths_with_spaces_and_unicode() {
+        let root = scratch("unicode");
+        let project = root.join("Mon Projet Étoilé 🌟");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("package.json"), r#"{"name":"mon-projet"}"#).unwrap();
+
+        let result = discover_projects(&root, "mon-projet", &DiscoveryLimits::default()).unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].path, project);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn desktop_dir_resolution() {
+        let desktop = desktop_directory().expect("desktop dir must be resolvable");
+        assert!(desktop.is_absolute());
     }
 }

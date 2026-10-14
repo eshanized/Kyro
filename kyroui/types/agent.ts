@@ -390,3 +390,38 @@ export interface AccountToolView {
   can_auto_approve?: boolean;
   schema_fingerprint?: string;
 }
+
+export interface BrowserInfo {
+  id: string;
+  name: string;
+  display_name: string;
+  family: string;
+  path: string;
+  version?: string | null;
+  available: boolean;
+  automatable: boolean;
+  adapter: string;
+  unavailable_reason?: string | null;
+  platform?: string | null;
+}
+
+export interface BrowserCapabilities {
+  browsers: BrowserInfo[];
+  default_browser_id?: string | null;
+  driver: {
+    name: string;
+    version: string;
+    status: string;
+    bidi_supported: boolean;
+    cdp_supported?: boolean;
+    external_driver_required: boolean;
+  };
+  node_version?: string | null;
+  platform?: string | null;
+}
+
+export interface BrowserSettings {
+  selected_browser: string;
+  headless_default: boolean;
+}
+

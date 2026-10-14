@@ -24,10 +24,15 @@ use std::sync::Arc;
 pub struct AuditOptions {
     /// The name of the project to find.
     pub project_name: String,
-    /// The directory to search.
-    pub search_root: PathBuf,
-    /// The browser to use.  Only `firefox` is supported.
-    pub browser: String,
+    /// Direct path to the project root, if known or provided explicitly.
+    #[serde(default)]
+    pub project_path: Option<PathBuf>,
+    /// The directory to search. When None, resolves dynamically to the user's Desktop.
+    #[serde(default)]
+    pub search_root: Option<PathBuf>,
+    /// The browser to use. None or "auto" resolves via priority rules (explicit -> settings -> OS default).
+    #[serde(default)]
+    pub browser: Option<String>,
     /// Whether the browser runs headless.
     pub headless: bool,
     /// Whether the development server keeps running after the audit.
@@ -45,9 +50,10 @@ pub struct AuditOptions {
 impl Default for AuditOptions {
     fn default() -> Self {
         Self {
-            project_name: "Runstead".into(),
-            search_root: PathBuf::from("."),
-            browser: "firefox".into(),
+            project_name: String::new(),
+            project_path: None,
+            search_root: None,
+            browser: None,
             headless: true,
             keep_server_running: false,
             viewports: vec![(1280, 800), (768, 1024), (390, 844)],
@@ -151,9 +157,50 @@ impl UiAuditWorkflow {
     /// No code is executed and no process is started; the plan exists so that
     /// the user can approve the exact command before it runs.
     pub async fn plan(&self, options: &AuditOptions) -> Result<AuditPlan, String> {
+        // 1. If an explicit project path is supplied, use it directly.
+        if let Some(ref path) = options.project_path {
+            if !path.exists() {
+                return Err(format!("The project path '{}' does not exist.", path.display()));
+            }
+            let candidate = crate::project::discovery::inspect_project_root(path, true)
+                .ok_or_else(|| format!("'{}' does not contain a recognized project manifest or repository marker.", path.display()))?;
+            let command = DevServerManager::choose_command(&candidate)?;
+            return Ok(AuditPlan {
+                project: candidate,
+                command,
+                discovery_summary: format!("Using explicitly provided project path at '{}'.", path.display()),
+            });
+        }
+
+        // 2. If the project name is an existing directory path, inspect it directly
+        let trimmed_name = options.project_name.trim();
+        if trimmed_name.is_empty() {
+            return Err("A project name or path must be specified for the UI audit. Specify the project name (e.g. from the user's task or explicit selection).".to_string());
+        }
+
+        let as_path = PathBuf::from(trimmed_name);
+        if as_path.is_absolute() && as_path.is_dir() {
+            let candidate = crate::project::discovery::inspect_project_root(&as_path, true)
+                .ok_or_else(|| format!("'{}' does not contain a recognized project manifest or repository marker.", as_path.display()))?;
+            let command = DevServerManager::choose_command(&candidate)?;
+            return Ok(AuditPlan {
+                project: candidate,
+                command,
+                discovery_summary: format!("Using explicit project directory at '{}'.", as_path.display()),
+            });
+        }
+
+        // 3. Resolve search root: explicit search_root or user's Desktop directory
+        let root = match &options.search_root {
+            Some(r) => r.clone(),
+            None => crate::project::discovery::desktop_directory().ok_or_else(|| {
+                "The user's Desktop directory could not be resolved on this system. Provide an explicit 'search_root'.".to_string()
+            })?,
+        };
+
         let discovery = crate::project::discovery::discover_projects(
-            &options.search_root,
-            &options.project_name,
+            &root,
+            trimmed_name,
             &DiscoveryLimits::default(),
         )?;
         if discovery.candidates.is_empty() {
@@ -173,7 +220,7 @@ impl UiAuditWorkflow {
             }
             return Err(format!(
                 "Several projects match '{}'. Select the intended one before running the audit:{}",
-                options.project_name, listing
+                trimmed_name, listing
             ));
         }
         let project = discovery.candidates[0].clone();
@@ -239,15 +286,16 @@ impl UiAuditWorkflow {
         });
 
         // ---- Open the preview --------------------------------------------
+        let requested_browser = options.browser.as_deref().unwrap_or("auto");
         on_progress(AuditProgress {
             stage: AuditStage::OpenPreview,
-            message: format!("Opening {} in {}", preview_url, options.browser),
+            message: format!("Opening {} in browser ({})", preview_url, requested_browser),
             completed: false,
         });
         let session = self
             .browser
             .create_session(
-                &options.browser,
+                requested_browser,
                 options.headless,
                 options.run_id.as_deref(),
                 &[],
@@ -1143,5 +1191,75 @@ mod tests {
         assert_eq!(obs.h1_count, 1);
         assert_eq!(obs.unnamed_interactive_elements, 1);
         assert_eq!(obs.broken_images.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plan_rejects_missing_project_name_and_path() {
+        let browser = Arc::new(BrowserAutomationManager::new());
+        let dev_servers = Arc::new(DevServerManager::new());
+        let workflow = UiAuditWorkflow::new(browser, dev_servers);
+
+        let options = AuditOptions {
+            project_name: "".to_string(),
+            project_path: None,
+            ..Default::default()
+        };
+
+        let err = workflow.plan(&options).await.unwrap_err();
+        assert!(err.contains("project name or path must be specified"));
+    }
+
+    #[tokio::test]
+    async fn plan_uses_explicit_project_path() {
+        let browser = Arc::new(BrowserAutomationManager::new());
+        let dev_servers = Arc::new(DevServerManager::new());
+        let workflow = UiAuditWorkflow::new(browser, dev_servers);
+
+        let temp = std::env::temp_dir().join(format!("kyro_explicit_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(
+            temp.join("package.json"),
+            r#"{"name":"explicit-test","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+
+        let options = AuditOptions {
+            project_name: "".to_string(),
+            project_path: Some(temp.clone()),
+            ..Default::default()
+        };
+
+        let plan = workflow.plan(&options).await.unwrap();
+        assert_eq!(plan.project.path, temp);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[tokio::test]
+    async fn plan_rejects_ambiguous_matches() {
+        let browser = Arc::new(BrowserAutomationManager::new());
+        let dev_servers = Arc::new(DevServerManager::new());
+        let workflow = UiAuditWorkflow::new(browser, dev_servers);
+
+        let root = std::env::temp_dir().join(format!("kyro_ambig_test_{}", uuid::Uuid::new_v4()));
+        let p1 = root.join("app-one");
+        let p2 = root.join("app-two");
+        std::fs::create_dir_all(&p1).unwrap();
+        std::fs::create_dir_all(&p2).unwrap();
+        std::fs::write(p1.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::write(p2.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let options = AuditOptions {
+            project_name: "app".to_string(),
+            project_path: None,
+            search_root: Some(root.clone()),
+            ..Default::default()
+        };
+
+        let err = workflow.plan(&options).await.unwrap_err();
+        assert!(err.contains("Several projects match"));
+        assert!(err.contains("app-one") && err.contains("app-two"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

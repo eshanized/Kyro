@@ -95,3 +95,40 @@ This log chronicles the engineering remediation, feature completion, and verific
 - Ran linter: `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed with 0 warnings.
 - Ran formatter: `cargo fmt --all -- --check` passed.
 - Ran frontend checks: `npx tsc --noEmit && npm run build` passed with 0 errors.
+
+---
+
+### Phase 8: Generic Browser Automation & Autonomous UI Audit Remediation
+- **Authoritative Browser Capability Registry (`libkyro/src/browser/mod.rs`, `worker.mjs`)**:
+  - Implemented multi-browser discovery across PATH, standard installation directories, and desktop entry registries.
+  - Recognizes Firefox, Firefox ESR, Google Chrome, Chromium, Microsoft Edge, Brave, Vivaldi, and Opera.
+  - Detects OS default browser via `xdg-settings` / `xdg-mime` (Linux) and platform-specific equivalents.
+  - Probes browser executable versions, user data isolation, and automation adapter compatibility without launching everyday profiles or exposing credentials.
+- **Provider-Neutral Worker Engine (`libkyro/browser-worker/worker.mjs`)**:
+  - Refactored worker into a unified architecture supporting two native protocol adapters using Node 20+ built-ins (`WebSocket`, `fetch`):
+    - `FirefoxSession`: Native WebDriver BiDi over WebSocket.
+    - `ChromiumSession`: Chrome DevTools Protocol (CDP) over WebSocket (`Page`, `Runtime`, `Network`, `Log`, `Input`, `Emulation.setDeviceMetricsOverride`).
+  - Implemented session creation, semantic page snapshots, accessible element interaction, form filling, mouse/keyboard events, screenshots, console error capture, failed request tracking, and responsive viewport emulation across both engines.
+- **Strict Non-Substitution & Selection Hierarchy**:
+  - Selection order: 1) Explicit task request, 2) Current audit selection, 3) User saved preference in Kyro DB, 4) OS default when set to Automatic.
+  - Rejection with explanation: If the requested browser is unsupported or unavailable, Kyro fails closed, explains why, and lists available alternatives without silently substituting Firefox or another browser.
+- **Dynamic Project Discovery & Resolution (`libkyro/src/project/discovery.rs`, `workflow.rs`)**:
+  - Removed all hardcoded production defaults for `Runstead` and current directory (`.`).
+  - Added dynamic Desktop directory resolution via `dirs::desktop_dir()` with fallback to `$HOME/Desktop`.
+  - Added support for explicit project paths (`project_path: Option<PathBuf>`) bypassing discovery when provided.
+  - Implemented candidate matching: filters candidates strictly to directories matching query name or package.json `name`; prioritizes exact matches over approximate matches; halts and lists candidates when multiple ambiguous matches exist.
+  - If project name or path is omitted, honestly rejects without guessing.
+- **Frontend Settings UI (`kyroui/components/SettingsModal.tsx`, `types/agent.ts`)**:
+  - Added dedicated "Browser Automation" tab in `SettingsModal`.
+  - Displays Automatic (system default) choice with detected browser indicator.
+  - Lists all discovered automatable browsers with display name, version, protocol, path, and readiness status.
+  - Lists unavailable browsers with structured reason.
+  - Exposes Headless Automation Mode toggle (defaulting to headless, visible on request).
+  - Provides "Refresh Browser Discovery" and "Save Browser Preferences" actions.
+- **Verification & Regression Testing**:
+  - `libkyro` unit tests: 115 tests passed.
+  - `browser_tests.rs`: 14 integration tests passed (covering Firefox BiDi, Chromium CDP, Brave CDP, navigation, snapshots, semantic clicks, form fills, console errors, screenshots, session isolation, and non-substitution validation).
+  - `ui_audit_tests.rs`: 2 end-to-end audit tests passed (running autonomous UI audit against `defect-app` on host Brave/Chromium CDP engine; detecting console errors, 404s, broken images, broken form validations, unhandled controls, mobile horizontal scroll; capturing screenshots and generating report).
+  - `kyroui` vitest suite: 7 test files passed (52 tests total, including `browser_settings.test.tsx`).
+  - `cargo clippy`: 0 warnings.
+  - `npm run build`: built clean.

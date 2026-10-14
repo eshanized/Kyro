@@ -105,18 +105,33 @@ impl BrowserOperationResult {
 /// Capabilities reported by the browser layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserCapabilities {
-    pub browsers: Vec<BrowserBinary>,
+    pub browsers: Vec<BrowserInfo>,
+    #[serde(default)]
+    pub default_browser_id: Option<String>,
     pub driver: DriverInfo,
     pub node_version: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowserBinary {
+pub struct BrowserInfo {
+    pub id: String,
     pub name: String,
+    pub display_name: String,
+    pub family: String,
     pub path: String,
     pub version: Option<String>,
     pub available: bool,
+    pub automatable: bool,
+    pub adapter: String,
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
 }
+
+pub type BrowserBinary = BrowserInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriverInfo {
@@ -125,11 +140,45 @@ pub struct DriverInfo {
     pub external_driver_required: bool,
 }
 
+/// Browser automation preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSettings {
+    pub selected_browser: String,
+    pub headless_default: bool,
+}
+
+impl Default for BrowserSettings {
+    fn default() -> Self {
+        Self {
+            selected_browser: "auto".to_string(),
+            headless_default: true,
+        }
+    }
+}
+
+impl BrowserSettings {
+    pub fn load(db: &crate::storage::Database) -> Self {
+        if let Ok(Some(json)) = db.get_setting("browser_settings") {
+            if let Ok(settings) = serde_json::from_str::<BrowserSettings>(&json) {
+                return settings;
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self, db: &crate::storage::Database) -> Result<(), String> {
+        let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        db.set_setting("browser_settings", &json)
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// The manager owns the worker process and the set of live sessions.
 pub struct BrowserAutomationManager {
     worker: Arc<Mutex<Option<WorkerHandle>>>,
     sessions: Arc<Mutex<HashMap<String, BrowserSession>>>,
     policies: Arc<Mutex<HashMap<String, NavigationPolicy>>>,
+    db: Arc<Mutex<Option<crate::storage::Database>>>,
 }
 
 impl Default for BrowserAutomationManager {
@@ -144,6 +193,18 @@ impl BrowserAutomationManager {
             worker: Arc::new(Mutex::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             policies: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn with_database(self, db: crate::storage::Database) -> Self {
+        self.set_database(db);
+        self
+    }
+
+    pub fn set_database(&self, db: crate::storage::Database) {
+        if let Ok(mut guard) = self.db.try_lock() {
+            *guard = Some(db);
         }
     }
 
@@ -189,29 +250,40 @@ impl BrowserAutomationManager {
             .map(|items| {
                 items
                     .iter()
-                    .map(|b| BrowserBinary {
-                        name: b
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        path: b
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        version: b
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        available: b
-                            .get("available")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
+                    .map(|b| {
+                        let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+                        let display_name = b.get("display_name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
+                        let family = b.get("family").and_then(|v| v.as_str()).unwrap_or("other").to_string();
+                        let path = b.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let version = b.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let available = b.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let automatable = b.get("automatable").and_then(|v| v.as_bool()).unwrap_or(available);
+                        let adapter = b.get("adapter").and_then(|v| v.as_str()).unwrap_or("none").to_string();
+                        let unavailable_reason = b.get("unavailable_reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let is_default = b.get("is_default").and_then(|v| v.as_bool()).unwrap_or(false);
+                        BrowserInfo {
+                            id,
+                            name,
+                            display_name,
+                            family,
+                            path,
+                            version,
+                            available,
+                            automatable,
+                            adapter,
+                            unavailable_reason,
+                            is_default,
+                        }
                     })
                     .collect()
             })
             .unwrap_or_default();
+
+        let default_browser_id = raw
+            .get("default_browser_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let driver = raw
             .get("driver")
@@ -232,16 +304,21 @@ impl BrowserAutomationManager {
                     .unwrap_or(false),
             })
             .unwrap_or_else(|| DriverInfo {
-                name: "webdriver-bidi".into(),
-                version: "native".into(),
+                name: "provider-neutral".into(),
+                version: "2.0".into(),
                 external_driver_required: false,
             });
 
         Ok(BrowserCapabilities {
             browsers,
+            default_browser_id,
             driver,
             node_version: raw
                 .get("node_version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            platform: raw
+                .get("platform")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
         })
@@ -250,15 +327,125 @@ impl BrowserAutomationManager {
     /// Starts a managed browser session.
     pub async fn create_session(
         &self,
-        browser: &str,
+        requested_browser: &str,
         headless: bool,
         run_id: Option<&str>,
         blocked_domains: &[String],
     ) -> Result<BrowserSession, String> {
+        let caps = self.capabilities().await?;
+
+        // 1. Resolve requested browser according to priority order
+        let mut target = requested_browser.trim();
+
+        // If requested is empty or "auto", check user's saved setting
+        let user_setting = {
+            let guard = self.db.lock().await;
+            guard.as_ref().map(BrowserSettings::load).unwrap_or_default()
+        };
+
+        if (target.is_empty() || target.eq_ignore_ascii_case("auto"))
+            && !user_setting.selected_browser.eq_ignore_ascii_case("auto")
+            && !user_setting.selected_browser.trim().is_empty()
+        {
+            target = user_setting.selected_browser.as_str();
+        }
+
+        let chosen_id = if target.is_empty() || target.eq_ignore_ascii_case("auto") {
+            // Automatic: use operating system default browser if automatable
+            if let Some(ref def_id) = caps.default_browser_id {
+                if let Some(def_b) = caps.browsers.iter().find(|b| b.id == *def_id) {
+                    if def_b.available && def_b.automatable {
+                        def_b.id.clone()
+                    } else {
+                        let alternatives: Vec<String> = caps
+                            .browsers
+                            .iter()
+                            .filter(|b| b.available && b.automatable)
+                            .map(|b| format!("{} ({})", b.display_name, b.id))
+                            .collect();
+                        return Err(format!(
+                            "The system default browser '{}' is {} and cannot be automated. Available supported alternatives: {}. Kyro will not silently substitute another browser.",
+                            def_b.display_name,
+                            if !def_b.available { "not installed" } else { "not automatable" },
+                            if alternatives.is_empty() { "none".to_string() } else { alternatives.join(", ") }
+                        ));
+                    }
+                } else {
+                    let alternatives: Vec<String> = caps
+                        .browsers
+                        .iter()
+                        .filter(|b| b.available && b.automatable)
+                        .map(|b| format!("{} ({})", b.display_name, b.id))
+                        .collect();
+                    return Err(format!(
+                        "The system default browser could not be automated. Available supported alternatives: {}. Kyro will not silently substitute another browser.",
+                        if alternatives.is_empty() { "none".to_string() } else { alternatives.join(", ") }
+                    ));
+                }
+            } else if let Some(first_avail) = caps.browsers.iter().find(|b| b.available && b.automatable) {
+                first_avail.id.clone()
+            } else {
+                return Err(
+                    "No automatable browser is currently installed. Install Mozilla Firefox ('sudo apt install firefox-esr') or Chromium ('sudo apt install chromium-browser') and retry.".to_string(),
+                );
+            }
+        } else {
+            // Explicit browser requested
+            let matched = caps.browsers.iter().find(|b| {
+                b.id.eq_ignore_ascii_case(target)
+                    || b.name.eq_ignore_ascii_case(target)
+                    || b.display_name.eq_ignore_ascii_case(target)
+            });
+            match matched {
+                Some(b) if b.available && b.automatable => b.id.clone(),
+                Some(b) if !b.available => {
+                    let alternatives: Vec<String> = caps
+                        .browsers
+                        .iter()
+                        .filter(|a| a.available && a.automatable)
+                        .map(|a| format!("{} ({})", a.display_name, a.id))
+                        .collect();
+                    return Err(format!(
+                        "Requested browser '{}' is not installed ({}). Available supported alternatives: {}. Kyro will not silently substitute another browser.",
+                        b.display_name,
+                        b.unavailable_reason.as_deref().unwrap_or("executable not found"),
+                        if alternatives.is_empty() { "none".to_string() } else { alternatives.join(", ") }
+                    ));
+                }
+                Some(b) => {
+                    let alternatives: Vec<String> = caps
+                        .browsers
+                        .iter()
+                        .filter(|a| a.available && a.automatable)
+                        .map(|a| format!("{} ({})", a.display_name, a.id))
+                        .collect();
+                    return Err(format!(
+                        "Requested browser '{}' is installed but cannot be automated by Kyro ({}). Available supported alternatives: {}. Kyro will not silently substitute another browser.",
+                        b.display_name,
+                        b.unavailable_reason.as_deref().unwrap_or("unsupported automation adapter"),
+                        if alternatives.is_empty() { "none".to_string() } else { alternatives.join(", ") }
+                    ));
+                }
+                None => {
+                    let alternatives: Vec<String> = caps
+                        .browsers
+                        .iter()
+                        .filter(|a| a.available && a.automatable)
+                        .map(|a| format!("{} ({})", a.display_name, a.id))
+                        .collect();
+                    return Err(format!(
+                        "Kyro does not support the browser '{}'. Available supported alternatives: {}. Kyro will not silently substitute another browser.",
+                        target,
+                        if alternatives.is_empty() { "none".to_string() } else { alternatives.join(", ") }
+                    ));
+                }
+            }
+        };
+
         let raw = self
             .raw_call(
                 "session.create",
-                serde_json::json!({ "browser": browser, "headless": headless }),
+                serde_json::json!({ "browser": chosen_id, "headless": headless }),
                 60000,
             )
             .await
@@ -275,7 +462,7 @@ impl BrowserAutomationManager {
             browser: raw
                 .get("browser")
                 .and_then(|v| v.as_str())
-                .unwrap_or(browser)
+                .unwrap_or(&chosen_id)
                 .to_string(),
             browser_path: raw
                 .get("browser_path")
@@ -945,5 +1132,50 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, "failed");
         assert_eq!(result.error_category.as_deref(), Some("navigation_blocked"));
+    }
+
+    #[tokio::test]
+    async fn browser_capabilities_reports_supported_and_unsupported_browsers() {
+        let manager = BrowserAutomationManager::new();
+        let caps = manager.capabilities().await.expect("capabilities");
+        assert!(!caps.browsers.is_empty(), "capabilities should list known browsers");
+        for b in &caps.browsers {
+            assert!(!b.id.is_empty());
+            assert!(!b.name.is_empty());
+            assert!(!b.family.is_empty());
+            assert!(!b.adapter.is_empty());
+            if !b.available || !b.automatable {
+                assert!(b.unavailable_reason.is_some(), "browser {} must give a reason when unavailable/unsupported", b.id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_settings_persistence() {
+        let temp_dir = std::env::temp_dir().join(format!("kyro_browser_settings_{}", uuid::Uuid::new_v4()));
+        let db = crate::storage::db::Database::init(temp_dir.clone()).expect("db init");
+
+        let settings = BrowserSettings {
+            selected_browser: "chromium".to_string(),
+            headless_default: false,
+        };
+        settings.save(&db).expect("save settings");
+
+        let loaded = BrowserSettings::load(&db);
+        assert_eq!(loaded.selected_browser, "chromium");
+        assert!(!loaded.headless_default);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unsupported_browser_rejection_names_alternatives() {
+        let manager = BrowserAutomationManager::new();
+        let err = manager
+            .create_session("safari", true, None, &[])
+            .await
+            .expect_err("safari should be rejected");
+        assert!(err.contains("safari"));
+        assert!(err.contains("Available supported alternatives"));
     }
 }

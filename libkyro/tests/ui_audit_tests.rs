@@ -37,14 +37,13 @@ async fn prerequisites_available() -> (bool, String) {
     let manager = BrowserAutomationManager::new();
     match manager.capabilities().await {
         Ok(caps) => {
-            let has_firefox = caps.browsers.iter().any(|b| b.available);
-            if has_firefox {
+            let has_browser = caps.browsers.iter().any(|b| b.available && b.automatable);
+            if has_browser {
                 (true, String::new())
             } else {
                 (
                     false,
-                    "No usable Firefox binary was found. Install Firefox (for example \
-'sudo apt install firefox-esr') and re-run."
+                    "No usable automatable browser was found. Install Firefox or Chromium and re-run."
                         .to_string(),
                 )
             }
@@ -75,8 +74,9 @@ async fn test_ui_audit_finds_the_known_defects() {
 
     let options = AuditOptions {
         project_name: "defect-app".to_string(),
-        search_root: fixture.parent().unwrap().to_path_buf(),
-        browser: "firefox".to_string(),
+        project_path: None,
+        search_root: Some(fixture.parent().unwrap().to_path_buf()),
+        browser: Some("auto".to_string()),
         headless: true,
         keep_server_running: false,
         viewports: vec![(1280, 800), (390, 844)],
@@ -226,7 +226,7 @@ async fn test_ui_audit_finds_the_known_defects() {
     assert!(report.contains("## Route coverage"));
     assert!(report.contains("## Limitations"));
     assert!(report.contains(&outcome.context.project_path));
-    assert!(report.contains("firefox"));
+    assert!(report.contains(&outcome.context.browser));
     assert!(report.contains("Verified preview URL"));
     // The report must not claim complete coverage when routes were blocked.
     assert!(
@@ -294,8 +294,8 @@ async fn test_ui_audit_reports_missing_projects_honestly() {
 
     let options = AuditOptions {
         project_name: "a-project-that-does-not-exist".to_string(),
-        search_root: fixture_dir(),
-        browser: "firefox".to_string(),
+        search_root: Some(fixture_dir()),
+        browser: Some("auto".to_string()),
         headless: true,
         ..Default::default()
     };

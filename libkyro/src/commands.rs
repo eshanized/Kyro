@@ -1019,24 +1019,36 @@ pub async fn open_browser_session(
     browser: Option<String>,
     headless: Option<bool>,
 ) -> Result<crate::browser::BrowserSession, String> {
-    let requested = browser.unwrap_or_else(|| "firefox".to_string());
-    if !requested.eq_ignore_ascii_case("firefox") {
-        return Err(format!(
-            "Kyro can only drive Firefox. '{}' was requested, and Kyro will not silently \
-substitute a different browser.",
-            requested
-        ));
-    }
+    let settings = crate::browser::BrowserSettings::load(&state.db);
+    let requested = browser.unwrap_or_else(|| settings.selected_browser.clone());
+    let is_headless = headless.unwrap_or(settings.headless_default);
     let policy = PolicyEngine::load(&state.db);
     state
         .browser
         .create_session(
-            "firefox",
-            headless.unwrap_or(true),
+            &requested,
+            is_headless,
             None,
             &policy.blocked_domains,
         )
         .await
+}
+
+/// Reads the user's browser settings.
+#[tauri::command]
+pub fn get_browser_settings(
+    state: State<AppState>,
+) -> Result<crate::browser::BrowserSettings, String> {
+    Ok(crate::browser::BrowserSettings::load(&state.db))
+}
+
+/// Saves the user's browser settings.
+#[tauri::command]
+pub fn save_browser_settings(
+    state: State<AppState>,
+    settings: crate::browser::BrowserSettings,
+) -> Result<(), String> {
+    settings.save(&state.db)
 }
 
 /// Closes a managed browser session.

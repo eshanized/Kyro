@@ -105,11 +105,12 @@ and the automation driver that will be used. Call this before opening a browser 
             name: "browser_open".to_string(),
             description: "Open a managed browser session with an isolated profile. \
 Returns the session id that every other browser tool needs. \
-Only 'firefox' is supported; Kyro never silently substitutes another browser.".to_string(),
+Supports installed and automatable browsers such as Firefox, Chrome, Chromium, Edge, Brave. \
+Kyro never silently substitutes another browser.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "browser": { "type": "string", "description": "Browser to drive (default 'firefox')" },
+                    "browser": { "type": "string", "description": "Browser to drive (e.g. 'auto', 'firefox', 'chrome', 'chromium', 'brave', 'edge'). Defaults to Kyro setting or system default." },
                     "headless": { "type": "boolean", "description": "Run the browser without a visible window (default true)" }
                 }
             }),
@@ -248,14 +249,14 @@ Never guess screen coordinates; use the semantic locator.".to_string(),
         ToolDefinition {
             name: "audit_ui".to_string(),
             description: "Run the complete UI audit workflow: discover the project, ask for approval to start its \
-development server, verify the ready URL, open it in Firefox, discover every route, inspect each one, \
+development server, verify the ready URL, open it in the configured or requested browser, discover every route, inspect each one, \
 exercise safe controls and produce a Markdown bug report with evidence.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "project_name": { "type": "string", "description": "The project directory name to find (case-insensitive)" },
                     "search_root": { "type": "string", "description": "Absolute directory to search. Defaults to the user's Desktop." },
-                    "browser": { "type": "string", "description": "Browser to use (default 'firefox')" },
+                    "browser": { "type": "string", "description": "Browser to use (e.g. 'auto', 'firefox', 'chrome', 'chromium', 'brave'). Defaults to 'auto'." },
                     "keep_server_running": { "type": "boolean", "description": "Leave the development server running after the audit" }
                 },
                 "required": ["project_name"]
@@ -532,18 +533,10 @@ pub async fn browser_open(
 ) -> ToolOutcome {
     let browser = args["browser"]
         .as_str()
-        .unwrap_or("firefox")
+        .unwrap_or("auto")
         .trim()
         .to_string();
     let headless = args["headless"].as_bool().unwrap_or(true);
-
-    if !browser.eq_ignore_ascii_case("firefox") {
-        return ToolOutcome::fail(format!(
-            "Kyro can only drive Firefox. '{}' was requested, and Kyro will not silently \
-substitute a different browser. Install Firefox and request 'firefox'.",
-            browser
-        ));
-    }
 
     match manager
         .create_session(&browser, headless, Some(run_id), blocked_domains)
@@ -963,12 +956,6 @@ pub fn evaluate_tool(
             None
         }
         "browser_open" => {
-            let browser = args["browser"].as_str().unwrap_or("firefox");
-            if !browser.eq_ignore_ascii_case("firefox") {
-                return Some(AuthDecision::Deny {
-                    reason: format!("Kyro can only drive Firefox; '{}' was requested", browser),
-                });
-            }
             None
         }
         "stop_dev_server" | "browser_close" => {
@@ -993,13 +980,13 @@ pub struct AuditPlanSummary {
 mod tests {
     use super::*;
 
-    #[test]
-    fn firefox_is_required() {
-        let args = serde_json::json!({ "browser": "chromium" });
+    #[tokio::test]
+    async fn unsupported_browser_is_refused_without_silent_substitution() {
+        let args = serde_json::json!({ "browser": "nonexistent_custom_browser" });
         let manager = Arc::new(BrowserAutomationManager::new());
-        let outcome = futures_block_on(browser_open(&args, &manager, "run_1", &[]));
+        let outcome = browser_open(&args, &manager, "run_1", &[]).await;
         assert!(outcome.is_error);
-        assert!(outcome.message.contains("will not silently"));
+        assert!(outcome.message.contains("will not silently substitute"));
     }
 
     #[test]
@@ -1058,6 +1045,7 @@ mod tests {
     }
 
     /// A tiny blocking executor so the tests do not need a full runtime.
+    #[allow(dead_code)]
     fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
         use std::task::{Context, Poll};
         let waker = std::task::Waker::noop();

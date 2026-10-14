@@ -2007,20 +2007,13 @@ The program is started as an explicit executable plus argument vector; free-form
 
         let browser = args["browser"]
             .as_str()
-            .unwrap_or("firefox")
-            .trim()
-            .to_string();
-        if !browser.eq_ignore_ascii_case("firefox") {
-            return ToolOutcome::fail(format!(
-                "Kyro can only drive Firefox. '{}' was requested, and Kyro will not silently \
-substitute a different browser.",
-                browser
-            ));
-        }
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"));
 
         let options = crate::audit::workflow::AuditOptions {
             project_name,
-            search_root,
+            project_path: None,
+            search_root: Some(search_root),
             browser,
             headless: args["headless"].as_bool().unwrap_or(true),
             keep_server_running: args["keep_server_running"].as_bool().unwrap_or(false),

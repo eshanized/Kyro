@@ -8,6 +8,8 @@ import {
   SystemHealthInfo,
   TemplatePack,
   ImportSummary,
+  BrowserCapabilities,
+  BrowserSettings,
 } from "../types/agent";
 import {
   Key,
@@ -22,6 +24,8 @@ import {
   Upload,
   CheckCircle,
   FileCode,
+  Globe,
+  RefreshCw,
 } from "lucide-react";
 import { KyroLogo } from "./Logo";
 import { InlineNotice } from "./InlineNotice";
@@ -49,8 +53,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [secretPendingDeletion, setSecretPendingDeletion] = useState<string | null>(null);
   const [isDeletingSecret, setIsDeletingSecret] = useState(false);
   const [activeTab, setActiveTab] = useState<
-    "model" | "governance" | "telegram" | "sandbox" | "templates" | "diagnostics"
+    "model" | "governance" | "browser" | "telegram" | "sandbox" | "templates" | "diagnostics"
   >("model");
+  const [browserCapabilities, setBrowserCapabilities] = useState<BrowserCapabilities | null>(null);
+  const [browserSettings, setBrowserSettings] = useState<BrowserSettings>({
+    selected_browser: "auto",
+    headless_default: true,
+  });
+  const [isRefreshingBrowser, setIsRefreshingBrowser] = useState(false);
+  const [isSavingBrowser, setIsSavingBrowser] = useState(false);
   const [metadata, setMetadata] = useState<ApiKeysMetadata>({
     nvidia_configured: false,
     telegram_configured: false,
@@ -76,7 +87,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      if (initialTab && ["model", "governance", "telegram", "sandbox", "templates", "diagnostics"].includes(initialTab)) {
+      if (initialTab && ["model", "governance", "browser", "telegram", "sandbox", "templates", "diagnostics"].includes(initialTab)) {
         setActiveTab(initialTab as any);
       }
       loadSettings();
@@ -93,8 +104,49 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setPolicy(storedPolicy);
       const sb = await invoke<SandboxStatus>("get_sandbox_status");
       setSandbox(sb);
+      await loadBrowserInfo();
     } catch (err) {
       console.error("Failed to load settings:", err);
+    }
+  };
+
+  const loadBrowserInfo = async () => {
+    try {
+      const [caps, bSettings] = await Promise.all([
+        invoke<BrowserCapabilities>("get_browser_capabilities"),
+        invoke<BrowserSettings>("get_browser_settings"),
+      ]);
+      setBrowserCapabilities(caps);
+      if (bSettings) {
+        setBrowserSettings(bSettings);
+      }
+    } catch (err) {
+      console.error("Failed to load browser info:", err);
+    }
+  };
+
+  const handleSaveBrowserSettings = async () => {
+    setIsSavingBrowser(true);
+    try {
+      await invoke("save_browser_settings", { settings: browserSettings });
+      setNotice({ tone: "success", message: "Browser settings saved successfully." });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to save browser settings: " + err });
+    } finally {
+      setIsSavingBrowser(false);
+    }
+  };
+
+  const handleRefreshBrowserDiscovery = async () => {
+    setIsRefreshingBrowser(true);
+    try {
+      const caps = await invoke<BrowserCapabilities>("get_browser_capabilities");
+      setBrowserCapabilities(caps);
+      setNotice({ tone: "info", message: "Discovered browser capabilities refreshed." });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to refresh browsers: " + err });
+    } finally {
+      setIsRefreshingBrowser(false);
     }
   };
 
@@ -240,6 +292,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             }`}
           >
             <Lock className="w-3.5 h-3.5" /> Governance Matrix
+          </button>
+          <button
+            onClick={() => setActiveTab("browser")}
+            className={`py-3 px-3 border-b-2 flex items-center gap-1.5 transition whitespace-nowrap ${
+              activeTab === "browser"
+                ? "border-neutral-200 text-neutral-100 font-medium"
+                : "border-transparent text-neutral-400 hover:text-neutral-200"
+            }`}
+          >
+            <Globe className="w-3.5 h-3.5" /> Browser Automation
           </button>
           <button
             onClick={() => setActiveTab("telegram")}
@@ -423,6 +485,153 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   }
                   className="w-full px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
                 />
+              </div>
+            </div>
+          )}
+
+          {/* TAB: BROWSER AUTOMATION */}
+          {activeTab === "browser" && (
+            <div className="space-y-4">
+              <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed flex items-start justify-between gap-4">
+                <div>
+                  <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
+                    <Globe className="w-4 h-4 text-sky-400" /> Browser Automation & Capability Matrix
+                  </div>
+                  Kyro drives real web browsers via native protocols (WebDriver BiDi for Firefox, Chrome DevTools Protocol for Chromium family) using an isolated automation profile. Your everyday cookies, passwords, and personal history are never accessed.
+                </div>
+                <button
+                  type="button"
+                  onClick={handleRefreshBrowserDiscovery}
+                  disabled={isRefreshingBrowser}
+                  className="px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium flex items-center gap-1.5 transition shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingBrowser ? "animate-spin" : ""}`} />
+                  Refresh
+                </button>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5">
+                  Default Automation Browser
+                </label>
+                <div className="space-y-2">
+                  <div
+                    onClick={() => setBrowserSettings({ ...browserSettings, selected_browser: "auto" })}
+                    className={`p-3 rounded-xl border text-xs cursor-pointer transition flex items-center justify-between ${
+                      browserSettings.selected_browser === "auto"
+                        ? "bg-neutral-800/80 border-neutral-600 text-neutral-100"
+                        : "bg-[#141414] border-neutral-800 text-neutral-300 hover:border-neutral-700"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <input
+                        type="radio"
+                        name="browser_choice"
+                        checked={browserSettings.selected_browser === "auto"}
+                        onChange={() => setBrowserSettings({ ...browserSettings, selected_browser: "auto" })}
+                        className="text-neutral-200 focus:ring-0"
+                      />
+                      <div>
+                        <div className="font-medium text-neutral-100">Automatic (System Default)</div>
+                        <div className="text-[11px] text-neutral-400">
+                          {browserCapabilities?.default_browser_id
+                            ? `Detected OS default: ${browserCapabilities.browsers.find((b) => b.id === browserCapabilities.default_browser_id)?.display_name || browserCapabilities.default_browser_id}`
+                            : "Uses operating system default browser if automatable, or first available"}
+                        </div>
+                      </div>
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-sky-950 text-sky-400 border border-sky-800">
+                      Recommended
+                    </span>
+                  </div>
+
+                  {browserCapabilities?.browsers
+                    ?.filter((b) => b.available && b.automatable)
+                    ?.map((b) => (
+                      <div
+                        key={b.id}
+                        onClick={() => setBrowserSettings({ ...browserSettings, selected_browser: b.id })}
+                        className={`p-3 rounded-xl border text-xs cursor-pointer transition flex items-center justify-between ${
+                          browserSettings.selected_browser === b.id
+                            ? "bg-neutral-800/80 border-neutral-600 text-neutral-100"
+                            : "bg-[#141414] border-neutral-800 text-neutral-300 hover:border-neutral-700"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <input
+                            type="radio"
+                            name="browser_choice"
+                            checked={browserSettings.selected_browser === b.id}
+                            onChange={() => setBrowserSettings({ ...browserSettings, selected_browser: b.id })}
+                            className="text-neutral-200 focus:ring-0"
+                          />
+                          <div>
+                            <div className="font-medium text-neutral-100 flex items-center gap-2">
+                              {b.display_name}
+                              {b.version && (
+                                <span className="text-[10px] text-neutral-400 font-mono">v{b.version}</span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-neutral-400 font-mono truncate max-w-md">
+                              {b.path} ({b.adapter === "webdriver-bidi" ? "WebDriver BiDi" : "CDP"})
+                            </div>
+                          </div>
+                        </div>
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-neutral-800 text-neutral-200 border border-neutral-700">
+                          Ready
+                        </span>
+                      </div>
+                    ))}
+
+                  {browserCapabilities?.browsers
+                    ?.filter((b) => !b.available || !b.automatable)
+                    ?.map((b) => (
+                      <div
+                        key={b.id}
+                        className="p-3 rounded-xl border border-neutral-800/60 bg-[#121212] text-xs text-neutral-500 flex items-center justify-between opacity-60"
+                      >
+                        <div>
+                          <div className="font-medium text-neutral-400">{b.display_name}</div>
+                          <div className="text-[11px] text-neutral-500">
+                            {b.unavailable_reason || "Not installed or unavailable on this system"}
+                          </div>
+                        </div>
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-neutral-900 text-neutral-500 border border-neutral-800">
+                          Unavailable
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between p-3.5 bg-[#141414] border border-neutral-800 rounded-xl">
+                <div>
+                  <div className="text-xs font-semibold text-neutral-100">
+                    Headless Automation Mode (Unattended)
+                  </div>
+                  <div className="text-[11px] text-neutral-400">
+                    Run browser operations silently in background. When unchecked or explicitly requested by a task, a visible browser window opens.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={browserSettings.headless_default}
+                  onChange={(e) =>
+                    setBrowserSettings({ ...browserSettings, headless_default: e.target.checked })
+                  }
+                  className="w-4 h-4 rounded border-neutral-700 bg-neutral-900 accent-neutral-200"
+                />
+              </div>
+
+              <div className="pt-2 flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleSaveBrowserSettings}
+                  disabled={isSavingBrowser}
+                  className="px-4 py-2 bg-neutral-100 hover:bg-white text-neutral-900 rounded-xl text-xs font-semibold transition disabled:opacity-50"
+                >
+                  {isSavingBrowser ? "Saving..." : "Save Browser Preferences"}
+                </button>
               </div>
             </div>
           )}

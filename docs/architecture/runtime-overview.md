@@ -119,6 +119,20 @@ graph TD
   - `bridge.rs`: Long-polling worker for Telegram bot command and notification exchange.
 - `sandbox/`:
   - `docker.rs`: Container isolation detection and CLI execution.
+- `browser/`:
+  - `mod.rs`: `BrowserAutomationManager`, authoritative browser capability registry, browser preferences persistence in SQLite, session lifecycle and state tracking.
+  - `worker.rs`: Subprocess lifecycle manager for `worker.mjs` over JSON-lines stdio protocol.
+  - `safety.rs`: Navigation safety policy, origin scope confinement, blocked domain enforcement.
+  - `types.rs`: Semantic locators, element targets, page snapshots, observation payloads.
+  - `worker.mjs`: Provider-neutral browser worker supporting Firefox family (via native WebDriver BiDi) and Chromium family (Google Chrome, Chromium, Microsoft Edge, Brave, Vivaldi, Opera via Chrome DevTools Protocol over WebSocket) using Node 20+ built-ins.
+- `project/`:
+  - `discovery.rs`: Dynamic project root resolution, candidate ranking, bounded search traversal, exclusion filters (`node_modules`, `.git`, `dist`, `build`, etc.), OS Desktop path resolution via `dirs::desktop_dir()`.
+  - `devserver.rs`: Development server process lifecycle, ready line detection, port extraction, framework recognition.
+- `audit/`:
+  - `workflow.rs`: Autonomous UI audit orchestrator: plan generation, server boot, multi-viewport responsive checks, route discovery, interaction exploration, finding aggregation, markdown report synthesis.
+  - `routes.rs`: Static file and router config route extraction.
+  - `findings.rs`: Categorized finding models (Bug, Accessibility, DesignInconsistency, Performance, Warning) and deduplication.
+  - `report.rs`: Markdown report generator with summary metrics and reproducible evidence attachments.
 
 ---
 

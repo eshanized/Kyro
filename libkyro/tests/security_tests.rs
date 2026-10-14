@@ -557,13 +557,12 @@ fn typing_a_credential_requires_a_human_takeover() {
 }
 
 #[test]
-fn a_browser_other_than_firefox_is_refused() {
+fn supported_browsers_are_permitted_for_browser_open() {
     let policy = GovernancePolicy::default();
     let ctx = context();
     let args = serde_json::json!({ "browser": "chromium" });
-    let decision = tools::evaluate_tool(&policy, &ctx, "browser_open", &args)
-        .expect("another browser must be refused");
-    assert!(matches!(decision, AuthDecision::Deny { .. }));
+    let decision = tools::evaluate_tool(&policy, &ctx, "browser_open", &args);
+    assert!(decision.is_none(), "supported browsers should be allowed: {:?}", decision);
 }
 
 #[test]

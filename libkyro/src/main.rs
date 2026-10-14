@@ -20,7 +20,7 @@ fn main() {
 
     let db = Database::init(config_dir).expect("Failed to initialize Kyro SQLite database");
     let vault = Vault::new(db.clone());
-    let browser = Arc::new(kyro_lib::browser::BrowserAutomationManager::new());
+    let browser = Arc::new(kyro_lib::browser::BrowserAutomationManager::new().with_database(db.clone()));
     let dev_servers = Arc::new(kyro_lib::project::DevServerManager::new());
     let engine = Arc::new(AgentLoopEngine::with_resources(
         browser.clone(),
@@ -142,6 +142,8 @@ fn main() {
             list_account_tool_policies,
             save_account_tool_policy,
             get_browser_capabilities,
+            get_browser_settings,
+            save_browser_settings,
             open_browser_session,
             close_browser_session,
             list_browser_sessions,

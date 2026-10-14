@@ -2,44 +2,166 @@
 /**
  * Kyro browser automation worker.
  *
- * The worker drives the *installed* Firefox through the WebDriver BiDi
- * protocol that Firefox exposes natively via `--remote-debugging-port`.
- * No external driver (geckodriver) and no npm dependency is required, so the
- * subsystem works offline and can be packaged with Kyro.
+ * Provider-neutral browser automation engine supporting:
+ *  - Mozilla Firefox and Firefox ESR via native WebDriver BiDi
+ *  - Chromium, Google Chrome, Microsoft Edge, Brave, Vivaldi, Opera via Chrome DevTools Protocol (CDP)
+ *
+ * No external driver (geckodriver/chromedriver) and no third-party npm dependency is required.
+ * Built-in Node.js WebSocket and fetch are used for offline local packaging with Kyro.
  *
  * Protocol: newline delimited JSON on stdin/stdout.
- *   request : {"id":1,"op":"page.navigate","session_id":"s1","params":{...}}
+ *   request : {"id":1,"op":"page.navigate","params":{"session_id":"s1","url":"..."}}
  *   response: {"id":1,"ok":true,"result":{...}}
  *             {"id":1,"ok":false,"error":{"category":"...","message":"..."}}
  *
- * The worker never evaluates caller supplied JavaScript.  Every operation is
- * a fixed, purpose built routine; the model can only ask for the operations
+ * The worker never evaluates caller-supplied arbitrary JavaScript. Every operation is
+ * a fixed, purpose-built routine; the model can only ask for the operations
  * this file implements.
  */
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
-const FIREFOX_CANDIDATES = [
-  "/usr/bin/firefox",
-  "/usr/local/bin/firefox",
-  "/usr/lib/firefox/firefox",
-  "/opt/firefox/firefox",
-  "/snap/bin/firefox",
-  "/usr/bin/firefox-esr",
-  "/usr/local/bin/firefox-esr",
-  "/Applications/Firefox.app/Contents/MacOS/firefox",
-];
-
 const DEFAULT_NAV_TIMEOUT_MS = 30000;
 const DEFAULT_ACTION_TIMEOUT_MS = 10000;
 
 /* ------------------------------------------------------------------ */
-/* Firefox discovery                                                   */
+/* Browser capability definitions                                      */
+/* ------------------------------------------------------------------ */
+
+const BROWSER_SPECS = [
+  {
+    id: "firefox",
+    displayName: "Mozilla Firefox",
+    family: "firefox",
+    adapter: "webdriver-bidi",
+    binaries: ["firefox"],
+    paths: [
+      "/usr/bin/firefox",
+      "/usr/local/bin/firefox",
+      "/usr/lib/firefox/firefox",
+      "/opt/firefox/firefox",
+      "/snap/bin/firefox",
+      "/usr/sbin/firefox",
+      "/var/lib/flatpak/exports/bin/org.mozilla.firefox",
+      "/Applications/Firefox.app/Contents/MacOS/firefox",
+      "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+      "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
+    ],
+  },
+  {
+    id: "firefox-esr",
+    displayName: "Firefox ESR",
+    family: "firefox",
+    adapter: "webdriver-bidi",
+    binaries: ["firefox-esr"],
+    paths: [
+      "/usr/bin/firefox-esr",
+      "/usr/local/bin/firefox-esr",
+      "/usr/lib/firefox-esr/firefox-esr",
+      "/usr/sbin/firefox-esr",
+    ],
+  },
+  {
+    id: "chrome",
+    displayName: "Google Chrome",
+    family: "chromium",
+    adapter: "cdp",
+    binaries: ["google-chrome", "google-chrome-stable"],
+    paths: [
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/opt/google/chrome/chrome",
+      "/usr/sbin/google-chrome",
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    ],
+  },
+  {
+    id: "chromium",
+    displayName: "Chromium",
+    family: "chromium",
+    adapter: "cdp",
+    binaries: ["chromium", "chromium-browser"],
+    paths: [
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/usr/sbin/chromium",
+      "/snap/bin/chromium",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      "C:\\Program Files\\Chromium\\Application\\chrome.exe",
+    ],
+  },
+  {
+    id: "edge",
+    displayName: "Microsoft Edge",
+    family: "chromium",
+    adapter: "cdp",
+    binaries: ["microsoft-edge", "microsoft-edge-stable"],
+    paths: [
+      "/usr/bin/microsoft-edge",
+      "/usr/bin/microsoft-edge-stable",
+      "/opt/microsoft/msedge/msedge",
+      "/usr/sbin/microsoft-edge",
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    ],
+  },
+  {
+    id: "brave",
+    displayName: "Brave Browser",
+    family: "chromium",
+    adapter: "cdp",
+    binaries: ["brave-browser", "brave"],
+    paths: [
+      "/usr/bin/brave-browser",
+      "/usr/bin/brave",
+      "/usr/sbin/brave-browser",
+      "/usr/sbin/brave",
+      "/opt/brave.com/brave/brave-browser",
+      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+      "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+    ],
+  },
+  {
+    id: "vivaldi",
+    displayName: "Vivaldi",
+    family: "chromium",
+    adapter: "cdp",
+    binaries: ["vivaldi", "vivaldi-stable"],
+    paths: [
+      "/usr/bin/vivaldi",
+      "/usr/bin/vivaldi-stable",
+      "/opt/vivaldi/vivaldi",
+      "/usr/sbin/vivaldi",
+      "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",
+      "C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe",
+    ],
+  },
+  {
+    id: "opera",
+    displayName: "Opera",
+    family: "chromium",
+    adapter: "cdp",
+    binaries: ["opera"],
+    paths: [
+      "/usr/bin/opera",
+      "/usr/lib/x86_64-linux-gnu/opera/opera",
+      "/usr/sbin/opera",
+      "/Applications/Opera.app/Contents/MacOS/Opera",
+      "C:\\Program Files\\Opera\\launcher.exe",
+    ],
+  },
+];
+
+/* ------------------------------------------------------------------ */
+/* Browser discovery                                                   */
 /* ------------------------------------------------------------------ */
 
 function findOnPath(name) {
@@ -56,7 +178,7 @@ function findOnPath(name) {
   return null;
 }
 
-async function probeFirefox(path) {
+async function probeVersion(path) {
   return new Promise((resolve) => {
     const child = spawn(path, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
@@ -65,48 +187,132 @@ async function probeFirefox(path) {
     const timer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch { /* ignore */ }
       resolve({ version: null, ok: false });
-    }, 10000);
+    }, 5000);
     child.on("error", () => {
       clearTimeout(timer);
       resolve({ version: null, ok: false });
     });
-    child.on("close", () => {
+    child.on("close", (code) => {
       clearTimeout(timer);
-      const m = out.match(/(\d+\.\d+(\.\d+)?)/);
+      if (code !== 0 && !out) {
+        resolve({ version: null, ok: false });
+        return;
+      }
+      const m = out.match(/(\d+\.\d+(\.\d+)?(\.\d+)?)/);
       resolve({ version: m ? m[1] : out.trim() || null, ok: true });
     });
   });
 }
 
+async function detectDefaultBrowserId() {
+  if (process.platform === "linux") {
+    try {
+      const out = await new Promise((resolve) => {
+        const child = spawn("xdg-settings", ["get", "default-web-browser"], { stdio: ["ignore", "pipe", "pipe"] });
+        let buf = "";
+        child.stdout.on("data", (d) => (buf += d.toString()));
+        child.on("close", () => resolve(buf.trim()));
+        child.on("error", () => resolve(""));
+      });
+      if (out) {
+        const lower = out.toLowerCase();
+        if (lower.includes("firefox-esr")) return "firefox-esr";
+        if (lower.includes("firefox")) return "firefox";
+        if (lower.includes("chrome")) return "chrome";
+        if (lower.includes("chromium")) return "chromium";
+        if (lower.includes("edge")) return "edge";
+        if (lower.includes("brave")) return "brave";
+        if (lower.includes("vivaldi")) return "vivaldi";
+        if (lower.includes("opera")) return "opera";
+      }
+    } catch { /* best effort */ }
+
+    try {
+      const out = await new Promise((resolve) => {
+        const child = spawn("xdg-mime", ["query", "default", "x-scheme-handler/http"], { stdio: ["ignore", "pipe", "pipe"] });
+        let buf = "";
+        child.stdout.on("data", (d) => (buf += d.toString()));
+        child.on("close", () => resolve(buf.trim()));
+        child.on("error", () => resolve(""));
+      });
+      if (out) {
+        const lower = out.toLowerCase();
+        if (lower.includes("firefox-esr")) return "firefox-esr";
+        if (lower.includes("firefox")) return "firefox";
+        if (lower.includes("chrome")) return "chrome";
+        if (lower.includes("chromium")) return "chromium";
+        if (lower.includes("edge")) return "edge";
+        if (lower.includes("brave")) return "brave";
+        if (lower.includes("vivaldi")) return "vivaldi";
+        if (lower.includes("opera")) return "opera";
+      }
+    } catch { /* best effort */ }
+  }
+  return null;
+}
+
 async function discoverBrowsers() {
-  const found = new Map();
-  for (const candidate of FIREFOX_CANDIDATES) {
-    if (found.has(candidate)) continue;
-    if (!existsSync(candidate)) continue;
-    const probe = await probeFirefox(candidate);
-    if (probe.ok) {
-      found.set(candidate, { name: "firefox", path: candidate, version: probe.version, available: true });
+  const defaultBrowserId = await detectDefaultBrowserId();
+  const results = [];
+
+  for (const spec of BROWSER_SPECS) {
+    let resolvedPath = null;
+    for (const bin of spec.binaries) {
+      const onPath = findOnPath(bin);
+      if (onPath) {
+        resolvedPath = onPath;
+        break;
+      }
     }
-  }
-  const onPath = findOnPath("firefox");
-  if (onPath && !found.has(onPath)) {
-    const probe = await probeFirefox(onPath);
-    if (probe.ok) {
-      found.set(onPath, { name: "firefox", path: onPath, version: probe.version, available: true });
+    if (!resolvedPath) {
+      for (const candidate of spec.paths) {
+        if (existsSync(candidate)) {
+          resolvedPath = candidate;
+          break;
+        }
+      }
     }
-  }
-  const esr = findOnPath("firefox-esr");
-  if (esr && !found.has(esr)) {
-    const probe = await probeFirefox(esr);
-    if (probe.ok) {
-      found.set(esr, { name: "firefox", path: esr, version: probe.version, available: true });
+
+    if (resolvedPath) {
+      const probe = await probeVersion(resolvedPath);
+      if (probe.ok) {
+        results.push({
+          id: spec.id,
+          name: spec.id,
+          display_name: spec.displayName,
+          family: spec.family,
+          path: resolvedPath,
+          version: probe.version,
+          available: true,
+          automatable: true,
+          adapter: spec.adapter,
+          unavailable_reason: null,
+          is_default: spec.id === defaultBrowserId,
+        });
+        continue;
+      }
     }
+
+    results.push({
+      id: spec.id,
+      name: spec.id,
+      display_name: spec.displayName,
+      family: spec.family,
+      path: resolvedPath || "",
+      version: null,
+      available: false,
+      automatable: false,
+      adapter: spec.adapter,
+      unavailable_reason: `Executable for ${spec.displayName} was not found on PATH or standard directories.`,
+      is_default: spec.id === defaultBrowserId,
+    });
   }
-  return [...found.values()];
+
+  return { browsers: results, defaultBrowserId };
 }
 
 /* ------------------------------------------------------------------ */
-/* Minimal WebDriver BiDi client                                       */
+/* Minimal WebDriver BiDi client (Firefox)                             */
 /* ------------------------------------------------------------------ */
 
 class BidiClient {
@@ -202,7 +408,7 @@ class BiDiError extends Error {
 }
 
 /* ------------------------------------------------------------------ */
-/* Browser session                                                     */
+/* Firefox session (WebDriver BiDi)                                    */
 /* ------------------------------------------------------------------ */
 
 const CONSOLE_EVENTS = ["log.entryAdded"];
@@ -212,21 +418,23 @@ const NETWORK_EVENTS = [
   "network.fetchError",
 ];
 
-class BrowserSession {
+class FirefoxSession {
   constructor(id, opts) {
     this.id = id;
     this.opts = opts;
+    this.browserId = opts.browserId;
+    this.browserPath = opts.browserPath;
+    this.browserVersion = null;
     this.process = null;
     this.client = null;
     this.profileDir = null;
     this.port = null;
-    this.browserPath = opts.browserPath;
-    this.browserVersion = null;
     this.contextId = null;
     this.consoleEntries = [];
     this.networkRequests = new Map();
     this.networkFailed = [];
     this.closed = false;
+    this.adapter = "webdriver-bidi";
   }
 
   async start() {
@@ -250,7 +458,7 @@ class BrowserSession {
       this.processError = e.message;
     });
 
-    await writeProfilePrefs(this.profileDir, this.opts);
+    writeFirefoxProfilePrefs(this.profileDir);
 
     const url = `ws://127.0.0.1:${this.port}/session`;
     const deadline = Date.now() + 30000;
@@ -291,8 +499,6 @@ class BrowserSession {
   }
 
   onConsole(p) {
-    // Firefox's `log.entryAdded` event carries the level and text at the top
-    // level of the event parameters.
     const level = p.level || "log";
     const text = p.text || "";
     const kind = p.type || "console";
@@ -395,6 +601,281 @@ class BrowserSession {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Chromium session (Chrome DevTools Protocol - CDP)                   */
+/* ------------------------------------------------------------------ */
+
+class ChromiumSession {
+  constructor(id, opts) {
+    this.id = id;
+    this.opts = opts;
+    this.browserId = opts.browserId;
+    this.browserPath = opts.browserPath;
+    this.browserVersion = null;
+    this.process = null;
+    this.ws = null;
+    this.port = null;
+    this.profileDir = null;
+    this.nextId = 0;
+    this.pending = new Map();
+    this.consoleEntries = [];
+    this.networkRequests = new Map();
+    this.networkFailed = [];
+    this.closed = false;
+    this.adapter = "cdp";
+  }
+
+  async start() {
+    this.profileDir = mkdtempSync(join(tmpdir(), "kyro-chromium-profile-"));
+    this.port = await findFreePort();
+    const args = [
+      `--remote-debugging-port=${this.port}`,
+      `--user-data-dir=${this.profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--disable-default-apps",
+      "--disable-features=Translate,OptimizationHints",
+    ];
+    if (this.opts.headless) {
+      args.push("--headless=new");
+    }
+    args.push("about:blank");
+
+    this.process = spawn(this.browserPath, args, {
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
+    });
+
+    const deadline = Date.now() + 30000;
+    let targetWs = null;
+    let lastError = null;
+
+    while (Date.now() < deadline) {
+      if (this.process.exitCode !== null) {
+        throw new BiDiError(
+          "browser_crash",
+          `${this.opts.browserDisplayName || this.browserId} exited during startup with code ${this.process.exitCode}`
+        );
+      }
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.port}/json/list`);
+        const targets = await res.json();
+        const page = targets.find((t) => t.type === "page");
+        if (page && page.webSocketDebuggerUrl) {
+          targetWs = page.webSocketDebuggerUrl;
+          break;
+        }
+      } catch (e) {
+        lastError = e;
+      }
+      await delay(200);
+    }
+
+    if (!targetWs) {
+      throw new BiDiError(
+        "browser_start_failed",
+        `${this.opts.browserDisplayName || this.browserId} DevTools endpoint did not become available: ${lastError ? lastError.message : "timed out"}`
+      );
+    }
+
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const ws = new WebSocket(targetWs);
+      this.ws = ws;
+      ws.onopen = () => {
+        settled = true;
+        resolve();
+      };
+      ws.onerror = (e) => {
+        if (!settled) reject(new Error(`Failed to connect to Chromium CDP endpoint: ${e.message || e.type}`));
+      };
+    });
+
+    this.ws.onmessage = (event) => {
+      let payload;
+      try {
+        payload = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (payload.id !== undefined && this.pending.has(payload.id)) {
+        const entry = this.pending.get(payload.id);
+        this.pending.delete(payload.id);
+        if (payload.error) {
+          entry.reject(new BiDiError(payload.error.code ? String(payload.error.code) : "cdp_error", payload.error.message || "CDP command failed"));
+        } else {
+          entry.resolve(payload.result);
+        }
+        return;
+      }
+      if (payload.method) {
+        this.handleEvent(payload.method, payload.params || {});
+      }
+    };
+
+    this.ws.onclose = () => {
+      this.closed = true;
+      for (const [, entry] of this.pending) {
+        entry.reject(new BiDiError("disconnected", "Chromium CDP connection closed"));
+      }
+      this.pending.clear();
+    };
+
+    await this.send("Page.enable");
+    await this.send("Runtime.enable");
+    await this.send("Network.enable");
+    await this.send("Log.enable");
+
+    if (this.opts.viewport) {
+      await this.send("Emulation.setDeviceMetricsOverride", {
+        width: this.opts.viewport.width,
+        height: this.opts.viewport.height,
+        deviceScaleFactor: 1,
+        mobile: false,
+      });
+    }
+
+    return this;
+  }
+
+  send(method, params = {}, timeoutMs = 30000) {
+    if (this.closed) return Promise.reject(new BiDiError("disconnected", "CDP connection is closed"));
+    const id = ++this.nextId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.has(id)) {
+          this.pending.delete(id);
+          reject(new BiDiError("timeout", `CDP command '${method}' timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  handleEvent(method, params) {
+    if (method === "Runtime.consoleAPICalled") {
+      const args = params.args || [];
+      const text = args.map((a) => (a.value !== undefined ? String(a.value) : (a.description || ""))).join(" ");
+      let level = params.type || "log";
+      if (level === "warning") level = "warn";
+      this.consoleEntries.push({
+        level,
+        type: params.type || "console",
+        text,
+        stack: params.stackTrace || null,
+        source: null,
+        timestamp: params.timestamp ? Math.round(params.timestamp) : Date.now(),
+      });
+      if (this.consoleEntries.length > 2000) this.consoleEntries.shift();
+    } else if (method === "Runtime.exceptionThrown") {
+      const details = params.exceptionDetails || {};
+      const text = (details.exception && (details.exception.description || details.exception.value))
+        || details.text
+        || "Uncaught error";
+      this.consoleEntries.push({
+        level: "error",
+        type: "error",
+        text: String(text),
+        stack: details.stackTrace || null,
+        source: details.url || null,
+        timestamp: params.timestamp ? Math.round(params.timestamp) : Date.now(),
+      });
+      if (this.consoleEntries.length > 2000) this.consoleEntries.shift();
+    } else if (method === "Log.entryAdded") {
+      const entry = params.entry || {};
+      let level = entry.level || "log";
+      if (level === "warning") level = "warn";
+      this.consoleEntries.push({
+        level,
+        type: entry.source || "log",
+        text: entry.text || "",
+        stack: entry.stackTrace || null,
+        source: entry.url || null,
+        timestamp: entry.timestamp || Date.now(),
+      });
+      if (this.consoleEntries.length > 2000) this.consoleEntries.shift();
+    } else if (method === "Network.requestWillBeSent") {
+      const r = params.request || {};
+      const id = params.requestId || r.url;
+      this.networkRequests.set(id, {
+        request_id: id,
+        url: r.url,
+        method: r.method,
+        status: null,
+        mime_type: null,
+        error: null,
+        navigation: params.type === "Document",
+      });
+    } else if (method === "Network.responseReceived") {
+      const id = params.requestId;
+      const resp = params.response || {};
+      const existing = this.networkRequests.get(id);
+      const record = existing || {
+        request_id: id,
+        url: resp.url,
+        method: null,
+        navigation: false,
+      };
+      record.status = resp.status;
+      record.mime_type = resp.mimeType || null;
+      this.networkRequests.set(id, record);
+    } else if (method === "Network.loadingFailed") {
+      const id = params.requestId;
+      const existing = this.networkRequests.get(id);
+      const url = existing ? existing.url : (params.requestId || "unknown");
+      this.networkFailed.push({
+        request_id: id,
+        url,
+        method: existing ? existing.method : null,
+        error: params.errorText || "network request failed",
+        navigation: params.type === "Document",
+        timestamp: Date.now(),
+      });
+      if (this.networkFailed.length > 500) this.networkFailed.shift();
+    }
+  }
+
+  async context() {
+    return "default";
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      if (this.ws) {
+        this.ws.close();
+      }
+    } catch { /* ignore */ }
+    try {
+      if (this.process && this.process.exitCode === null) {
+        process.kill(-this.process.pid, "SIGTERM");
+      }
+    } catch { /* ignore */ }
+    try {
+      if (this.process && this.process.exitCode === null) {
+        this.process.kill("SIGTERM");
+      }
+    } catch { /* ignore */ }
+    await delay(150);
+    try {
+      if (this.process && this.process.exitCode === null) {
+        process.kill(-this.process.pid, "SIGKILL");
+        this.process.kill("SIGKILL");
+      }
+    } catch { /* ignore */ }
+    if (this.profileDir) {
+      try { rmSync(this.profileDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
+}
+
 async function findFreePort() {
   return new Promise((resolve, reject) => {
     const server = createServer();
@@ -407,7 +888,7 @@ async function findFreePort() {
   });
 }
 
-function writeProfilePrefs(profileDir, opts) {
+function writeFirefoxProfilePrefs(profileDir) {
   const prefs = [
     "user_pref(\"browser.shell.checkDefaultBrowser\", false);",
     "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");",
@@ -423,20 +904,13 @@ function writeProfilePrefs(profileDir, opts) {
   ].join("\n");
   try {
     writeFileSync(join(profileDir, "user.js"), prefs, "utf8");
-  } catch { /* preferences are best effort */ }
+  } catch { /* best effort */ }
 }
 
 /* ------------------------------------------------------------------ */
 /* Page inspection (fixed routines, no caller supplied JavaScript)     */
 /* ------------------------------------------------------------------ */
 
-/**
- * Builds the ordered list of semantic elements for the current document.
- *
- * The routine is a fixed constant: the caller cannot inject JavaScript.
- * Both the snapshot and the locator resolution use the *same* builder, so a
- * `ref` returned by a snapshot always refers to the same element later.
- */
 const ELEMENT_BUILDER = `
 (() => {
   const isVisible = (el) => {
@@ -564,9 +1038,6 @@ const ELEMENT_BUILDER = `
 })()
 `;
 
-/**
- * Collects a semantic snapshot of the current document.
- */
 const SNAPSHOT_SOURCE = `
 (() => {
   const elements = ${ELEMENT_BUILDER};
@@ -613,11 +1084,6 @@ const SNAPSHOT_SOURCE = `
 })()
 `;
 
-// The resolve routine is built per request by embedding a JSON literal of the
-// spec.  Only known keys are read; nothing is evaluated from the caller.
-//
-// The candidate list is produced by the *same* builder that the snapshot uses,
-// so a role, name or reference always refers to the same element in both.
 function resolveScript(spec) {
   const json = JSON.stringify(spec);
   return `(() => {
@@ -720,46 +1186,73 @@ function resolveScript(spec) {
   })()`;
 }
 
+function bidiValueToJs(v) {
+  if (!v) return null;
+  if (v.type === "string" || v.type === "number" || v.type === "boolean") return v.value;
+  if (v.type === "null") return null;
+  if (v.type === "undefined") return undefined;
+  if (v.type === "array" && Array.isArray(v.value)) return v.value.map(bidiValueToJs);
+  if (v.type === "object" && Array.isArray(v.value)) {
+    const o = {};
+    for (const [k, val] of v.value) o[k] = bidiValueToJs(val);
+    return o;
+  }
+  return v.value !== undefined ? v.value : null;
+}
+
 async function evalInPage(session, source, awaitPromise = false, explicitContext) {
-  const context = explicitContext || (await session.context());
-  const result = await session.client.send("script.evaluate", {
-    expression: source,
-    target: { context },
-    awaitPromise,
-  });
-  if (result.type === "exception") {
-    throw new BiDiError("script_error", `Page evaluation failed: ${result.exceptionDetails ? result.exceptionDetails.text : "unknown"}`);
-  }
-  const value = result.result ? result.result.value : null;
-  if (typeof value === "string") {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return value;
+  if (session.adapter === "cdp") {
+    const res = await session.send("Runtime.evaluate", {
+      expression: source,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (res.exceptionDetails) {
+      throw new BiDiError(
+        "script_error",
+        `Page evaluation failed: ${res.exceptionDetails.text || "unknown"}`
+      );
     }
+    const val = res.result ? res.result.value : null;
+    if (typeof val === "string") {
+      try { return JSON.parse(val); } catch { return val; }
+    }
+    return val;
+  } else {
+    const context = explicitContext || (await session.context());
+    const result = await session.client.send("script.evaluate", {
+      expression: source,
+      target: { context },
+      awaitPromise,
+    });
+    if (result.type === "exception") {
+      throw new BiDiError("script_error", `Page evaluation failed: ${result.exceptionDetails ? result.exceptionDetails.text : "unknown"}`);
+    }
+    const value = result.result ? result.result.value : null;
+    const jsVal = bidiValueToJs(result.result);
+    if (typeof jsVal === "string") {
+      try {
+        return JSON.parse(jsVal);
+      } catch {
+        return jsVal;
+      }
+    }
+    return jsVal;
   }
-  return value;
 }
 
 async function pageInfo(session) {
-  const info = await evalInPage(session, `(() => JSON.stringify({ url: location.href, title: document.title, readyState: document.readyState }))()`);
+  const info = await evalInPage(
+    session,
+    `(() => JSON.stringify({ url: location.href, title: document.title, readyState: document.readyState }))()`
+  );
   return info || { url: null, title: null, readyState: null };
 }
-
-/* ------------------------------------------------------------------ */
-/* Operation dispatch                                                  */
-/* ------------------------------------------------------------------ */
-
 
 /* ------------------------------------------------------------------ */
 /* Keyboard helpers                                                    */
 /* ------------------------------------------------------------------ */
 
-/**
- * WebDriver key codes.  Firefox's WebDriver BiDi implementation requires a
- * single code point or grapheme cluster per key action, and expects the
- * `keyDown` / `keyUp` action subtypes.
- */
 const WEBDRIVER_KEYS = {
   enter: "\uE006",
   return: "\uE006",
@@ -793,9 +1286,6 @@ function graphemes(text) {
   return Array.from(segmenter.segment(text), (s) => s.segment);
 }
 
-/**
- * Builds the keyDown/keyUp action list for a literal string.
- */
 function typeActions(value) {
   const actions = [];
   for (const g of graphemes(String(value))) {
@@ -805,9 +1295,6 @@ function typeActions(value) {
   return actions;
 }
 
-/**
- * Resolves a key name to the value that WebDriver BiDi expects.
- */
 function keyValue(name) {
   const key = String(name || "").trim();
   if (!key) return null;
@@ -821,51 +1308,107 @@ function keyValue(name) {
 const sessions = new Map();
 let sessionCounter = 0;
 
+/* ------------------------------------------------------------------ */
+/* Operation dispatch                                                  */
+/* ------------------------------------------------------------------ */
+
 const OPS = {
   async capabilities() {
-    const browsers = await discoverBrowsers();
+    const discovery = await discoverBrowsers();
     return {
       node_version: process.version,
       platform: process.platform,
       arch: process.arch,
-      browsers,
+      browsers: discovery.browsers,
+      default_browser_id: discovery.defaultBrowserId,
       driver: {
-        name: "webdriver-bidi",
-        version: "native",
+        name: "provider-neutral",
+        version: "2.0",
         external_driver_required: false,
       },
     };
   },
 
   async "session.create"(params) {
-    const browsers = await discoverBrowsers();
-    const requested = (params.browser || "firefox").toLowerCase();
-    const chosen = browsers.find((b) => b.name === requested && b.available);
-    if (!chosen) {
-      const available = browsers.map((b) => b.path).join(", ") || "none";
-      throw new BiDiError(
-        "browser_unavailable",
-        `No usable ${requested} binary was found. Searched: ${available}. ` +
-        `Install ${requested} (for example 'sudo apt install firefox-esr' or 'sudo dnf install firefox') and retry.`
+    const discovery = await discoverBrowsers();
+    const browsers = discovery.browsers;
+    const requested = (params.browser || "auto").trim().toLowerCase();
+
+    let chosen = null;
+    if (requested === "auto" || !requested) {
+      if (discovery.defaultBrowserId) {
+        chosen = browsers.find((b) => b.id === discovery.defaultBrowserId && b.available && b.automatable);
+      }
+      if (!chosen) {
+        chosen = browsers.find((b) => b.available && b.automatable);
+      }
+      if (!chosen) {
+        throw new BiDiError(
+          "no_browser_available",
+          "No automatable browser is currently installed. Install Mozilla Firefox ('sudo apt install firefox-esr' or 'sudo dnf install firefox') or Chromium ('sudo apt install chromium-browser') and retry."
+        );
+      }
+    } else {
+      chosen = browsers.find(
+        (b) => b.id === requested || b.name === requested || b.display_name.toLowerCase() === requested
       );
+      if (!chosen) {
+        const available = browsers
+          .filter((b) => b.available && b.automatable)
+          .map((b) => `${b.display_name} (${b.id})`)
+          .join(", ") || "none";
+        throw new BiDiError(
+          "browser_unsupported",
+          `Kyro does not support the browser '${requested}'. Available automatable browsers on this machine: ${available}. Kyro will not silently substitute another browser.`
+        );
+      }
+      if (!chosen.available) {
+        const available = browsers
+          .filter((b) => b.available && b.automatable)
+          .map((b) => `${b.display_name} (${b.id})`)
+          .join(", ") || "none";
+        throw new BiDiError(
+          "browser_unavailable",
+          `Requested browser '${chosen.display_name}' is not installed (${chosen.unavailable_reason || "executable missing"}). Available alternatives: ${available}. Kyro will not silently substitute another browser.`
+        );
+      }
+      if (!chosen.automatable) {
+        const available = browsers
+          .filter((b) => b.available && b.automatable)
+          .map((b) => `${b.display_name} (${b.id})`)
+          .join(", ") || "none";
+        throw new BiDiError(
+          "browser_not_automatable",
+          `Requested browser '${chosen.display_name}' is installed but cannot be automated by Kyro (${chosen.unavailable_reason || "unsupported automation adapter"}). Available alternatives: ${available}. Kyro will not silently substitute another browser.`
+        );
+      }
     }
+
     const id = `bs_${++sessionCounter}_${Date.now().toString(36)}`;
-    const session = new BrowserSession(id, {
+    const sessionOpts = {
+      browserId: chosen.id,
+      browserDisplayName: chosen.display_name,
       browserPath: chosen.path,
       headless: params.headless !== false,
       viewport: params.viewport || { width: 1280, height: 800 },
-    });
+    };
+
+    const session = chosen.family === "chromium"
+      ? new ChromiumSession(id, sessionOpts)
+      : new FirefoxSession(id, sessionOpts);
+
     await session.start();
     session.browserVersion = chosen.version;
     sessions.set(id, session);
+
     return {
       session_id: id,
-      browser: "firefox",
+      browser: chosen.id,
       browser_path: chosen.path,
       browser_version: chosen.version,
       headless: session.opts.headless,
       profile_isolated: true,
-      driver: "webdriver-bidi",
+      driver: chosen.adapter,
     };
   },
 
@@ -880,31 +1423,64 @@ const OPS = {
   async "page.navigate"(params) {
     const session = requireSession(params.session_id);
     const started = Date.now();
-    const context = await session.context();
     const url = params.url;
     const timeout = params.timeout_ms || DEFAULT_NAV_TIMEOUT_MS;
-    let result;
-    try {
-      result = await session.client.send(
-        "browsingContext.navigate",
-        { context, url, wait: "complete" },
-        timeout + 5000
-      );
-    } catch (e) {
-      if (e instanceof BiDiError && e.code === "timeout") {
-        throw new BiDiError("navigation_timeout", `Navigation to ${url} timed out after ${timeout}ms`);
+
+    if (session.adapter === "cdp") {
+      try {
+        const navPromise = session.send("Page.navigate", { url }, timeout + 5000);
+        const navResult = await navPromise;
+        const readyDeadline = Date.now() + Math.min(timeout, 10000);
+        while (Date.now() < readyDeadline) {
+          const state = await session.send("Runtime.evaluate", {
+            expression: "document.readyState",
+            returnByValue: true,
+          }).catch(() => null);
+          if (state && state.result && (state.result.value === "complete" || state.result.value === "interactive")) {
+            break;
+          }
+          await delay(100);
+        }
+        const info = await pageInfo(session);
+        return {
+          url: info.url || url,
+          title: info.title,
+          navigation: navResult ? navResult.frameId : null,
+          navigation_status: "complete",
+          ready_state: info.readyState,
+          duration_ms: Date.now() - started,
+        };
+      } catch (e) {
+        if (e instanceof BiDiError && e.code === "timeout") {
+          throw new BiDiError("navigation_timeout", `Navigation to ${url} timed out after ${timeout}ms`);
+        }
+        throw new BiDiError("navigation_failed", `Navigation to ${url} failed: ${e.message}`);
       }
-      throw new BiDiError("navigation_failed", `Navigation to ${url} failed: ${e.message}`);
+    } else {
+      const context = await session.context();
+      let result;
+      try {
+        result = await session.client.send(
+          "browsingContext.navigate",
+          { context, url, wait: "complete" },
+          timeout + 5000
+        );
+      } catch (e) {
+        if (e instanceof BiDiError && e.code === "timeout") {
+          throw new BiDiError("navigation_timeout", `Navigation to ${url} timed out after ${timeout}ms`);
+        }
+        throw new BiDiError("navigation_failed", `Navigation to ${url} failed: ${e.message}`);
+      }
+      const info = await pageInfo(session);
+      return {
+        url: result.url || info.url,
+        title: info.title,
+        navigation: result.navigation || null,
+        navigation_status: "complete",
+        ready_state: info.readyState,
+        duration_ms: Date.now() - started,
+      };
     }
-    const info = await pageInfo(session);
-    return {
-      url: result.url || info.url,
-      title: info.title,
-      navigation: result.navigation || null,
-      navigation_status: "complete",
-      ready_state: info.readyState,
-      duration_ms: Date.now() - started,
-    };
   },
 
   async "page.info"(params) {
@@ -941,21 +1517,29 @@ const OPS = {
       throw new BiDiError("element_disabled", `The element '${located.name || located.tag}' is disabled and cannot be clicked`);
     }
 
-    await session.client.send("input.performActions", {
-      context: await session.context(),
-      actions: [
-        {
-          type: "pointer",
-          id: "mouse",
-          parameters: { pointerType: "mouse" },
-          actions: [
-            { type: "pointerMove", x: located.x, y: located.y, duration: 0 },
-            { type: "pointerDown", button: 0 },
-            { type: "pointerUp", button: 0 },
-          ],
-        },
-      ],
-    });
+    if (session.adapter === "cdp") {
+      const x = Math.round(located.x);
+      const y = Math.round(located.y);
+      await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await session.send("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+      await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+    } else {
+      await session.client.send("input.performActions", {
+        context: await session.context(),
+        actions: [
+          {
+            type: "pointer",
+            id: "mouse",
+            parameters: { pointerType: "mouse" },
+            actions: [
+              { type: "pointerMove", x: located.x, y: located.y, duration: 0 },
+              { type: "pointerDown", button: 0 },
+              { type: "pointerUp", button: 0 },
+            ],
+          },
+        ],
+      });
+    }
 
     await delay(params.settle_ms === undefined ? 250 : params.settle_ms);
     const after = await pageInfo(session);
@@ -992,38 +1576,54 @@ const OPS = {
       throw new BiDiError("element_disabled", `The field '${located.name || located.tag}' is disabled`);
     }
 
-    const context = await session.context();
-    // Focus the field with a real pointer click.
-    await session.client.send("input.performActions", {
-      context,
-      actions: [
-        {
-          type: "pointer",
-          id: "mouse",
-          parameters: { pointerType: "mouse" },
-          actions: [
-            { type: "pointerMove", x: located.x, y: located.y, duration: 0 },
-            { type: "pointerDown", button: 0 },
-            { type: "pointerUp", button: 0 },
-          ],
-        },
-      ],
-    });
-    await delay(80);
+    if (session.adapter === "cdp") {
+      const x = Math.round(located.x);
+      const y = Math.round(located.y);
+      await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await session.send("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x, y });
+      await session.send("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x, y });
+      await delay(80);
 
-    // Select the existing contents and remove them, then type the new value
-    // with real key events.
-    const keyActions = [
-      { type: "keyDown", value: "a", modifiers: 2 },
-      { type: "keyUp", value: "a", modifiers: 2 },
-      { type: "keyDown", value: "\uE003" },
-      { type: "keyUp", value: "\uE003" },
-      ...typeActions(value),
-    ];
-    await session.client.send("input.performActions", {
-      context,
-      actions: [{ type: "key", id: "keyboard", actions: keyActions }],
-    });
+      // Select existing text and delete
+      await session.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "a", code: "KeyA", modifiers: 2 });
+      await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA" });
+      await session.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Backspace", code: "Backspace" });
+      await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" });
+
+      if (value) {
+        await session.send("Input.insertText", { text: value });
+      }
+    } else {
+      const context = await session.context();
+      await session.client.send("input.performActions", {
+        context,
+        actions: [
+          {
+            type: "pointer",
+            id: "mouse",
+            parameters: { pointerType: "mouse" },
+            actions: [
+              { type: "pointerMove", x: located.x, y: located.y, duration: 0 },
+              { type: "pointerDown", button: 0 },
+              { type: "pointerUp", button: 0 },
+            ],
+          },
+        ],
+      });
+      await delay(80);
+
+      const keyActions = [
+        { type: "keyDown", value: "a", modifiers: 2 },
+        { type: "keyUp", value: "a", modifiers: 2 },
+        { type: "keyDown", value: "\uE003" },
+        { type: "keyUp", value: "\uE003" },
+        ...typeActions(value),
+      ];
+      await session.client.send("input.performActions", {
+        context,
+        actions: [{ type: "key", id: "keyboard", actions: keyActions }],
+      });
+    }
 
     const after = await evalInPage(
       session,
@@ -1056,10 +1656,6 @@ const OPS = {
       throw new BiDiError("element_not_found", `Could not find the field to validate: ${lastReason}`);
     }
 
-    // The check runs entirely inside the page: an obviously invalid value is
-    // entered, the browser's own constraint validation is asked whether the
-    // value is acceptable, and the original value is restored.  Nothing is
-    // ever submitted.
     const probe = await evalInPage(
       session,
       `(() => {
@@ -1086,9 +1682,6 @@ const OPS = {
         if (!el) return JSON.stringify({ found: false, reason: 'field not found' });
         const type = (el.getAttribute('type') || 'text').toLowerCase();
         const original = 'value' in el ? el.value : null;
-        // The field's *name* often states the expected format even when the
-        // declared type does not enforce it, so the probe value is derived
-        // from both.
         const labelText = [
           el.getAttribute('aria-label') || '',
           el.getAttribute('placeholder') || '',
@@ -1098,6 +1691,7 @@ const OPS = {
             ? el.form.querySelector('label[for="' + CSS.escape(el.id) + '"]').innerText
             : '',
         ].join(' ').toLowerCase();
+
         let expects = null;
         if (type === 'email' || /e-?mail/.test(labelText)) expects = 'email';
         else if (type === 'url' || /url|website|link/.test(labelText)) expects = 'url';
@@ -1134,7 +1728,6 @@ const OPS = {
         const pattern = el.getAttribute('pattern');
         const minlength = el.getAttribute('minlength');
         const constrainedByType = type === 'email' || type === 'url' || type === 'number' || type === 'tel';
-        // Restore the original value so that the page is left untouched.
         if (setter && setter.set && original !== null) setter.set.call(el, original);
         else if (original !== null) el.value = original;
         el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1150,9 +1743,6 @@ const OPS = {
           invalid_value: invalid,
           valid: valid,
           validation_message: message,
-          // A field that claims a constrained type (either through the type
-          // attribute or through its name) but still accepts an obviously
-          // invalid value does not validate its input.
           expects: expects,
           constrained_by_type: constrainedByType,
           accepts_invalid: valid === true && expects !== null,
@@ -1170,22 +1760,40 @@ const OPS = {
 
   async "page.press"(params) {
     const session = requireSession(params.session_id);
-    const context = await session.context();
     const key = params.key || "";
     if (!key) throw new BiDiError("invalid_request", "page.press requires a 'key' value");
-    const value = keyValue(key);
-    if (value === null) {
-      throw new BiDiError(
-        "invalid_request",
-        `'${key}' is not a single key. Use a named key (Enter, Tab, Escape, Backspace, ArrowDown, ...) or a single character.`
-      );
+
+    if (session.adapter === "cdp") {
+      const lower = key.toLowerCase();
+      let cdpKey = key;
+      let code = "";
+      if (lower === "enter" || lower === "return") { cdpKey = "Enter"; code = "Enter"; }
+      else if (lower === "tab") { cdpKey = "Tab"; code = "Tab"; }
+      else if (lower === "escape" || lower === "esc") { cdpKey = "Escape"; code = "Escape"; }
+      else if (lower === "backspace") { cdpKey = "Backspace"; code = "Backspace"; }
+      else if (lower === "arrowdown") { cdpKey = "ArrowDown"; code = "ArrowDown"; }
+      else if (lower === "arrowup") { cdpKey = "ArrowUp"; code = "ArrowUp"; }
+      else if (lower === "arrowleft") { cdpKey = "ArrowLeft"; code = "ArrowLeft"; }
+      else if (lower === "arrowright") { cdpKey = "ArrowRight"; code = "ArrowRight"; }
+
+      await session.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: cdpKey, code });
+      await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: cdpKey, code });
+    } else {
+      const value = keyValue(key);
+      if (value === null) {
+        throw new BiDiError(
+          "invalid_request",
+          `'${key}' is not a single key. Use a named key (Enter, Tab, Escape, Backspace, ArrowDown, ...) or a single character.`
+        );
+      }
+      await session.client.send("input.performActions", {
+        context: await session.context(),
+        actions: [
+          { type: "key", id: "keyboard", actions: [{ type: "keyDown", value }, { type: "keyUp", value }] },
+        ],
+      });
     }
-    await session.client.send("input.performActions", {
-      context,
-      actions: [
-        { type: "key", id: "keyboard", actions: [{ type: "keyDown", value }, { type: "keyUp", value }] },
-      ],
-    });
+
     await delay(params.settle_ms === undefined ? 150 : params.settle_ms);
     const after = await pageInfo(session);
     return { status: "pressed", key, url: after.url, title: after.title };
@@ -1193,12 +1801,23 @@ const OPS = {
 
   async "page.screenshot"(params) {
     const session = requireSession(params.session_id);
-    const context = await session.context();
-    const shot = await session.client.send("browsingContext.captureScreenshot", {
-      context,
-      origin: params.full_page ? "document" : "viewport",
-    });
-    const data = shot.data;
+    let data;
+
+    if (session.adapter === "cdp") {
+      const shot = await session.send("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: !!params.full_page,
+      });
+      data = shot.data;
+    } else {
+      const context = await session.context();
+      const shot = await session.client.send("browsingContext.captureScreenshot", {
+        context,
+        origin: params.full_page ? "document" : "viewport",
+      });
+      data = shot.data;
+    }
+
     return {
       base64_png: data,
       width: params.width || null,
@@ -1209,24 +1828,43 @@ const OPS = {
 
   async "page.tabs"(params) {
     const session = requireSession(params.session_id);
-    const tree = await session.client.send("browsingContext.getTree", {});
-    const tabs = (tree.contexts || []).map((c) => ({
-      context_id: c.context,
-      url: c.url,
-      title: c.children ? undefined : undefined,
-      parent: c.parent || null,
-    }));
-    for (const tab of tabs) {
+    let tabs = [];
+
+    if (session.adapter === "cdp") {
       try {
-        const info = await evalInPage(
-          session,
-          `(() => JSON.stringify({ title: document.title, url: location.href }))()`,
-          false,
-          tab.context_id
-        );
-        tab.title = info ? info.title : null;
-        if (info && info.url) tab.url = info.url;
-      } catch { /* title is optional */ }
+        const res = await fetch(`http://127.0.0.1:${session.port}/json/list`);
+        const targets = await res.json();
+        tabs = targets
+          .filter((t) => t.type === "page")
+          .map((t) => ({
+            context_id: t.id,
+            url: t.url,
+            title: t.title || null,
+            parent: null,
+          }));
+      } catch {
+        tabs = [{ context_id: "default", url: "about:blank", title: null, parent: null }];
+      }
+    } else {
+      const tree = await session.client.send("browsingContext.getTree", {});
+      tabs = (tree.contexts || []).map((c) => ({
+        context_id: c.context,
+        url: c.url,
+        title: undefined,
+        parent: c.parent || null,
+      }));
+      for (const tab of tabs) {
+        try {
+          const info = await evalInPage(
+            session,
+            `(() => JSON.stringify({ title: document.title, url: location.href }))()`,
+            false,
+            tab.context_id
+          );
+          tab.title = info ? info.title : null;
+          if (info && info.url) tab.url = info.url;
+        } catch { /* title optional */ }
+      }
     }
     return { tabs };
   },
@@ -1235,8 +1873,18 @@ const OPS = {
     const session = requireSession(params.session_id);
     const width = Math.max(320, Math.min(3840, Number(params.width) || 1280));
     const height = Math.max(240, Math.min(2160, Number(params.height) || 800));
-    const context = await session.context();
-    await session.client.send("browsingContext.setViewport", { context, viewport: { width, height } });
+
+    if (session.adapter === "cdp") {
+      await session.send("Emulation.setDeviceMetricsOverride", {
+        width,
+        height,
+        deviceScaleFactor: 1,
+        mobile: false,
+      });
+    } else {
+      const context = await session.context();
+      await session.client.send("browsingContext.setViewport", { context, viewport: { width, height } });
+    }
     return { width, height };
   },
 
@@ -1283,10 +1931,11 @@ const OPS = {
     return {
       sessions: [...sessions.values()].map((s) => ({
         session_id: s.id,
-        browser: "firefox",
+        browser: s.browserId,
         browser_version: s.browserVersion,
         headless: s.opts.headless,
         closed: s.closed,
+        adapter: s.adapter,
       })),
     };
   },
@@ -1307,7 +1956,7 @@ function normaliseTarget(target) {
   for (const key of ["role", "name", "text", "tag", "testId", "css", "nth", "ref"]) {
     if (target[key] !== undefined && target[key] !== null) out[key] = target[key];
   }
-  if (!out.role && !out.name && !out.text && !out.tag && !out.testId && !out.css) {
+  if (!out.role && !out.name && !out.text && !out.tag && !out.testId && !out.css && !out.ref) {
     throw new BiDiError("invalid_request", "The target must specify at least one of role, name, text, tag, testId or css");
   }
   return out;
