@@ -948,6 +948,9 @@ const ELEMENT_BUILDER = `
     if (tag === 'main') return 'main';
     if (tag === 'header') return 'banner';
     if (tag === 'footer') return 'contentinfo';
+    if (tag === 'aside') return 'complementary';
+    if (tag === 'dialog') return 'dialog';
+    if (tag === 'menu') return 'menu';
     if (tag === 'form') return 'form';
     if (tag === 'ul' || tag === 'ol') return 'list';
     if (tag === 'li') return 'listitem';
@@ -1004,7 +1007,21 @@ const ELEMENT_BUILDER = `
   const MAX_ELEMENTS = 400;
   const elements = [];
   let index = 0;
-  const all = document.querySelectorAll('*');
+
+  // Support open shadow roots traversal
+  const collectElements = (root = document, list = []) => {
+    const children = root.querySelectorAll('*');
+    for (let i = 0; i < children.length; i++) {
+      const el = children[i];
+      list.push(el);
+      if (el.shadowRoot && el.shadowRoot.mode === 'open') {
+        collectElements(el.shadowRoot, list);
+      }
+    }
+    return list;
+  };
+
+  const all = collectElements();
   for (let domIndex = 0; domIndex < all.length; domIndex++) {
     const el = all[domIndex];
     if (elements.length >= MAX_ELEMENTS) break;
@@ -1015,13 +1032,17 @@ const ELEMENT_BUILDER = `
     if (!isVisible(el)) continue;
     const rect = el.getBoundingClientRect();
     const name = nameOf(el);
+    const inViewport = rect.top < window.innerHeight && rect.bottom > 0 && rect.left < window.innerWidth && rect.right > 0;
+    const clipped = rect.top < 0 || rect.left < 0 || rect.bottom > window.innerHeight || rect.right > window.innerWidth;
+    const lbl = labelFor(el);
+
     elements.push({
       ref: 'e' + (++index),
       role,
       name: name,
       tag: tag,
       type: el.getAttribute ? (el.getAttribute('type') || null) : null,
-      value: ('value' in el && typeof el.value === 'string' && el.type !== 'password') ? el.value : null,
+      value: ('value' in el && typeof el.value === 'string') ? (el.type === 'password' ? '[REDACTED]' : el.value) : null,
       disabled: !!el.disabled,
       checked: !!el.checked,
       href: tag === 'a' ? (el.getAttribute('href') || null) : null,
@@ -1031,6 +1052,9 @@ const ELEMENT_BUILDER = `
       width: Math.round(rect.width), height: Math.round(rect.height),
       interactive: INTERACTIVE.has(role),
       headingLevel: isHeading ? Number(tag.slice(1)) : null,
+      in_viewport: inViewport,
+      clipped: clipped,
+      labels: lbl ? [lbl] : [],
       domIndex: domIndex,
     });
   }
@@ -1042,12 +1066,32 @@ const SNAPSHOT_SOURCE = `
 (() => {
   const elements = ${ELEMENT_BUILDER};
   const docTitle = document.title || '';
+  const snapId = 'snap_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  const now = Date.now();
   const headings = elements.filter((e) => e.headingLevel).map((e) => ({ ref: e.ref, level: e.headingLevel, text: e.text || e.name }));
   const links = elements.filter((e) => e.tag === 'a' && e.href).map((e) => ({ ref: e.ref, href: e.href, text: e.name || e.text }));
+  const landmarks = elements.filter((e) => ['banner', 'navigation', 'main', 'contentinfo', 'complementary', 'search', 'form'].includes(e.role)).map((e) => ({
+    ref: e.ref,
+    role: e.role,
+    tag: e.tag,
+    name: e.name || e.text || ''
+  }));
+  const dialogs = elements.filter((e) => e.role === 'dialog' || e.role === 'alertdialog' || e.tag === 'dialog').map((e) => ({
+    ref: e.ref,
+    role: e.role,
+    name: e.name || e.text || '',
+    open: true
+  }));
+  const menus = elements.filter((e) => ['menu', 'menubar', 'menuitem'].includes(e.role)).map((e) => ({
+    ref: e.ref,
+    role: e.role,
+    name: e.name || e.text || ''
+  }));
   const forms = [...document.querySelectorAll('form')].map((f, i) => ({
     ref: 'f' + (i + 1),
     action: f.getAttribute('action') || null,
     method: (f.getAttribute('method') || 'get').toLowerCase(),
+    field_count: f.elements ? f.elements.length : 0
   }));
   const anchors = [...document.querySelectorAll('a[href]')].map((a) => {
     const href = a.getAttribute('href') || '';
@@ -1062,24 +1106,55 @@ const SNAPSHOT_SOURCE = `
     naturalWidth: i.naturalWidth,
     naturalHeight: i.naturalHeight,
   }));
+  const failed_images = images.filter((img) => img.complete && img.naturalWidth === 0).map((img) => ({
+    src: img.src,
+    alt: img.alt
+  }));
+  const unnamed_interactive = elements.filter((e) => e.interactive && !e.name.trim()).map((e) => ({
+    ref: e.ref,
+    role: e.role,
+    tag: e.tag
+  }));
+
+  let hasClosedShadowRoots = false;
+  const crossOriginFrames = [];
+  const frames = document.querySelectorAll('iframe, frame');
+  for (let i = 0; i < frames.length; i++) {
+    try {
+      if (!frames[i].contentDocument) crossOriginFrames.push(frames[i].src || 'unknown');
+    } catch {
+      crossOriginFrames.push(frames[i].src || 'cross-origin');
+    }
+  }
+
   const scripts = [...document.querySelectorAll('script[src]')].map((s) => s.getAttribute('src'));
   const rawText = (document.body && document.body.innerText) || '';
   const bodyText = rawText.replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 4000);
   return JSON.stringify({
+    snapshot_id: snapId,
+    timestamp: now,
     url: location.href,
     title: docTitle,
     readyState: document.readyState,
     elements,
     headings,
+    landmarks,
+    dialogs,
+    menus,
     links,
     forms,
     anchors,
     images,
+    failed_images,
+    unnamed_interactive,
     scripts,
     body_text: bodyText,
     viewport: { width: window.innerWidth, height: window.innerHeight },
     scroll: { x: window.scrollX, y: window.scrollY, width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
+    page_dimensions: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
     overflowX: document.documentElement.scrollWidth > window.innerWidth + 1,
+    has_closed_shadow_roots: hasClosedShadowRoots,
+    cross_origin_frames: crossOriginFrames,
   });
 })()
 `;
@@ -1088,14 +1163,86 @@ function resolveScript(spec) {
   const json = JSON.stringify(spec);
   return `(() => {
     const spec = ${json};
-    const all = Array.from(document.querySelectorAll('*'));
+    const collectElements = (root = document, list = []) => {
+      const kids = root.querySelectorAll('*');
+      for (let i = 0; i < kids.length; i++) {
+        const el = kids[i];
+        list.push(el);
+        if (el.shadowRoot && el.shadowRoot.mode === 'open') {
+          collectElements(el.shadowRoot, list);
+        }
+      }
+      return list;
+    };
+    const all = collectElements();
     const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim();
 
     let chosen = null;
     let matchCount = 0;
     let reason = 'no visible element matched the requested target';
+    let isStale = false;
+    let isAmbiguous = false;
 
-    if (spec.css) {
+    // 1. Coordinates targeting
+    if (spec.x !== undefined && spec.y !== undefined && spec.x !== null && spec.y !== null) {
+      if (spec.x < 0 || spec.x > window.innerWidth || spec.y < 0 || spec.y > window.innerHeight) {
+        return JSON.stringify({ found: false, reason: 'Coordinates (' + spec.x + ', ' + spec.y + ') are outside the viewport (' + window.innerWidth + 'x' + window.innerHeight + ')' });
+      }
+      chosen = document.elementFromPoint(spec.x, spec.y);
+      matchCount = chosen ? 1 : 0;
+      if (!chosen) reason = 'No element found at coordinates (' + spec.x + ', ' + spec.y + ')';
+    } else if (spec.ref) {
+      // 2. Direct snapshot reference
+      const elements = ${ELEMENT_BUILDER};
+      const byRef = (ref) => {
+        const index = Number(String(ref).replace(/^e/, ''));
+        if (!Number.isFinite(index) || index < 1 || index > elements.length) return null;
+        const candidate = elements[index - 1];
+        return candidate ? all[candidate.domIndex] || null : null;
+      };
+      chosen = byRef(spec.ref);
+      if (!chosen) {
+        isStale = true;
+        reason = "stale_element_reference: reference '" + spec.ref + "' is stale or no longer exists in DOM";
+      }
+      matchCount = chosen ? 1 : 0;
+    } else if (spec.role || spec.name || spec.text) {
+      // 3. Accessible role / name / text locator
+      const elements = ${ELEMENT_BUILDER};
+      const matches = elements.filter((candidate) => {
+        if (spec.role && candidate.role.toLowerCase() !== String(spec.role).toLowerCase()) return false;
+        if (spec.name) {
+          const needle = String(spec.name).toLowerCase();
+          const haystack = ((candidate.name || '') + ' ' + (candidate.text || '')).toLowerCase();
+          if (!haystack.includes(needle)) return false;
+        }
+        if (spec.text) {
+          const needle = String(spec.text).toLowerCase();
+          if (!((candidate.text || '') + ' ' + (candidate.name || '')).toLowerCase().includes(needle)) return false;
+        }
+        if (spec.tag && candidate.tag !== String(spec.tag).toLowerCase()) return false;
+        return true;
+      });
+      matchCount = matches.length;
+      if (matchCount > 1 && spec.nth === undefined && !spec.ref) {
+        isAmbiguous = true;
+      }
+      const candidate = spec.nth !== undefined && spec.nth !== null ? matches[spec.nth] : matches[0];
+      chosen = candidate ? all[candidate.domIndex] || null : null;
+      if (!chosen && !matchCount) {
+        reason = 'no visible element matched the requested role/name';
+      }
+    } else if (spec.testId) {
+      // 4. Test ID
+      const matches = all.filter((el) => {
+        const tid = el.getAttribute ? (el.getAttribute('data-testid') || el.getAttribute('data-test-id')) : null;
+        return tid === spec.testId;
+      });
+      matchCount = matches.length;
+      chosen = spec.nth !== undefined && spec.nth !== null ? matches[spec.nth] : matches[0];
+      if (!chosen) reason = "no element matched testId '" + spec.testId + "'";
+    } else if (spec.css) {
+      // 5. CSS selector
       let matches = [];
       try { matches = Array.from(document.querySelectorAll(spec.css)); } catch (e) { matches = []; }
       const visible = matches.filter((el) => {
@@ -1107,48 +1254,9 @@ function resolveScript(spec) {
       matchCount = visible.length;
       chosen = spec.nth !== undefined && spec.nth !== null ? visible[spec.nth] : visible[0];
       if (!chosen) reason = "no visible element matched the CSS selector '" + spec.css + "'";
-    } else {
-      const elements = ${ELEMENT_BUILDER};
-      const byRef = (ref) => {
-        const index = Number(String(ref).replace(/^e/, ''));
-        if (!Number.isFinite(index) || index < 1 || index > elements.length) return null;
-        const candidate = elements[index - 1];
-        return candidate ? all[candidate.domIndex] || null : null;
-      };
-      if (spec.ref) {
-        chosen = byRef(spec.ref);
-        if (!chosen) reason = "reference '" + spec.ref + "' no longer exists on this page";
-        matchCount = chosen ? 1 : 0;
-      } else {
-        const matches = elements.filter((candidate) => {
-          if (spec.role && candidate.role.toLowerCase() !== String(spec.role).toLowerCase()) return false;
-          if (spec.name) {
-            const needle = String(spec.name).toLowerCase();
-            const haystack = ((candidate.name || '') + ' ' + (candidate.text || '')).toLowerCase();
-            if (!haystack.includes(needle)) return false;
-          }
-          if (spec.text) {
-            const needle = String(spec.text).toLowerCase();
-            if (!((candidate.text || '') + ' ' + (candidate.name || '')).toLowerCase().includes(needle)) return false;
-          }
-          if (spec.tag && candidate.tag !== String(spec.tag).toLowerCase()) return false;
-          if (spec.testId) {
-            const el = all[candidate.domIndex];
-            const tid = el ? (el.getAttribute('data-testid') || el.getAttribute('data-test-id')) : null;
-            if (tid !== spec.testId) return false;
-          }
-          return true;
-        });
-        matchCount = matches.length;
-        const candidate = spec.nth !== undefined && spec.nth !== null ? matches[spec.nth] : matches[0];
-        chosen = candidate ? all[candidate.domIndex] || null : null;
-        if (!chosen && !matchCount) {
-          reason = 'no visible element matched the requested role/name';
-        }
-      }
     }
 
-    if (!chosen) return JSON.stringify({ found: false, reason: reason, matches: matchCount });
+    if (!chosen) return JSON.stringify({ found: false, stale: isStale, reason: reason, matches: matchCount });
 
     chosen.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = chosen.getBoundingClientRect();
@@ -1180,8 +1288,9 @@ function resolveScript(spec) {
       role: role,
       name: (chosen.getAttribute('aria-label') || textOf(chosen) || '').slice(0, 160),
       disabled: !!chosen.disabled,
-      value: ('value' in chosen && typeof chosen.value === 'string') ? chosen.value : null,
+      value: ('value' in chosen && typeof chosen.value === 'string') ? (chosen.type === 'password' ? '[REDACTED]' : chosen.value) : null,
       matches: matchCount,
+      ambiguous: isAmbiguous,
     });
   })()`;
 }
@@ -1338,15 +1447,32 @@ const OPS = {
     if (requested === "auto" || !requested) {
       if (discovery.defaultBrowserId) {
         chosen = browsers.find((b) => b.id === discovery.defaultBrowserId && b.available && b.automatable);
-      }
-      if (!chosen) {
-        chosen = browsers.find((b) => b.available && b.automatable);
-      }
-      if (!chosen) {
-        throw new BiDiError(
-          "no_browser_available",
-          "No automatable browser is currently installed. Install Mozilla Firefox ('sudo apt install firefox-esr' or 'sudo dnf install firefox') or Chromium ('sudo apt install chromium-browser') and retry."
-        );
+        if (!chosen) {
+          const available = browsers
+            .filter((b) => b.available && b.automatable)
+            .map((b) => `${b.display_name} (${b.id})`)
+            .join(", ") || "none";
+          throw new BiDiError(
+            "default_browser_not_automatable",
+            `The system default browser '${discovery.defaultBrowserId}' is not installed or cannot be automated. Available supported alternatives: ${available}. Kyro will not silently substitute another browser.`
+          );
+        }
+      } else {
+        const available = browsers
+          .filter((b) => b.available && b.automatable)
+          .map((b) => `${b.display_name} (${b.id})`)
+          .join(", ") || "none";
+        if (available === "none") {
+          throw new BiDiError(
+            "no_browser_available",
+            "No automatable browser is currently installed. Install Mozilla Firefox ('sudo apt install firefox-esr' or 'sudo dnf install firefox') or Chromium ('sudo apt install chromium-browser') and retry."
+          );
+        } else {
+          throw new BiDiError(
+            "no_default_browser",
+            `The system default browser could not be determined. Available supported alternatives: ${available}. Please specify a browser explicitly or configure a default in Kyro settings. Kyro will not silently substitute another browser.`
+          );
+        }
       }
     } else {
       chosen = browsers.find(
@@ -1492,7 +1618,135 @@ const OPS = {
     const session = requireSession(params.session_id);
     const snap = await evalInPage(session, SNAPSHOT_SOURCE);
     if (!snap) throw new BiDiError("snapshot_failed", "The page snapshot could not be produced");
+    session.currentSnapshotId = snap.snapshot_id;
+    snap.console_errors = (session.consoleEntries || []).filter((e) => e.level === "error");
+    snap.failed_requests = session.networkFailed || [];
     return snap;
+  },
+
+  async "page.inspect_element"(params) {
+    const session = requireSession(params.session_id);
+    const target = normaliseTarget(params.target);
+    const timeout = params.timeout_ms || DEFAULT_ACTION_TIMEOUT_MS;
+    const deadline = Date.now() + timeout;
+
+    let located = null;
+    let lastReason = "no visible element matched the requested target";
+    while (Date.now() < deadline) {
+      located = await evalInPage(session, resolveScript(target));
+      if (located && located.found) break;
+      if (located && located.reason) lastReason = located.reason;
+      await delay(150);
+    }
+    if (!located || !located.found) {
+      const code = located && located.stale ? "stale_element_reference" : "element_not_found";
+      throw new BiDiError(code, `Could not inspect element: ${lastReason}`);
+    }
+
+    const script = `(() => {
+      const spec = ${JSON.stringify(target)};
+      const collectElements = (root = document, list = []) => {
+        const kids = root.querySelectorAll('*');
+        for (let i = 0; i < kids.length; i++) {
+          const el = kids[i];
+          list.push(el);
+          if (el.shadowRoot && el.shadowRoot.mode === 'open') {
+            collectElements(el.shadowRoot, list);
+          }
+        }
+        return list;
+      };
+      const all = collectElements();
+      let chosen = null;
+      if (spec.x !== undefined && spec.y !== undefined) {
+        chosen = document.elementFromPoint(spec.x, spec.y);
+      } else if (spec.ref) {
+        const index = Number(String(spec.ref).replace(/^e/, ''));
+        const elements = ${ELEMENT_BUILDER};
+        if (Number.isFinite(index) && index >= 1 && index <= elements.length) {
+          const candidate = elements[index - 1];
+          chosen = candidate ? all[candidate.domIndex] : null;
+        }
+      } else if (spec.css) {
+        chosen = document.querySelector(spec.css);
+      } else {
+        const elements = ${ELEMENT_BUILDER};
+        const candidate = elements.find(c => {
+          if (spec.role && c.role.toLowerCase() !== String(spec.role).toLowerCase()) return false;
+          if (spec.name && !((c.name || '') + ' ' + (c.text || '')).toLowerCase().includes(String(spec.name).toLowerCase())) return false;
+          return true;
+        });
+        chosen = candidate ? all[candidate.domIndex] : null;
+      }
+      if (!chosen) return null;
+      const rect = chosen.getBoundingClientRect();
+      const style = window.getComputedStyle(chosen);
+      const attrs = {};
+      for (let i = 0; i < chosen.attributes.length; i++) {
+        const a = chosen.attributes[i];
+        if (a.name.toLowerCase().includes('password') || a.name.toLowerCase().includes('secret')) continue;
+        attrs[a.name] = a.value;
+      }
+      return JSON.stringify({
+        tag: chosen.tagName.toLowerCase(),
+        role: chosen.getAttribute('role') || chosen.tagName.toLowerCase(),
+        name: (chosen.getAttribute('aria-label') || chosen.innerText || '').slice(0, 160),
+        dom_context: {
+          tag: chosen.tagName.toLowerCase(),
+          outer_html_snippet: chosen.outerHTML.slice(0, 300),
+          parent_tag: chosen.parentElement ? chosen.parentElement.tagName.toLowerCase() : null,
+          parent_class: chosen.parentElement ? chosen.parentElement.className : null,
+          children_count: chosen.children ? chosen.children.length : 0,
+        },
+        attributes: attrs,
+        computed_styles: {
+          display: style.display,
+          visibility: style.visibility,
+          opacity: style.opacity,
+          position: style.position,
+          z_index: style.zIndex,
+          color: style.color,
+          background_color: style.backgroundColor,
+          font_size: style.fontSize,
+          box_sizing: style.boxSizing,
+          width: style.width,
+          height: style.height,
+          overflow: style.overflow,
+        },
+        bounding_box: {
+          x: Math.round(rect.left),
+          y: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          in_viewport: rect.top < window.innerHeight && rect.bottom > 0 && rect.left < window.innerWidth && rect.right > 0,
+          clipped: rect.top < 0 || rect.left < 0 || rect.bottom > window.innerHeight || rect.right > window.innerWidth,
+        },
+        interactable: !chosen.disabled && style.display !== 'none' && style.visibility !== 'hidden',
+        disabled: !!chosen.disabled,
+      });
+    })()`;
+
+    const details = await evalInPage(session, script);
+    let cropped_png = null;
+    if (session.adapter === "cdp" && located.width > 0 && located.height > 0) {
+      try {
+        const clip = {
+          x: Math.max(0, located.x - located.width / 2),
+          y: Math.max(0, located.y - located.height / 2),
+          width: Math.max(1, located.width),
+          height: Math.max(1, located.height),
+          scale: 1,
+        };
+        const shot = await session.send("Page.captureScreenshot", { format: "png", clip });
+        if (shot && shot.data) cropped_png = shot.data;
+      } catch { /* best effort */ }
+    }
+
+    return {
+      element_ref: target.ref || null,
+      ...details,
+      cropped_screenshot: cropped_png,
+    };
   },
 
   async "page.click"(params) {
@@ -1500,6 +1754,8 @@ const OPS = {
     const target = normaliseTarget(params.target);
     const timeout = params.timeout_ms || DEFAULT_ACTION_TIMEOUT_MS;
     const started = Date.now();
+    const before = await pageInfo(session);
+    const activeBefore = await evalInPage(session, `(() => { const el = document.activeElement; return el ? (el.tagName + (el.id ? '#' + el.id : '')) : null; })()`);
 
     let located = null;
     const deadline = Date.now() + timeout;
@@ -1511,7 +1767,8 @@ const OPS = {
       await delay(150);
     }
     if (!located || !located.found) {
-      throw new BiDiError("element_not_found", `Could not find a clickable element: ${lastReason}`);
+      const code = located && located.stale ? "stale_element_reference" : "element_not_found";
+      throw new BiDiError(code, `Could not find a clickable element: ${lastReason}`);
     }
     if (located.disabled) {
       throw new BiDiError("element_disabled", `The element '${located.name || located.tag}' is disabled and cannot be clicked`);
@@ -1543,12 +1800,25 @@ const OPS = {
 
     await delay(params.settle_ms === undefined ? 250 : params.settle_ms);
     const after = await pageInfo(session);
+    const activeAfter = await evalInPage(session, `(() => { const el = document.activeElement; return el ? (el.tagName + (el.id ? '#' + el.id : '')) : null; })()`);
+
+    const navigated = before.url !== after.url;
+    const titleChanged = before.title !== after.title;
+    const focusChanged = activeBefore !== activeAfter;
+    const stateChanged = navigated || titleChanged || focusChanged;
+    const verificationStatus = stateChanged ? "succeeded" : "not_verified";
+
     return {
       status: "clicked",
       element: { name: located.name, role: located.role, tag: located.tag, x: located.x, y: located.y },
       matches: located.matches,
+      ambiguous: !!located.ambiguous,
       url: after.url,
       title: after.title,
+      url_before: before.url,
+      navigated,
+      verified_state_change: stateChanged,
+      verification_status: verificationStatus,
       duration_ms: Date.now() - started,
     };
   },
@@ -1570,7 +1840,8 @@ const OPS = {
       await delay(150);
     }
     if (!located || !located.found) {
-      throw new BiDiError("element_not_found", `Could not find an editable element: ${lastReason}`);
+      const code = located && located.stale ? "stale_element_reference" : "element_not_found";
+      throw new BiDiError(code, `Could not find an editable element: ${lastReason}`);
     }
     if (located.disabled) {
       throw new BiDiError("element_disabled", `The field '${located.name || located.tag}' is disabled`);
@@ -1629,10 +1900,15 @@ const OPS = {
       session,
       `(() => { const el = document.activeElement; return el ? JSON.stringify({ tag: el.tagName, value: ('value' in el ? el.value : null) }) : null; })()`
     );
+    const valueAfter = after ? after.value : null;
+    const valueChanged = valueAfter === value || (valueAfter !== null && valueAfter !== undefined);
+
     return {
       status: "filled",
       element: { name: located.name, role: located.role, tag: located.tag },
-      value_after: after ? after.value : null,
+      value_after: valueAfter,
+      verified_state_change: valueChanged,
+      verification_status: valueChanged ? "succeeded" : "not_verified",
       duration_ms: Date.now() - started,
     };
   },
@@ -1953,11 +2229,11 @@ function normaliseTarget(target) {
     throw new BiDiError("invalid_request", "A 'target' object describing the element is required");
   }
   const out = {};
-  for (const key of ["role", "name", "text", "tag", "testId", "css", "nth", "ref"]) {
+  for (const key of ["role", "name", "text", "tag", "testId", "css", "nth", "ref", "x", "y", "snapshot_id"]) {
     if (target[key] !== undefined && target[key] !== null) out[key] = target[key];
   }
-  if (!out.role && !out.name && !out.text && !out.tag && !out.testId && !out.css && !out.ref) {
-    throw new BiDiError("invalid_request", "The target must specify at least one of role, name, text, tag, testId or css");
+  if (!out.role && !out.name && !out.text && !out.tag && !out.testId && !out.css && !out.ref && (out.x === undefined || out.y === undefined)) {
+    throw new BiDiError("invalid_request", "The target must specify at least one of ref, role, name, text, tag, testId, css, or coordinates (x, y)");
   }
   return out;
 }
