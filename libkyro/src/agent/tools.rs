@@ -142,32 +142,53 @@ Use the element references and names to drive the other browser tools.".to_strin
             }),
         },
         ToolDefinition {
-            name: "browser_click".to_string(),
-            description: "Click an element identified by its accessible name, role, text or a CSS selector. \
-Never guess screen coordinates; use the semantic locator.".to_string(),
+            name: "browser_inspect_element".to_string(),
+            description: "Perform targeted inspection of a selected element on the current page: returns DOM context, attributes, computed styles, layout bounding box, and a cropped screenshot when supported.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "description": "The browser session id" },
+                    "ref": { "type": "string", "description": "Element reference from the current snapshot (e.g. 'e1')" },
+                    "role": { "type": "string", "description": "The ARIA role, e.g. 'button' or 'link'" },
+                    "name": { "type": "string", "description": "Part of the accessible name of the element" },
+                    "text": { "type": "string", "description": "Part of the visible text of the element" },
+                    "tag": { "type": "string", "description": "The HTML tag, e.g. 'button'" },
+                    "test_id": { "type": "string", "description": "A data-testid value" },
+                    "css": { "type": "string", "description": "A CSS selector" }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "browser_click".to_string(),
+            description: "Click an element identified by its snapshot reference ('ref'), accessible name, role, text, test id, or CSS selector.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "The browser session id" },
+                    "ref": { "type": "string", "description": "Element reference from the current snapshot (e.g. 'e1')" },
                     "role": { "type": "string", "description": "The ARIA role, e.g. 'button' or 'link'" },
                     "name": { "type": "string", "description": "Part of the accessible name of the element" },
                     "text": { "type": "string", "description": "Part of the visible text of the element" },
                     "tag": { "type": "string", "description": "The HTML tag, e.g. 'button'" },
                     "test_id": { "type": "string", "description": "A data-testid value" },
                     "css": { "type": "string", "description": "A CSS selector (last resort)" },
-                    "nth": { "type": "integer", "description": "Which match to use when several elements match" }
+                    "nth": { "type": "integer", "description": "Which match to use when several elements match" },
+                    "x": { "type": "integer", "description": "Target X coordinate (only when semantic locator is unavailable)" },
+                    "y": { "type": "integer", "description": "Target Y coordinate (only when semantic locator is unavailable)" }
                 },
                 "required": ["session_id"]
             }),
         },
         ToolDefinition {
             name: "browser_fill".to_string(),
-            description: "Type a value into a form field identified by its accessible name, role, label or selector.".to_string(),
+            description: "Type a value into a form field identified by its snapshot reference, accessible name, role, label or selector.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "description": "The browser session id" },
                     "value": { "type": "string", "description": "The text to enter" },
+                    "ref": { "type": "string", "description": "Element reference from the current snapshot (e.g. 'e1')" },
                     "role": { "type": "string", "description": "The ARIA role, e.g. 'textbox'" },
                     "name": { "type": "string", "description": "Part of the accessible name of the field" },
                     "text": { "type": "string", "description": "Part of the visible text of the field" },
@@ -248,18 +269,17 @@ Never guess screen coordinates; use the semantic locator.".to_string(),
         },
         ToolDefinition {
             name: "audit_ui".to_string(),
-            description: "Run the complete UI audit workflow: discover the project, ask for approval to start its \
-development server, verify the ready URL, open it in the configured or requested browser, discover every route, inspect each one, \
-exercise safe controls and produce a Markdown bug report with evidence.".to_string(),
+            description: "Run the complete UI audit workflow: inspect the project at project_path (or discover project_name in search_root), ask for approval to start its development server, verify the ready URL, open it in the configured or requested browser, discover every route, inspect each one across responsive viewports, exercise safe controls and produce an evidence bundle with a Markdown bug report.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "project_name": { "type": "string", "description": "The project directory name to find (case-insensitive)" },
-                    "search_root": { "type": "string", "description": "Absolute directory to search. Defaults to the user's Desktop." },
-                    "browser": { "type": "string", "description": "Browser to use (e.g. 'auto', 'firefox', 'chrome', 'chromium', 'brave'). Defaults to 'auto'." },
+                    "project_path": { "type": "string", "description": "Direct absolute path to the project directory. When specified, discovery is bypassed." },
+                    "project_name": { "type": "string", "description": "The project directory name to find in search_root (case-insensitive)." },
+                    "search_root": { "type": "string", "description": "Absolute directory to search when finding by project_name. Defaults to the user's Desktop." },
+                    "browser": { "type": "string", "description": "Browser to use (e.g. 'auto', 'firefox', 'chrome', 'chromium', 'brave'). Defaults to Kyro setting or system default." },
+                    "headless": { "type": "boolean", "description": "Run the browser without a visible window (defaults to Kyro browser setting)" },
                     "keep_server_running": { "type": "boolean", "description": "Leave the development server running after the audit" }
-                },
-                "required": ["project_name"]
+                }
             }),
         },
     ]
@@ -536,7 +556,8 @@ pub async fn browser_open(
         .unwrap_or("auto")
         .trim()
         .to_string();
-    let headless = args["headless"].as_bool().unwrap_or(true);
+    let default_headless = manager.default_headless().await;
+    let headless = args["headless"].as_bool().unwrap_or(default_headless);
 
     match manager
         .create_session(&browser, headless, Some(run_id), blocked_domains)
@@ -551,14 +572,30 @@ pub async fn browser_open(
 
 /// Builds an element target from the tool arguments.
 pub fn target_from_args(args: &serde_json::Value) -> Result<ElementTarget, String> {
+    let ref_id = args["ref"]
+        .as_str()
+        .or_else(|| args["element_ref"].as_str())
+        .map(|s| s.to_string());
+    let test_id = args["test_id"]
+        .as_str()
+        .or_else(|| args["testId"].as_str())
+        .map(|s| s.to_string());
+    let x = args["x"].as_i64().map(|n| n as i32);
+    let y = args["y"].as_i64().map(|n| n as i32);
+    let snapshot_id = args["snapshot_id"].as_str().map(|s| s.to_string());
+
     let target = ElementTarget {
+        ref_id,
         role: args["role"].as_str().map(|s| s.to_string()),
         name: args["name"].as_str().map(|s| s.to_string()),
         text: args["text"].as_str().map(|s| s.to_string()),
         tag: args["tag"].as_str().map(|s| s.to_string()),
-        test_id: args["test_id"].as_str().map(|s| s.to_string()),
+        test_id,
         css: args["css"].as_str().map(|s| s.to_string()),
         nth: args["nth"].as_u64().map(|n| n as usize),
+        x,
+        y,
+        snapshot_id,
     };
     target.to_params()?;
     Ok(target)
@@ -627,6 +664,45 @@ pub async fn browser_snapshot(
         })
         .to_string(),
     )
+}
+
+/// Handles the `browser_inspect_element` tool.
+pub async fn browser_inspect_element(
+    args: &serde_json::Value,
+    manager: &Arc<BrowserAutomationManager>,
+) -> ToolOutcome {
+    let session_id = args["session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if session_id.is_empty() {
+        return ToolOutcome::fail("browser_inspect_element requires a 'session_id' parameter.");
+    }
+    let target = match target_from_args(args) {
+        Ok(t) => t,
+        Err(e) => return ToolOutcome::fail(e),
+    };
+    let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10000);
+    match manager.inspect_element(&session_id, target, timeout_ms).await {
+        Ok(res) => {
+            let cropped = res.cropped_screenshot.clone();
+            let summary = serde_json::json!({
+                "status": "success",
+                "tag": res.tag,
+                "role": res.role,
+                "name": res.name,
+                "dom_context": res.dom_context,
+                "attributes": res.attributes,
+                "computed_styles": res.computed_styles,
+                "bounding_box": res.bounding_box,
+                "interactable": res.interactable,
+                "disabled": res.disabled,
+            });
+            ToolOutcome::ok(summary.to_string()).with_visual(cropped)
+        }
+        Err(e) => ToolOutcome::fail(format!("Element inspection failed: {}", e)),
+    }
 }
 
 /// Handles the `browser_click` tool.
