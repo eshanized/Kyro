@@ -93,8 +93,33 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Verified capabilities of an LLM provider and model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    pub vision: bool,
+    pub tool_calling: bool,
+    pub max_tokens: Option<usize>,
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self {
+            vision: false,
+            tool_calling: true,
+            max_tokens: None,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ModelRouter {
     client: reqwest::Client,
+    capabilities: Arc<RwLock<HashMap<String, ModelCapabilities>>>,
+    fallback_vision_model: Arc<RwLock<Option<String>>>,
 }
 
 impl Default for ModelRouter {
@@ -109,21 +134,96 @@ impl ModelRouter {
             .timeout(Duration::from_secs(90))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            client,
+            capabilities: Arc::new(RwLock::new(HashMap::new())),
+            fallback_vision_model: Arc::new(RwLock::new(Some(DEFAULT_VISION_MODEL.to_string()))),
+        }
     }
 
-    /// Check if a model identifier indicates multimodal / vision capabilities
-    pub fn is_vision_model(model: &str) -> bool {
+    /// Explicitly register capabilities for a model identifier
+    pub async fn register_capability(&self, model: &str, caps: ModelCapabilities) {
+        let mut map = self.capabilities.write().await;
+        map.insert(model.to_string(), caps);
+    }
+
+    /// Set fallback vision model to use when primary model is text-only
+    pub async fn set_fallback_vision_model(&self, model: Option<String>) {
+        let mut guard = self.fallback_vision_model.write().await;
+        *guard = model;
+    }
+
+    /// Get configured fallback vision model
+    pub async fn get_fallback_vision_model(&self) -> Option<String> {
+        let guard = self.fallback_vision_model.read().await;
+        guard.clone()
+    }
+
+    /// Retrieve model capabilities using explicit registry, then provider/model capability metadata
+    pub async fn capabilities_for(&self, model: &str) -> ModelCapabilities {
+        let guard = self.capabilities.read().await;
+        if let Some(caps) = guard.get(model) {
+            return caps.clone();
+        }
+        Self::resolve_capabilities(model)
+    }
+
+    /// Statically resolve capabilities based on verified provider/model metadata
+    pub fn resolve_capabilities(model: &str) -> ModelCapabilities {
         let lower = model.to_lowercase();
-        lower.contains("vision")
+        // Explicit text-only models MUST be rejected for vision
+        let text_only = (lower.contains("instruct") && !lower.contains("vision") && !lower.contains("vl"))
+            || lower.contains("deepseek-coder")
+            || lower.contains("gpt-3.5")
+            || lower.contains("llama-3-8b")
+            || lower.contains("llama-3-70b")
+            || lower.contains("llama-3.1-8b")
+            || lower.contains("llama-3.1-70b")
+            || lower.contains("mistral-7b")
+            || lower.contains("mixtral-8x7b")
+            || lower.contains("claude-2");
+
+        if text_only {
+            return ModelCapabilities {
+                vision: false,
+                tool_calling: true,
+                max_tokens: None,
+            };
+        }
+
+        let is_vision = lower.contains("vision")
             || lower.contains("neva")
             || lower.contains("vl")
             || lower.contains("gpt-4o")
             || lower.contains("claude-3")
+            || lower.contains("claude-3-5")
             || lower.contains("gemini")
             || lower.contains("llava")
             || lower.contains("kosmos")
-            || lower.contains("pixtral")
+            || lower.contains("pixtral");
+
+        ModelCapabilities {
+            vision: is_vision,
+            tool_calling: true,
+            max_tokens: None,
+        }
+    }
+
+    /// Check if a model identifier indicates multimodal / vision capabilities
+    pub fn is_vision_model(model: &str) -> bool {
+        Self::resolve_capabilities(model).vision
+    }
+
+    /// Validate vision support for a model, returning an error if unsupported
+    pub fn validate_vision_support(model: &str) -> Result<(), String> {
+        if !Self::is_vision_model(model) {
+            Err(format!(
+                "Selected model '{}' does not support multimodal/vision inputs. Please configure a verified vision-capable model to process images.",
+                model
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Complete using NVIDIA NIM or OpenAI-compatible endpoint with cancellation support
