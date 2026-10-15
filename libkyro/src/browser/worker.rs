@@ -1,9 +1,9 @@
 //! Management of the browser automation worker process.
 //!
-//! The worker is a small Node.js program that speaks WebDriver BiDi to the
-//! installed Firefox.  Kyro owns its lifecycle: the worker is started on
-//! demand, is torn down with the process group that owns it, and never
-//! survives the run that created it.
+//! The worker is a provider-neutral Node.js program that drives installed browsers
+//! over WebDriver BiDi (Firefox) or Chrome DevTools Protocol (Chromium-family).
+//! Kyro owns its lifecycle: the worker is started on demand, is torn down with the
+//! process group that owns it, and never survives the run that created it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
