@@ -1,8 +1,9 @@
 //! Kyro's browser automation subsystem.
 //!
-//! The subsystem owns a *managed* browser session: a dedicated Firefox
-//! process with an isolated profile, driven over WebDriver BiDi by a Node.js
-//! worker that Kyro starts and owns.  The manager never exposes arbitrary
+//! The subsystem owns a *managed* browser session: a dedicated browser
+//! process with an isolated profile, driven over WebDriver BiDi (Firefox family)
+//! or Chrome DevTools Protocol (Chromium family) by a Node.js
+//! worker that Kyro starts and owns. The manager never exposes arbitrary
 //! JavaScript evaluation to the model; every operation is a fixed, typed
 //! command with a structured result.
 
@@ -324,6 +325,24 @@ impl BrowserAutomationManager {
         })
     }
 
+    /// Returns the default headless setting saved in the database, or true if not configured.
+    pub async fn default_headless(&self) -> bool {
+        let guard = self.db.lock().await;
+        guard
+            .as_ref()
+            .map(|db| BrowserSettings::load(db).headless_default)
+            .unwrap_or(true)
+    }
+
+    /// Returns the saved browser settings.
+    pub async fn saved_settings(&self) -> BrowserSettings {
+        let guard = self.db.lock().await;
+        guard
+            .as_ref()
+            .map(BrowserSettings::load)
+            .unwrap_or_default()
+    }
+
     /// Starts a managed browser session.
     pub async fn create_session(
         &self,
@@ -382,12 +401,23 @@ impl BrowserAutomationManager {
                         if alternatives.is_empty() { "none".to_string() } else { alternatives.join(", ") }
                     ));
                 }
-            } else if let Some(first_avail) = caps.browsers.iter().find(|b| b.available && b.automatable) {
-                first_avail.id.clone()
             } else {
-                return Err(
-                    "No automatable browser is currently installed. Install Mozilla Firefox ('sudo apt install firefox-esr') or Chromium ('sudo apt install chromium-browser') and retry.".to_string(),
-                );
+                let alternatives: Vec<String> = caps
+                    .browsers
+                    .iter()
+                    .filter(|b| b.available && b.automatable)
+                    .map(|b| format!("{} ({})", b.display_name, b.id))
+                    .collect();
+                if alternatives.is_empty() {
+                    return Err(
+                        "No automatable browser is currently installed. Install Mozilla Firefox ('sudo apt install firefox-esr') or Chromium ('sudo apt install chromium-browser') and retry.".to_string(),
+                    );
+                } else {
+                    return Err(format!(
+                        "The system default browser could not be determined. Available supported alternatives: {}. Please specify a browser explicitly or configure a default in Kyro settings. Kyro will not silently substitute another browser.",
+                        alternatives.join(", ")
+                    ));
+                }
             }
         } else {
             // Explicit browser requested
@@ -710,6 +740,31 @@ impl BrowserAutomationManager {
             }
         }
         Ok(result)
+    }
+
+    /// Performs targeted inspection of a selected element.
+    pub async fn inspect_element(
+        &self,
+        session_id: &str,
+        target: ElementTarget,
+        timeout_ms: u64,
+    ) -> Result<ElementInspectionResult, String> {
+        let params = target.to_params()?;
+        let raw = self
+            .raw_call(
+                "page.inspect_element",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "target": params,
+                    "timeout_ms": timeout_ms,
+                }),
+                timeout_ms + 10000,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        serde_json::from_value::<ElementInspectionResult>(raw)
+            .map_err(|e| format!("Failed to parse element inspection result: {}", e))
     }
 
     /// Clicks an element using a semantic locator.
