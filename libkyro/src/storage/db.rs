@@ -1940,6 +1940,15 @@ impl Database {
         Ok(count > 0)
     }
 
+    pub fn update_artifact_metadata(&self, id: &str, metadata_json: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            "UPDATE artifacts SET metadata_json = ?1 WHERE id = ?2",
+            params![metadata_json, id],
+        )?;
+        Ok(count > 0)
+    }
+
     // Universal Search Across All Subsystems
     pub fn search_all(&self, query: &str) -> Result<Vec<SearchResultItem>> {
         let trimmed = query.trim();
