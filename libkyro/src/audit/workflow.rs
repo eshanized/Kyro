@@ -5,6 +5,7 @@
 //! stage records what it did, and the workflow never claims that a route was
 //! inspected when it was not.
 
+use crate::agent::vision::VisualAnalyzer;
 use crate::audit::findings::{
     detect_dead_control, detect_findings, BrokenImage, ConsoleObservation,
     FailedRequestObservation, Finding, HttpErrorObservation, PageObservations, ValidationTarget,
@@ -56,7 +57,7 @@ impl Default for AuditOptions {
             browser: None,
             headless: true,
             keep_server_running: false,
-            viewports: vec![(1280, 800), (768, 1024), (390, 844)],
+            viewports: vec![(1440, 900), (768, 1024), (390, 844)],
             max_routes: 40,
             ready_timeout_ms: 120000,
             run_id: None,
@@ -141,6 +142,8 @@ pub struct AuditPlan {
 pub struct UiAuditWorkflow {
     pub browser: Arc<BrowserAutomationManager>,
     pub dev_servers: Arc<DevServerManager>,
+    pub visual_analyzer: Option<Arc<VisualAnalyzer>>,
+    pub primary_model: Option<String>,
 }
 
 impl UiAuditWorkflow {
@@ -148,7 +151,19 @@ impl UiAuditWorkflow {
         Self {
             browser,
             dev_servers,
+            visual_analyzer: None,
+            primary_model: None,
         }
+    }
+
+    pub fn with_visual_analyzer(
+        mut self,
+        analyzer: Arc<VisualAnalyzer>,
+        primary_model: Option<String>,
+    ) -> Self {
+        self.visual_analyzer = Some(analyzer);
+        self.primary_model = primary_model;
+        self
     }
 
     /// Produces the plan for an audit: the project that was found and the
@@ -275,10 +290,15 @@ impl UiAuditWorkflow {
                 options.ready_timeout_ms,
             )
             .await?;
-        let preview_url = server_state
-            .ready_url
-            .clone()
-            .ok_or_else(|| "The development server did not report a ready URL".to_string())?;
+        let preview_url = match server_state.ready_url.clone() {
+            Some(u) => u,
+            None => {
+                if !options.keep_server_running {
+                    let _ = self.dev_servers.stop(&server_state.id);
+                }
+                return Err("The development server did not report a ready URL".to_string());
+            }
+        };
         on_progress(AuditProgress {
             stage: AuditStage::WaitForReady,
             message: format!("The development server is ready at {}", preview_url),
@@ -292,7 +312,7 @@ impl UiAuditWorkflow {
             message: format!("Opening {} in browser ({})", preview_url, requested_browser),
             completed: false,
         });
-        let session = self
+        let session_res = self
             .browser
             .create_session(
                 requested_browser,
@@ -300,14 +320,25 @@ impl UiAuditWorkflow {
                 options.run_id.as_deref(),
                 &[],
             )
-            .await?;
+            .await;
+
+        let session = match session_res {
+            Ok(s) => s,
+            Err(e) => {
+                if !options.keep_server_running {
+                    let _ = self.dev_servers.stop(&server_state.id);
+                }
+                return Err(e);
+            }
+        };
+
         if let Some(origin) = origin_of(&preview_url) {
             self.browser
                 .set_origin_scope(&session.session_id, Some(origin))
                 .await;
         }
 
-        let mut outcome = match self
+        let audit_res = self
             .audit_session(
                 &session,
                 &project,
@@ -317,11 +348,7 @@ impl UiAuditWorkflow {
                 &preview_url,
                 started,
             )
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return Err(e),
-        };
+            .await;
 
         // ---- Cleanup ------------------------------------------------------
         on_progress(AuditProgress {
@@ -342,6 +369,8 @@ impl UiAuditWorkflow {
             },
             completed: true,
         });
+
+        let mut outcome = audit_res?;
 
         // The report is rendered before the cleanup, so the state of the
         // development server is corrected and the report regenerated.
@@ -479,18 +508,6 @@ impl UiAuditWorkflow {
                 continue;
             }
 
-            // Screenshot evidence.
-            if let Ok(shot) = self.browser.screenshot(&session.session_id, false).await {
-                if shot.status == "success" {
-                    if let Some(png) = shot.data.get("base64_png").and_then(|d| d.as_str()) {
-                        artifact_index += 1;
-                        let name =
-                            format!("route-{}-{:02}.png", sanitize(&route.path), artifact_index);
-                        screenshots.push((name, png.to_string()));
-                    }
-                }
-            }
-
             let console = self.browser.console(&session.session_id).await.ok();
             let network = self.browser.network(&session.session_id).await.ok();
 
@@ -501,6 +518,65 @@ impl UiAuditWorkflow {
                 console.as_ref().and_then(|c| c.data.as_object()),
                 network.as_ref().and_then(|n| n.data.as_object()),
             );
+
+            // Screenshot evidence and visual analysis.
+            if let Ok(shot) = self.browser.screenshot(&session.session_id, false).await {
+                if shot.status == "success" {
+                    if let Some(png) = shot.data.get("base64_png").and_then(|d| d.as_str()) {
+                        artifact_index += 1;
+                        let name =
+                            format!("route-{}-{:02}.png", sanitize(&route.path), artifact_index);
+                        screenshots.push((name.clone(), png.to_string()));
+
+                        if let Some(ref analyzer) = self.visual_analyzer {
+                            let vis_ctx = crate::agent::vision::VisualAnalysisContext {
+                                route: route.path.clone(),
+                                preview_url: url.clone(),
+                                viewport: "1440x900".to_string(),
+                                dom_summary: Some(format!(
+                                    "Interactive elements: {}",
+                                    observations.interactive_element_names.len()
+                                )),
+                                element_of_interest: None,
+                            };
+                            let vis_res = analyzer
+                                .analyze_screenshot(
+                                    png,
+                                    self.primary_model.as_deref().unwrap_or(""),
+                                    &vis_ctx,
+                                )
+                                .await;
+                            for defect in vis_res.visible_defects {
+                                let mut f = Finding::new(
+                                    crate::audit::findings::FindingCategory::DesignInconsistency,
+                                    match defect.severity.to_lowercase().as_str() {
+                                        "high" => crate::audit::findings::Severity::High,
+                                        "low" => crate::audit::findings::Severity::Low,
+                                        _ => crate::audit::findings::Severity::Medium,
+                                    },
+                                    match vis_res.confidence.as_str() {
+                                        "reproduced" => crate::audit::findings::Confidence::Reproduced,
+                                        "strong_evidence" => {
+                                            crate::audit::findings::Confidence::StrongEvidence
+                                        }
+                                        _ => crate::audit::findings::Confidence::Unverified,
+                                    },
+                                    format!("Visual defect on {}: {}", route.path, defect.defect_type),
+                                    &route.path,
+                                    nav.url.as_deref().unwrap_or(&url),
+                                    "1440x900",
+                                );
+                                f.actual = defect.description;
+                                f.artifacts = vec![name.clone()];
+                                if !vis_res.supporting_evidence.is_empty() {
+                                    f.console_evidence = vec![vis_res.supporting_evidence.clone()];
+                                }
+                                findings.push(f);
+                            }
+                        }
+                    }
+                }
+            }
 
             total_console_errors += observations.console_entries.len();
             total_failed_requests += observations.failed_requests.len();
@@ -611,10 +687,27 @@ impl UiAuditWorkflow {
         for route in visitable.iter().take(options.max_routes) {
             let url = join_url(preview_url, &route.path);
             for (width, height) in options.viewports.iter().skip(1) {
-                let _ = self
+                let vp_res = self
                     .browser
                     .set_viewport(&session.session_id, *width, *height)
                     .await;
+                let actual_viewport = match vp_res {
+                    Ok(ref r) => {
+                        let w = r
+                            .data
+                            .get("width")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(*width as u64) as u32;
+                        let h = r
+                            .data
+                            .get("height")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(*height as u64) as u32;
+                        format!("{}x{}", w, h)
+                    }
+                    Err(_) => format!("{}x{}", width, height),
+                };
+
                 let nav = match self
                     .browser
                     .navigate(&session.session_id, &url, 45000, false)
@@ -648,10 +741,76 @@ impl UiAuditWorkflow {
                     f.category == crate::audit::findings::FindingCategory::DesignInconsistency
                 });
                 for finding in &mut viewport_findings {
-                    finding.viewport = format!("{}x{}", width, height);
-                    finding.title = format!("Page scrolls horizontally at {}x{}", width, height);
+                    finding.viewport = actual_viewport.clone();
+                    finding.title = format!("Page scrolls horizontally at {}", actual_viewport);
                 }
                 findings.extend(viewport_findings);
+
+                // Responsive screenshot evidence and visual analysis
+                if let Ok(shot) = self.browser.screenshot(&session.session_id, false).await {
+                    if shot.status == "success" {
+                        if let Some(png) = shot.data.get("base64_png").and_then(|d| d.as_str()) {
+                            artifact_index += 1;
+                            let shot_name = format!(
+                                "responsive-{}-{}-{:02}.png",
+                                sanitize(&route.path),
+                                actual_viewport,
+                                artifact_index
+                            );
+                            screenshots.push((shot_name.clone(), png.to_string()));
+
+                            if let Some(ref analyzer) = self.visual_analyzer {
+                                let vis_ctx = crate::agent::vision::VisualAnalysisContext {
+                                    route: route.path.clone(),
+                                    preview_url: url.clone(),
+                                    viewport: actual_viewport.clone(),
+                                    dom_summary: None,
+                                    element_of_interest: None,
+                                };
+                                let vis_res = analyzer
+                                    .analyze_screenshot(
+                                        png,
+                                        self.primary_model.as_deref().unwrap_or(""),
+                                        &vis_ctx,
+                                    )
+                                    .await;
+                                for defect in vis_res.visible_defects {
+                                    let mut f = Finding::new(
+                                        crate::audit::findings::FindingCategory::DesignInconsistency,
+                                        match defect.severity.to_lowercase().as_str() {
+                                            "high" => crate::audit::findings::Severity::High,
+                                            "low" => crate::audit::findings::Severity::Low,
+                                            _ => crate::audit::findings::Severity::Medium,
+                                        },
+                                        match vis_res.confidence.as_str() {
+                                            "reproduced" => {
+                                                crate::audit::findings::Confidence::Reproduced
+                                            }
+                                            "strong_evidence" => {
+                                                crate::audit::findings::Confidence::StrongEvidence
+                                            }
+                                            _ => crate::audit::findings::Confidence::Unverified,
+                                        },
+                                        format!(
+                                            "Visual defect on {} ({}): {}",
+                                            route.path, actual_viewport, defect.defect_type
+                                        ),
+                                        &route.path,
+                                        nav.url.as_deref().unwrap_or(&url),
+                                        &actual_viewport,
+                                    );
+                                    f.actual = defect.description;
+                                    f.artifacts = vec![shot_name.clone()];
+                                    if !vis_res.supporting_evidence.is_empty() {
+                                        f.console_evidence =
+                                            vec![vis_res.supporting_evidence.clone()];
+                                    }
+                                    findings.push(f);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         // Restore the primary viewport.
