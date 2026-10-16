@@ -124,6 +124,7 @@ fn main() {
             delete_artifact,
             read_artifact_content,
             export_artifact,
+            add_artifact_comment,
             search_workspace,
             export_workspace_templates,
             import_workspace_templates,
