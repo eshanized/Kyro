@@ -59,6 +59,9 @@ pub struct ToolResult {
 pub struct ActiveRunContext {
     pub token: CancellationToken,
     pub pids: Arc<std::sync::Mutex<Vec<u32>>>,
+    pub model: String,
+    pub api_key: String,
+    pub base_url: Option<String>,
 }
 
 pub struct AgentLoopEngine {
@@ -101,12 +104,27 @@ impl AgentLoopEngine {
 
     /// Register a cancellation token for an active run
     pub async fn register_run_token(&self, run_id: &str, token: CancellationToken) {
+        self.register_run(run_id, token, "", "", None).await;
+    }
+
+    /// Register full run context including cancellation token, model, and credentials
+    pub async fn register_run(
+        &self,
+        run_id: &str,
+        token: CancellationToken,
+        model: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+    ) {
         let mut map = self.active_runs.lock().await;
         map.insert(
             run_id.to_string(),
             ActiveRunContext {
                 token,
                 pids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                model: model.to_string(),
+                api_key: api_key.to_string(),
+                base_url: base_url.map(|s| s.to_string()),
             },
         );
     }
@@ -350,7 +368,7 @@ The program is started as an explicit executable plus argument vector; free-form
         F: FnMut(AgentStepEvent) + Send + 'static,
     {
         let token = cancel_token.unwrap_or_default();
-        self.register_run_token(run_id, token.clone()).await;
+        self.register_run(run_id, token.clone(), model, api_key, base_url).await;
 
         let mut tools = Self::standard_tools();
         if let Some(ref conn_mgr) = connector_manager {
@@ -522,12 +540,85 @@ The program is started as an explicit executable plus argument vector; free-form
                 };
                 let _ = db.append_run_event(&tool_event);
 
-                // If vision model and visual screenshot data is available, attach multimodal message
-                let message_content = if ModelRouter::is_vision_model(model) {
-                    if let Some(ref b64) = visual_data {
-                        MessageContent::from_text_and_image(&output, b64)
+                // Handle visual data from tools: persist image artifact and process with vision/multimodal
+                let message_content = if let Some(ref b64) = visual_data {
+                    use base64::Engine;
+                    let shot_art_id = format!("art_{}", uuid::Uuid::new_v4());
+                    let shot_name = format!("shot-{}.png", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                    let artifacts_dir = dirs::config_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("kyro")
+                        .join("artifacts");
+                    let _ = std::fs::create_dir_all(&artifacts_dir);
+                    let shot_path = artifacts_dir.join(format!("{}_{}", &shot_art_id[4..12], shot_name));
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        let _ = std::fs::write(&shot_path, &bytes);
+                        let conv_id = db
+                            .get_run(run_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|r| r.conversation_id);
+                        let rec = crate::storage::ArtifactRecord {
+                            id: shot_art_id.clone(),
+                            run_id: Some(run_id.to_string()),
+                            conversation_id: conv_id,
+                            name: shot_name.clone(),
+                            file_path: shot_path.to_string_lossy().to_string(),
+                            artifact_type: "image".to_string(),
+                            mime_type: "image/png".to_string(),
+                            size_bytes: bytes.len() as i64,
+                            created_at: chrono::Utc::now().timestamp_millis(),
+                            metadata_json: Some(
+                                serde_json::json!({
+                                    "tool": tc.name,
+                                    "source": "browser_tool",
+                                })
+                                .to_string(),
+                            ),
+                        };
+                        let _ = db.create_artifact(&rec);
+                    }
+
+                    if ModelRouter::is_vision_model(model) {
+                        MessageContent::from_text_and_image(
+                            &format!("{}\n[Visual artifact saved: {} ({})]", output, shot_name, shot_art_id),
+                            b64,
+                        )
                     } else {
-                        MessageContent::from_text(&output)
+                        // Text-only model: Run visual analyzer fallback and return structured summary
+                        let analyzer = crate::agent::vision::VisualAnalyzer::new(
+                            Arc::new(self.router.clone()),
+                            api_key.to_string(),
+                            base_url.map(|s| s.to_string()),
+                        );
+                        let vis_ctx = crate::agent::vision::VisualAnalysisContext {
+                            route: "".to_string(),
+                            preview_url: "".to_string(),
+                            viewport: "".to_string(),
+                            dom_summary: None,
+                            element_of_interest: None,
+                        };
+                        let vis_res = analyzer.analyze_screenshot(b64, model, &vis_ctx).await;
+                        let defects_str = if vis_res.visible_defects.is_empty() {
+                            "None detected".to_string()
+                        } else {
+                            vis_res
+                                .visible_defects
+                                .iter()
+                                .map(|d| format!("{}: {}", d.defect_type, d.description))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        };
+                        let augmented = format!(
+                            "{}\n\n[Visual Analysis - Artifact: {} ({})]\nSummary: {}\nDefects: {}\nConfidence: {}",
+                            output,
+                            shot_name,
+                            shot_art_id,
+                            vis_res.summary,
+                            defects_str,
+                            vis_res.confidence
+                        );
+                        MessageContent::from_text(&augmented)
                     }
                 } else {
                     MessageContent::from_text(&output)
@@ -1916,6 +2007,10 @@ The program is started as an explicit executable plus argument vector; free-form
                 let outcome = tools::browser_snapshot(&tc.arguments, &self.browser).await;
                 (outcome.message, outcome.is_error, outcome.visual)
             }
+            "browser_inspect_element" => {
+                let outcome = tools::browser_inspect_element(&tc.arguments, &self.browser).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
             "browser_click" => {
                 let outcome = tools::browser_click(&tc.arguments, &self.browser).await;
                 (outcome.message, outcome.is_error, outcome.visual)
@@ -1991,18 +2086,38 @@ The program is started as an explicit executable plus argument vector; free-form
         db: &Database,
         token: &CancellationToken,
     ) -> ToolOutcome {
-        let project_name = args["project_name"]
+        let project_path_opt = args["project_path"]
             .as_str()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if project_name.is_empty() {
-            return ToolOutcome::fail("audit_ui requires a 'project_name' parameter.");
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let project_name_opt = args["project_name"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        if project_path_opt.is_none() && project_name_opt.is_none() {
+            return ToolOutcome::fail(
+                "audit_ui requires either 'project_path' (direct path) or 'project_name' to be specified.",
+            );
         }
 
-        let search_root = match tools::resolve_search_root(args) {
-            Ok(r) => r,
-            Err(e) => return ToolOutcome::fail(e),
+        let project_name = project_name_opt.unwrap_or_else(|| {
+            project_path_opt
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+
+        let search_root = if project_path_opt.is_some() && args["search_root"].as_str().is_none() {
+            None
+        } else {
+            match tools::resolve_search_root(args) {
+                Ok(r) => Some(r),
+                Err(e) => return ToolOutcome::fail(e),
+            }
         };
 
         let browser = args["browser"]
@@ -2010,20 +2125,45 @@ The program is started as an explicit executable plus argument vector; free-form
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"));
 
+        let default_headless = self.browser.default_headless().await;
+        let headless = args["headless"].as_bool().unwrap_or(default_headless);
+
         let options = crate::audit::workflow::AuditOptions {
             project_name,
-            project_path: None,
-            search_root: Some(search_root),
+            project_path: project_path_opt,
+            search_root,
             browser,
-            headless: args["headless"].as_bool().unwrap_or(true),
+            headless,
             keep_server_running: args["keep_server_running"].as_bool().unwrap_or(false),
             ..Default::default()
         };
 
-        let workflow = crate::audit::workflow::UiAuditWorkflow::new(
+        let (run_model, run_api_key, run_base_url) = {
+            let map = self.active_runs.lock().await;
+            if let Some(ctx) = map.get(run_id) {
+                (
+                    Some(ctx.model.clone()),
+                    Some(ctx.api_key.clone()),
+                    ctx.base_url.clone(),
+                )
+            } else {
+                (None, None, None)
+            }
+        };
+
+        let mut workflow = crate::audit::workflow::UiAuditWorkflow::new(
             self.browser.clone(),
             self.dev_servers.clone(),
         );
+
+        if let (Some(ref m), Some(ref k)) = (&run_model, &run_api_key) {
+            let analyzer = Arc::new(crate::agent::vision::VisualAnalyzer::new(
+                Arc::new(self.router.clone()),
+                k.clone(),
+                run_base_url,
+            ));
+            workflow = workflow.with_visual_analyzer(analyzer, Some(m.clone()));
+        }
 
         let mut progress_log: Vec<String> = Vec::new();
         let mut on_progress = |p: crate::audit::workflow::AuditProgress| {
@@ -2127,7 +2267,7 @@ The program is started as an explicit executable plus argument vector; free-form
         let rec = crate::storage::ArtifactRecord {
             id: artifact_id.clone(),
             run_id: Some(run_id.to_string()),
-            conversation_id: conv_id,
+            conversation_id: conv_id.clone(),
             name: report_name.clone(),
             file_path: report_path.to_string_lossy().to_string(),
             artifact_type: "markdown".to_string(),
@@ -2146,10 +2286,44 @@ The program is started as an explicit executable plus argument vector; free-form
         };
         let _ = db.create_artifact(&rec);
 
+        // Store all screenshots from outcome through Kyro's artifact registry
+        let mut screenshot_artifact_ids: Vec<String> = Vec::new();
+        for (shot_name, b64_png) in &outcome.screenshots {
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_png) {
+                let shot_art_id = format!("art_{}", uuid::Uuid::new_v4());
+                let shot_filename = format!("{}_{}", &shot_art_id[4..12], shot_name);
+                let shot_path = artifacts_dir.join(&shot_filename);
+                if std::fs::write(&shot_path, &bytes).is_ok() {
+                    let shot_rec = crate::storage::ArtifactRecord {
+                        id: shot_art_id.clone(),
+                        run_id: Some(run_id.to_string()),
+                        conversation_id: conv_id.clone(),
+                        name: shot_name.clone(),
+                        file_path: shot_path.to_string_lossy().to_string(),
+                        artifact_type: "image".to_string(),
+                        mime_type: "image/png".to_string(),
+                        size_bytes: bytes.len() as i64,
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                        metadata_json: Some(
+                            serde_json::json!({
+                                "route": shot_name,
+                                "source": "ui_audit",
+                            })
+                            .to_string(),
+                        ),
+                    };
+                    let _ = db.create_artifact(&shot_rec);
+                    screenshot_artifact_ids.push(shot_art_id);
+                }
+            }
+        }
+
         let payload = serde_json::json!({
             "status": "success",
             "report_artifact_id": artifact_id,
             "report_path": report_path.to_string_lossy(),
+            "screenshot_artifact_ids": screenshot_artifact_ids,
             "progress": progress_log,
             "context": outcome.context,
             "finding_count": outcome.findings.len(),
