@@ -606,3 +606,116 @@ async fn browser_session_starts_with_brave_and_navigates() {
 
     manager.close_session(&session.session_id).await.ok();
 }
+
+#[tokio::test]
+#[ignore = "requires Firefox and Node.js; run with --ignored"]
+async fn browser_element_inspection_returns_details() {
+    if let Some(reason) = prerequisites().await {
+        eprintln!("SKIPPED: {}", reason);
+        return;
+    }
+
+    let server = FixtureServer::start(FIXTURE);
+    let manager = BrowserAutomationManager::new();
+    let session = manager
+        .create_session("firefox", true, Some("run_inspect_test"), &[])
+        .await
+        .expect("session should start");
+
+    manager
+        .navigate(&session.session_id, &server.url("/"), 30000, false)
+        .await
+        .expect("navigation");
+
+    let snapshot = manager.snapshot(&session.session_id).await.expect("snapshot");
+    assert_eq!(snapshot.status, "success");
+
+    let target = ElementTarget {
+        role: Some("button".to_string()),
+        name: Some("Press me".to_string()),
+        ..Default::default()
+    };
+    let inspect_res = manager
+        .inspect_element(&session.session_id, target, 5000)
+        .await
+        .expect("inspect_element");
+
+    assert_eq!(inspect_res.tag, "button");
+    assert_eq!(inspect_res.role, "button");
+    assert!(inspect_res.interactable, "element must be interactable");
+
+    manager.close_session(&session.session_id).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires Firefox and Node.js; run with --ignored"]
+async fn browser_viewport_resizing_reports_actual_dimensions() {
+    if let Some(reason) = prerequisites().await {
+        eprintln!("SKIPPED: {}", reason);
+        return;
+    }
+
+    let manager = BrowserAutomationManager::new();
+    let session = manager
+        .create_session("firefox", true, Some("run_vp_test"), &[])
+        .await
+        .expect("session should start");
+
+    let vp_res = manager
+        .set_viewport(&session.session_id, 768, 1024)
+        .await
+        .expect("set_viewport");
+
+    assert_eq!(vp_res.status, "success");
+    let w = vp_res.data.get("width").and_then(|v| v.as_u64());
+    let h = vp_res.data.get("height").and_then(|v| v.as_u64());
+    assert_eq!(w, Some(768));
+    assert_eq!(h, Some(1024));
+
+    manager.close_session(&session.session_id).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires Firefox and Node.js; run with --ignored"]
+async fn browser_stale_element_reference_rejection() {
+    if let Some(reason) = prerequisites().await {
+        eprintln!("SKIPPED: {}", reason);
+        return;
+    }
+
+    let server = FixtureServer::start(FIXTURE);
+    let manager = BrowserAutomationManager::new();
+    let session = manager
+        .create_session("firefox", true, Some("run_stale_test"), &[])
+        .await
+        .expect("session should start");
+
+    manager
+        .navigate(&session.session_id, &server.url("/"), 30000, false)
+        .await
+        .expect("navigation");
+
+    // Pass a fake/stale ref ID with a snapshot_id
+    let stale_target = ElementTarget {
+        ref_id: Some("e99999_stale".to_string()),
+        snapshot_id: Some("snap_old_111".to_string()),
+        ..Default::default()
+    };
+
+    let target_params = stale_target.to_params().unwrap();
+    let click_res = manager.click(&session.session_id, target_params, 5000).await;
+    match click_res {
+        Ok(res) => {
+            assert!(
+                res.status != "success"
+                    || res.error_message.as_deref().unwrap_or("").contains("stale")
+                    || res.error_message.as_deref().unwrap_or("").contains("not found")
+            );
+        }
+        Err(e) => {
+            assert!(e.contains("stale") || e.contains("not found") || e.contains("target"));
+        }
+    }
+
+    manager.close_session(&session.session_id).await.ok();
+}
