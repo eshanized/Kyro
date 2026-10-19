@@ -1,6 +1,17 @@
 pub mod db;
+pub mod documents;
+pub mod organizer;
 pub mod templates;
 pub mod vault;
+
+pub use documents::{
+    ActionItem, DocumentAnalysisResult, DocumentAssistant, DocumentComparisonResult,
+    DocumentMetadata, DocumentSection, ExtractedDate,
+};
+pub use organizer::{
+    FileOrganizer, OrganizationOpRecord, OrganizationPlan, OrganizationRule,
+    OrganizationTransaction, PlannedFileOp,
+};
 
 pub use db::{
     json_values_canonically_equal, AgentRun, ApprovalRequest, ArtifactRecord, BotRecord,
