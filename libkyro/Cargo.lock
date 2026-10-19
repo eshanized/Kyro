@@ -2790,6 +2790,7 @@ dependencies = [
  "dirs 5.0.1",
  "enigo",
  "env_logger",
+ "flate2",
  "futures-util",
  "image",
  "keyring",

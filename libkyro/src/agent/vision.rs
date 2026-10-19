@@ -270,7 +270,10 @@ mod tests {
     #[test]
     fn extract_json_from_markdown_blocks() {
         let block = "Here is the analysis:\n```json\n{\"summary\": \"Clean layout\", \"confidence\": \"reproduced\"}\n```\nDone.";
-        assert_eq!(extract_json_block(block), "{\"summary\": \"Clean layout\", \"confidence\": \"reproduced\"}");
+        assert_eq!(
+            extract_json_block(block),
+            "{\"summary\": \"Clean layout\", \"confidence\": \"reproduced\"}"
+        );
 
         let raw = "Some prefix {\"summary\": \"Inline\"} suffix";
         assert_eq!(extract_json_block(raw), "{\"summary\": \"Inline\"}");
@@ -294,8 +297,9 @@ mod tests {
         );
 
         // Configured vision model overrides default
-        let analyzer_custom = VisualAnalyzer::new(Arc::new(ModelRouter::new()), "test-key".into(), None)
-            .with_configured_vision_model(Some("gpt-4o-mini".to_string()));
+        let analyzer_custom =
+            VisualAnalyzer::new(Arc::new(ModelRouter::new()), "test-key".into(), None)
+                .with_configured_vision_model(Some("gpt-4o-mini".to_string()));
         assert_eq!(
             analyzer_custom.resolve_vision_model("deepseek-coder"),
             Some("gpt-4o-mini".to_string())
@@ -309,7 +313,9 @@ mod tests {
         let analyzer = VisualAnalyzer::new(router, "".into(), None);
         let ctx = VisualAnalysisContext::default();
 
-        let res = analyzer.analyze_screenshot("fake_base64", "deepseek-coder", &ctx).await;
+        let res = analyzer
+            .analyze_screenshot("fake_base64", "deepseek-coder", &ctx)
+            .await;
         assert!(!res.vision_supported);
         assert_eq!(res.confidence, "unverified");
         assert!(res.visible_defects.is_empty());
@@ -345,7 +351,8 @@ mod tests {
         };
 
         let json = serde_json::to_string(&res).expect("Must serialize");
-        let deserialized: VisualAnalysisResult = serde_json::from_str(&json).expect("Must deserialize");
+        let deserialized: VisualAnalysisResult =
+            serde_json::from_str(&json).expect("Must deserialize");
         assert_eq!(deserialized.visible_defects.len(), 1);
         assert_eq!(deserialized.visible_defects[0].defect_type, "overlap");
         assert_eq!(deserialized.discrepancies.len(), 1);

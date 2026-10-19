@@ -100,19 +100,113 @@ use tokio::sync::RwLock;
 /// Verified capabilities of an LLM provider and model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCapabilities {
+    pub provider: String,
+    pub model_id: String,
+    pub text_input: bool,
+    pub text_output: bool,
     pub vision: bool,
+    #[serde(default)]
+    pub image_input: bool,
     pub tool_calling: bool,
+    pub supported_formats: Vec<String>,
+    pub max_image_size_bytes: Option<usize>,
     pub max_tokens: Option<usize>,
+    pub capability_status: String, // "verified", "configured", "unknown"
+    pub configuration_error: Option<String>,
 }
 
 impl Default for ModelCapabilities {
     fn default() -> Self {
         Self {
+            provider: "custom".to_string(),
+            model_id: "default".to_string(),
+            text_input: true,
+            text_output: true,
             vision: false,
+            image_input: false,
             tool_calling: true,
+            supported_formats: vec![],
+            max_image_size_bytes: None,
             max_tokens: None,
+            capability_status: "unknown".to_string(),
+            configuration_error: None,
         }
     }
+}
+
+/// Validates an image payload against model capabilities before transmission.
+pub fn validate_image_payload(
+    raw_payload: &str,
+    caps: &ModelCapabilities,
+) -> Result<(String, usize, u32, u32), String> {
+    if !caps.vision && !caps.image_input {
+        return Err(format!(
+            "Destination model '{}' (provider: {}) does not support image or multimodal inputs. Please route to a verified vision-capable model.",
+            caps.model_id, caps.provider
+        ));
+    }
+
+    let b64_clean = if let Some(idx) = raw_payload.find(";base64,") {
+        &raw_payload[idx + 8..]
+    } else if let Some(stripped) = raw_payload.strip_prefix("data:") {
+        if let Some(idx) = stripped.find(',') {
+            &stripped[idx + 1..]
+        } else {
+            raw_payload
+        }
+    } else {
+        raw_payload.trim()
+    };
+
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_clean)
+        .map_err(|e| format!("Invalid base64 encoding in image payload: {}", e))?;
+
+    let max_allowed = caps.max_image_size_bytes.unwrap_or(20 * 1024 * 1024);
+    if bytes.len() > max_allowed {
+        return Err(format!(
+            "Image payload size ({} bytes) exceeds the maximum allowed limit ({} bytes) for model '{}'.",
+            bytes.len(),
+            max_allowed,
+            caps.model_id
+        ));
+    }
+
+    if bytes.is_empty() {
+        return Err("Image payload is empty (0 bytes).".to_string());
+    }
+
+    let mime_type = if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else {
+        return Err(
+            "Unsupported image format. Supported formats are PNG, JPEG, WEBP, and GIF.".to_string(),
+        );
+    };
+
+    if !caps.supported_formats.is_empty() && !caps.supported_formats.iter().any(|f| f == mime_type)
+    {
+        return Err(format!(
+            "Image format '{}' is not supported by model '{}'. Supported formats: {:?}",
+            mime_type, caps.model_id, caps.supported_formats
+        ));
+    }
+
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("Failed to parse image dimensions or corrupted data: {}", e))?;
+    let (width, height) = (img.width(), img.height());
+    if width == 0 || height == 0 {
+        return Err("Image dimensions are zero (invalid image).".to_string());
+    }
+
+    Ok((mime_type.to_string(), bytes.len(), width, height))
 }
 
 #[derive(Clone)]
@@ -171,23 +265,55 @@ impl ModelRouter {
     /// Statically resolve capabilities based on verified provider/model metadata
     pub fn resolve_capabilities(model: &str) -> ModelCapabilities {
         let lower = model.to_lowercase();
+        let provider = if lower.contains("nvidia") || lower.contains("nemotron") {
+            "nvidia".to_string()
+        } else if lower.contains("gpt-") || lower.contains("openai") {
+            "openai".to_string()
+        } else if lower.contains("claude") || lower.contains("anthropic") {
+            "anthropic".to_string()
+        } else if lower.contains("gemini") || lower.contains("google") {
+            "google".to_string()
+        } else if lower.contains("llama") || lower.contains("meta/") {
+            "meta".to_string()
+        } else if lower.contains("mistral") || lower.contains("mixtral") {
+            "mistral".to_string()
+        } else if lower.contains("deepseek") {
+            "deepseek".to_string()
+        } else if lower.contains("qwen") {
+            "qwen".to_string()
+        } else if lower.contains("ollama") {
+            "ollama".to_string()
+        } else {
+            "custom".to_string()
+        };
+
         // Explicit text-only models MUST be rejected for vision
-        let text_only = (lower.contains("instruct") && !lower.contains("vision") && !lower.contains("vl"))
-            || lower.contains("deepseek-coder")
-            || lower.contains("gpt-3.5")
-            || lower.contains("llama-3-8b")
-            || lower.contains("llama-3-70b")
-            || lower.contains("llama-3.1-8b")
-            || lower.contains("llama-3.1-70b")
-            || lower.contains("mistral-7b")
-            || lower.contains("mixtral-8x7b")
-            || lower.contains("claude-2");
+        let text_only =
+            (lower.contains("instruct") && !lower.contains("vision") && !lower.contains("vl"))
+                || lower.contains("deepseek-coder")
+                || lower.contains("gpt-3.5")
+                || lower.contains("llama-3-8b")
+                || lower.contains("llama-3-70b")
+                || lower.contains("llama-3.1-8b")
+                || lower.contains("llama-3.1-70b")
+                || lower.contains("mistral-7b")
+                || lower.contains("mixtral-8x7b")
+                || lower.contains("claude-2");
 
         if text_only {
             return ModelCapabilities {
+                provider,
+                model_id: model.to_string(),
+                text_input: true,
+                text_output: true,
                 vision: false,
+                image_input: false,
                 tool_calling: true,
-                max_tokens: None,
+                supported_formats: vec![],
+                max_image_size_bytes: None,
+                max_tokens: Some(32768),
+                capability_status: "verified".to_string(),
+                configuration_error: None,
             };
         }
 
@@ -202,11 +328,71 @@ impl ModelRouter {
             || lower.contains("kosmos")
             || lower.contains("pixtral");
 
+        let supported_formats = if is_vision {
+            vec![
+                "image/png".to_string(),
+                "image/jpeg".to_string(),
+                "image/webp".to_string(),
+                "image/gif".to_string(),
+            ]
+        } else {
+            vec![]
+        };
+
+        let max_image_size_bytes = if is_vision {
+            Some(20 * 1024 * 1024) // 20 MB default limit
+        } else {
+            None
+        };
+
+        let max_tokens = if lower.contains("gemini") {
+            Some(1000000)
+        } else if lower.contains("gpt-4o")
+            || lower.contains("claude-3")
+            || lower.contains("llama-3")
+        {
+            Some(128000)
+        } else {
+            Some(32768)
+        };
+
+        let capability_status = if is_vision || lower.contains("nemotron") || lower.contains("gpt")
+        {
+            "verified".to_string()
+        } else {
+            "unknown".to_string()
+        };
+
         ModelCapabilities {
+            provider,
+            model_id: model.to_string(),
+            text_input: true,
+            text_output: true,
             vision: is_vision,
+            image_input: is_vision,
             tool_calling: true,
-            max_tokens: None,
+            supported_formats,
+            max_image_size_bytes,
+            max_tokens,
+            capability_status,
+            configuration_error: None,
         }
+    }
+
+    /// List known standard models with authoritative capability metadata
+    pub fn list_known_models() -> Vec<ModelCapabilities> {
+        vec![
+            Self::resolve_capabilities(DEFAULT_NEMOTRON_MODEL),
+            Self::resolve_capabilities(DEFAULT_VISION_MODEL),
+            Self::resolve_capabilities("meta/llama-3.2-90b-vision-instruct"),
+            Self::resolve_capabilities("openai/gpt-4o"),
+            Self::resolve_capabilities("openai/gpt-4o-mini"),
+            Self::resolve_capabilities("anthropic/claude-3-5-sonnet"),
+            Self::resolve_capabilities("google/gemini-1.5-pro"),
+            Self::resolve_capabilities("google/gemini-1.5-flash"),
+            Self::resolve_capabilities("deepseek-ai/deepseek-coder-33b-instruct"),
+            Self::resolve_capabilities("mistralai/mistral-large"),
+        ]
     }
 
     /// Check if a model identifier indicates multimodal / vision capabilities
@@ -344,11 +530,24 @@ impl ModelRouter {
             _ => false,
         });
 
-        if has_image_content && !Self::is_vision_model(model) {
-            return Err(format!(
-                "Selected model '{}' does not support multimodal/vision inputs. Please select a vision-capable model (e.g., Nemotron-Vision, Claude-3, or GPT-4o) to process images.",
-                model
-            ));
+        if has_image_content {
+            let caps = self.capabilities_for(model).await;
+            if !caps.vision && !caps.image_input {
+                return Err(format!(
+                    "Selected model '{}' does not support multimodal/vision inputs. Please select a vision-capable model (e.g., Nemotron-Vision, Claude-3, or GPT-4o) to process images.",
+                    model
+                ));
+            }
+            // Validate all image payloads for size, MIME type, and dimension corruption
+            for m in messages {
+                if let MessageContent::Parts(parts) = &m.content {
+                    for part in parts {
+                        if let ContentPart::ImageUrl { image_url } = part {
+                            validate_image_payload(&image_url.url, &caps)?;
+                        }
+                    }
+                }
+            }
         }
 
         let mut oai_messages = Vec::new();
@@ -501,5 +700,88 @@ impl ModelRouter {
             content,
             tool_calls,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageEncoder;
+
+    #[test]
+    fn test_resolve_capabilities_metadata() {
+        let nemotron = ModelRouter::resolve_capabilities(DEFAULT_NEMOTRON_MODEL);
+        assert_eq!(nemotron.provider, "nvidia");
+        assert_eq!(nemotron.capability_status, "verified");
+        assert!(nemotron.tool_calling);
+
+        let llama_vision = ModelRouter::resolve_capabilities(DEFAULT_VISION_MODEL);
+        assert!(llama_vision.vision);
+        assert!(llama_vision.image_input);
+        assert_eq!(llama_vision.provider, "meta");
+        assert_eq!(
+            llama_vision.supported_formats,
+            vec!["image/png", "image/jpeg", "image/webp", "image/gif"]
+        );
+
+        let deepseek = ModelRouter::resolve_capabilities("deepseek-coder");
+        assert!(!deepseek.vision);
+        assert!(!deepseek.image_input);
+        assert_eq!(deepseek.provider, "deepseek");
+
+        let claude = ModelRouter::resolve_capabilities("claude-3-5-sonnet");
+        assert!(claude.vision);
+        assert_eq!(claude.provider, "anthropic");
+    }
+
+    #[test]
+    fn test_validate_image_payload_rejection_and_acceptance() {
+        let vision_caps = ModelRouter::resolve_capabilities(DEFAULT_VISION_MODEL);
+        let text_caps = ModelRouter::resolve_capabilities("deepseek-coder");
+
+        // Create a 1x1 valid PNG in base64
+        let img = image::RgbaImage::new(1, 1);
+        let mut png_bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png_bytes)
+            .write_image(&img, 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        use base64::Engine;
+        let b64_png = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let data_url = format!("data:image/png;base64,{}", b64_png);
+
+        // 1. Text caps must reject vision input
+        let err_text = validate_image_payload(&data_url, &text_caps);
+        assert!(err_text.is_err());
+        assert!(err_text
+            .unwrap_err()
+            .contains("does not support image or multimodal inputs"));
+
+        // 2. Vision caps must accept valid PNG data URL
+        let ok_res = validate_image_payload(&data_url, &vision_caps);
+        assert!(ok_res.is_ok());
+        let (mime, bytes_len, w, h) = ok_res.unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(bytes_len > 0);
+        assert_eq!(w, 1);
+        assert_eq!(h, 1);
+
+        // 3. Invalid / corrupt payload must be rejected
+        let corrupt = "data:image/png;base64,aW52YWxpZGJ5dGVz";
+        let err_corrupt = validate_image_payload(corrupt, &vision_caps);
+        assert!(err_corrupt.is_err());
+
+        // 4. Empty payload must be rejected
+        let empty = "data:image/png;base64,";
+        let err_empty = validate_image_payload(empty, &vision_caps);
+        assert!(err_empty.is_err());
+    }
+
+    #[test]
+    fn test_list_known_models() {
+        let models = ModelRouter::list_known_models();
+        assert!(models.len() >= 8);
+        assert!(models.iter().any(|m| m.model_id == DEFAULT_NEMOTRON_MODEL));
+        assert!(models.iter().any(|m| m.model_id == DEFAULT_VISION_MODEL));
+        assert!(models.iter().any(|m| m.model_id == "openai/gpt-4o"));
     }
 }
