@@ -627,7 +627,10 @@ async fn browser_element_inspection_returns_details() {
         .await
         .expect("navigation");
 
-    let snapshot = manager.snapshot(&session.session_id).await.expect("snapshot");
+    let snapshot = manager
+        .snapshot(&session.session_id)
+        .await
+        .expect("snapshot");
     assert_eq!(snapshot.status, "success");
 
     let target = ElementTarget {
@@ -703,13 +706,19 @@ async fn browser_stale_element_reference_rejection() {
     };
 
     let target_params = stale_target.to_params().unwrap();
-    let click_res = manager.click(&session.session_id, target_params, 5000).await;
+    let click_res = manager
+        .click(&session.session_id, target_params, 5000)
+        .await;
     match click_res {
         Ok(res) => {
             assert!(
                 res.status != "success"
                     || res.error_message.as_deref().unwrap_or("").contains("stale")
-                    || res.error_message.as_deref().unwrap_or("").contains("not found")
+                    || res
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("not found")
             );
         }
         Err(e) => {

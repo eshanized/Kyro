@@ -252,17 +252,56 @@ impl BrowserAutomationManager {
                 items
                     .iter()
                     .map(|b| {
-                        let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-                        let display_name = b.get("display_name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
-                        let family = b.get("family").and_then(|v| v.as_str()).unwrap_or("other").to_string();
-                        let path = b.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let version = b.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let available = b.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let automatable = b.get("automatable").and_then(|v| v.as_bool()).unwrap_or(available);
-                        let adapter = b.get("adapter").and_then(|v| v.as_str()).unwrap_or("none").to_string();
-                        let unavailable_reason = b.get("unavailable_reason").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let is_default = b.get("is_default").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let id = b
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = b
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&id)
+                            .to_string();
+                        let display_name = b
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&name)
+                            .to_string();
+                        let family = b
+                            .get("family")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("other")
+                            .to_string();
+                        let path = b
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let version = b
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let available = b
+                            .get("available")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let automatable = b
+                            .get("automatable")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(available);
+                        let adapter = b
+                            .get("adapter")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("none")
+                            .to_string();
+                        let unavailable_reason = b
+                            .get("unavailable_reason")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let is_default = b
+                            .get("is_default")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         BrowserInfo {
                             id,
                             name,
@@ -359,7 +398,10 @@ impl BrowserAutomationManager {
         // If requested is empty or "auto", check user's saved setting
         let user_setting = {
             let guard = self.db.lock().await;
-            guard.as_ref().map(BrowserSettings::load).unwrap_or_default()
+            guard
+                .as_ref()
+                .map(BrowserSettings::load)
+                .unwrap_or_default()
         };
 
         if (target.is_empty() || target.eq_ignore_ascii_case("auto"))
@@ -1193,21 +1235,29 @@ mod tests {
     async fn browser_capabilities_reports_supported_and_unsupported_browsers() {
         let manager = BrowserAutomationManager::new();
         let caps = manager.capabilities().await.expect("capabilities");
-        assert!(!caps.browsers.is_empty(), "capabilities should list known browsers");
+        assert!(
+            !caps.browsers.is_empty(),
+            "capabilities should list known browsers"
+        );
         for b in &caps.browsers {
             assert!(!b.id.is_empty());
             assert!(!b.name.is_empty());
             assert!(!b.family.is_empty());
             assert!(!b.adapter.is_empty());
             if !b.available || !b.automatable {
-                assert!(b.unavailable_reason.is_some(), "browser {} must give a reason when unavailable/unsupported", b.id);
+                assert!(
+                    b.unavailable_reason.is_some(),
+                    "browser {} must give a reason when unavailable/unsupported",
+                    b.id
+                );
             }
         }
     }
 
     #[tokio::test]
     async fn browser_settings_persistence() {
-        let temp_dir = std::env::temp_dir().join(format!("kyro_browser_settings_{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("kyro_browser_settings_{}", uuid::Uuid::new_v4()));
         let db = crate::storage::db::Database::init(temp_dir.clone()).expect("db init");
 
         let settings = BrowserSettings {

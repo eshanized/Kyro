@@ -515,7 +515,8 @@ mod tests {
             "cropped_screenshot": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
         });
 
-        let inspection: ElementInspectionResult = serde_json::from_value(json_data).expect("Must deserialize");
+        let inspection: ElementInspectionResult =
+            serde_json::from_value(json_data).expect("Must deserialize");
         assert!(inspection.interactable);
         assert_eq!(inspection.dom_context.tag, "button");
         assert_eq!(inspection.computed_styles.display.as_deref(), Some("block"));
