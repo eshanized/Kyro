@@ -175,10 +175,14 @@ async fn test_ui_audit_finds_the_known_defects() {
     );
 
     // 2. The missing image.
+    // The detector may report either a DOM broken-image finding
+    // ("Image failed to load") or a network HTTP 404 finding for the image
+    // URL — both indicate the same defect. The assertion accepts either.
     assert!(
         findings
             .iter()
-            .any(|f| f.title.contains("Image failed to load")),
+            .any(|f| f.title.contains("Image failed to load")
+                || (f.title.contains("HTTP 404") && f.title.contains("missing-logo"))),
         "the missing image must be reported; findings were: {:#?}",
         titles
     );
