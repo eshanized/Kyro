@@ -305,7 +305,8 @@ pub fn discover_projects(
             let file_name_lower = file_name.to_lowercase();
             let name_exact = file_name_lower == query_lower;
             let name_approx = !query_lower.is_empty()
-                && (file_name_lower.contains(&query_lower) || query_lower.contains(&file_name_lower));
+                && (file_name_lower.contains(&query_lower)
+                    || query_lower.contains(&file_name_lower));
 
             if let Some(mut candidate) = inspect_project_root(&path, name_exact) {
                 let pkg_name = candidate
@@ -320,11 +321,8 @@ pub fn discover_projects(
                     .map(|s| s.contains(&query_lower))
                     .unwrap_or(false);
 
-                let is_match = query_lower.is_empty()
-                    || name_exact
-                    || name_approx
-                    || pkg_exact
-                    || pkg_approx;
+                let is_match =
+                    query_lower.is_empty() || name_exact || name_approx || pkg_exact || pkg_approx;
 
                 if is_match {
                     if pkg_exact {
@@ -465,7 +463,10 @@ fn manifest_package_name(manifest: Option<&Path>) -> Option<String> {
     let manifest_path = manifest?;
     if manifest_path.file_name()?.to_str()? == "package.json" {
         let pkg = read_package_json(manifest_path)?;
-        return pkg.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+        return pkg
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string());
     }
     None
 }
@@ -673,13 +674,22 @@ mod tests {
         let root = scratch("unrelated");
         let target = root.join("analytics-dashboard");
         fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("package.json"), r#"{"name":"analytics-dashboard"}"#).unwrap();
+        fs::write(
+            target.join("package.json"),
+            r#"{"name":"analytics-dashboard"}"#,
+        )
+        .unwrap();
 
         let unrelated = root.join("billing-service");
         fs::create_dir_all(&unrelated).unwrap();
-        fs::write(unrelated.join("package.json"), r#"{"name":"billing-service"}"#).unwrap();
+        fs::write(
+            unrelated.join("package.json"),
+            r#"{"name":"billing-service"}"#,
+        )
+        .unwrap();
 
-        let result = discover_projects(&root, "analytics-dashboard", &DiscoveryLimits::default()).unwrap();
+        let result =
+            discover_projects(&root, "analytics-dashboard", &DiscoveryLimits::default()).unwrap();
         assert_eq!(result.candidates.len(), 1);
         assert_eq!(result.candidates[0].name, "analytics-dashboard");
 
