@@ -562,7 +562,11 @@ fn supported_browsers_are_permitted_for_browser_open() {
     let ctx = context();
     let args = serde_json::json!({ "browser": "chromium" });
     let decision = tools::evaluate_tool(&policy, &ctx, "browser_open", &args);
-    assert!(decision.is_none(), "supported browsers should be allowed: {:?}", decision);
+    assert!(
+        decision.is_none(),
+        "supported browsers should be allowed: {:?}",
+        decision
+    );
 }
 
 #[test]

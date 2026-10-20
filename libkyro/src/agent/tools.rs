@@ -13,6 +13,7 @@ use crate::project::discovery::{
     detect_node_framework, read_package_json, DiscoveryLimits, ProjectKind,
 };
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -280,6 +281,98 @@ Use the element references and names to drive the other browser tools.".to_strin
                     "headless": { "type": "boolean", "description": "Run the browser without a visible window (defaults to Kyro browser setting)" },
                     "keep_server_running": { "type": "boolean", "description": "Leave the development server running after the audit" }
                 }
+            }),
+        },
+        ToolDefinition {
+            name: "organize_files_preview".to_string(),
+            description: "Inspect a target directory, analyze file types and content-hash duplicates, and generate a safe, reviewable reorganization plan before executing any moves.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "directory": { "type": "string", "description": "Absolute directory to scan and organize" },
+                    "recursive": { "type": "boolean", "description": "Whether to scan subdirectories recursively" }
+                },
+                "required": ["directory"]
+            }),
+        },
+        ToolDefinition {
+            name: "organize_files_execute".to_string(),
+            description: "Execute a previously reviewed file reorganization plan, moving files into categorized folders, enforcing path containment, and creating a transaction manifest.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": { "type": "object", "description": "The full plan object returned by organize_files_preview" }
+                },
+                "required": ["plan"]
+            }),
+        },
+        ToolDefinition {
+            name: "organize_files_undo".to_string(),
+            description: "Reverse an executed file organization transaction, moving files back to their original paths after verifying content hashes.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "transaction": { "type": "object", "description": "The transaction object returned by organize_files_execute" }
+                },
+                "required": ["transaction"]
+            }),
+        },
+        ToolDefinition {
+            name: "analyze_document".to_string(),
+            description: "Parse and analyze a local document (plain text, markdown, or searchable PDF), extracting structured text, key facts, deadlines, and action items.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to the document file" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "compare_documents".to_string(),
+            description: "Compare two local documents, producing a structured diff of added sections, removed content, and action items delta.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path_a": { "type": "string", "description": "Absolute path to first document" },
+                    "path_b": { "type": "string", "description": "Absolute path to second document" }
+                },
+                "required": ["path_a", "path_b"]
+            }),
+        },
+        ToolDefinition {
+            name: "create_code_checkpoint".to_string(),
+            description: "Create a reversible checkpoint of the workspace before modifying code files, preserving pre-existing dirty Git state.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "workspace_path": { "type": "string", "description": "Absolute path to the workspace root" },
+                    "description": { "type": "string", "description": "Reason or context for the changes" }
+                },
+                "required": ["workspace_path", "description"]
+            }),
+        },
+        ToolDefinition {
+            name: "rollback_code_checkpoint".to_string(),
+            description: "Roll back changes from a checkpoint, reverting only agent-modified files while detecting any user conflicts.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "checkpoint": { "type": "object", "description": "The checkpoint object returned by create_code_checkpoint" }
+                },
+                "required": ["checkpoint"]
+            }),
+        },
+        ToolDefinition {
+            name: "diagnose_build_failure".to_string(),
+            description: "Diagnose compiler, test, or build command output (cargo, npm, tsc, vitest, pytest), identifying the root error, file, line number, and a suggested fix.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The build or test command that failed" },
+                    "output": { "type": "string", "description": "The console/stderr output produced by the failed command" }
+                },
+                "required": ["command", "output"]
             }),
         },
     ]
@@ -684,7 +777,10 @@ pub async fn browser_inspect_element(
         Err(e) => return ToolOutcome::fail(e),
     };
     let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(10000);
-    match manager.inspect_element(&session_id, target, timeout_ms).await {
+    match manager
+        .inspect_element(&session_id, target, timeout_ms)
+        .await
+    {
         Ok(res) => {
             let cropped = res.cropped_screenshot.clone();
             let summary = serde_json::json!({
@@ -937,6 +1033,99 @@ pub async fn browser_close(
     }
 }
 
+/// Handles the `organize_files_preview` tool.
+pub async fn organize_files_preview(args: &serde_json::Value) -> ToolOutcome {
+    let dir = args["directory"].as_str().unwrap_or_default();
+    let recursive = args["recursive"].as_bool().unwrap_or(false);
+    let rule = crate::storage::organizer::OrganizationRule {
+        recursive,
+        ..Default::default()
+    };
+    match crate::storage::organizer::FileOrganizer::preview(Path::new(dir), Some(rule)) {
+        Ok(plan) => ToolOutcome::ok(serde_json::to_string_pretty(&plan).unwrap_or_default()),
+        Err(e) => ToolOutcome::fail(e),
+    }
+}
+
+/// Handles the `organize_files_execute` tool.
+pub async fn organize_files_execute(args: &serde_json::Value) -> ToolOutcome {
+    let plan: crate::storage::organizer::OrganizationPlan =
+        match serde_json::from_value(args["plan"].clone()) {
+            Ok(p) => p,
+            Err(e) => return ToolOutcome::fail(format!("Invalid plan argument: {}", e)),
+        };
+    match crate::storage::organizer::FileOrganizer::execute(&plan) {
+        Ok(trx) => ToolOutcome::ok(serde_json::to_string_pretty(&trx).unwrap_or_default()),
+        Err(e) => ToolOutcome::fail(e),
+    }
+}
+
+/// Handles the `organize_files_undo` tool.
+pub async fn organize_files_undo(args: &serde_json::Value) -> ToolOutcome {
+    let mut trx: crate::storage::organizer::OrganizationTransaction =
+        match serde_json::from_value(args["transaction"].clone()) {
+            Ok(t) => t,
+            Err(e) => return ToolOutcome::fail(format!("Invalid transaction argument: {}", e)),
+        };
+    match crate::storage::organizer::FileOrganizer::undo(&mut trx) {
+        Ok(count) => ToolOutcome::ok(format!("Successfully reversed {} file operations.", count)),
+        Err(e) => ToolOutcome::fail(e),
+    }
+}
+
+/// Handles the `analyze_document` tool.
+pub async fn analyze_document(args: &serde_json::Value) -> ToolOutcome {
+    let path = args["path"].as_str().unwrap_or_default();
+    match crate::storage::documents::DocumentAssistant::analyze(Path::new(path), None) {
+        Ok(res) => ToolOutcome::ok(serde_json::to_string_pretty(&res).unwrap_or_default()),
+        Err(e) => ToolOutcome::fail(e),
+    }
+}
+
+/// Handles the `compare_documents` tool.
+pub async fn compare_documents(args: &serde_json::Value) -> ToolOutcome {
+    let path_a = args["path_a"].as_str().unwrap_or_default();
+    let path_b = args["path_b"].as_str().unwrap_or_default();
+    match crate::storage::documents::DocumentAssistant::compare(
+        Path::new(path_a),
+        Path::new(path_b),
+    ) {
+        Ok(res) => ToolOutcome::ok(res.markdown_report),
+        Err(e) => ToolOutcome::fail(e),
+    }
+}
+
+/// Handles the `create_code_checkpoint` tool.
+pub async fn create_code_checkpoint(args: &serde_json::Value) -> ToolOutcome {
+    let ws = args["workspace_path"].as_str().unwrap_or_default();
+    let desc = args["description"]
+        .as_str()
+        .unwrap_or("agent modifications");
+    let chk = crate::project::checkpoint::CheckpointManager::create_checkpoint(Path::new(ws), desc);
+    ToolOutcome::ok(serde_json::to_string_pretty(&chk).unwrap_or_default())
+}
+
+/// Handles the `rollback_code_checkpoint` tool.
+pub async fn rollback_code_checkpoint(args: &serde_json::Value) -> ToolOutcome {
+    let mut chk: crate::project::checkpoint::CodeCheckpoint =
+        match serde_json::from_value(args["checkpoint"].clone()) {
+            Ok(c) => c,
+            Err(e) => return ToolOutcome::fail(format!("Invalid checkpoint argument: {}", e)),
+        };
+    match crate::project::checkpoint::CheckpointManager::rollback(&mut chk) {
+        Ok(res) => ToolOutcome::ok(serde_json::to_string_pretty(&res).unwrap_or_default()),
+        Err(e) => ToolOutcome::fail(e),
+    }
+}
+
+/// Handles the `diagnose_build_failure` tool.
+pub async fn diagnose_build_failure(args: &serde_json::Value) -> ToolOutcome {
+    let cmd = args["command"].as_str().unwrap_or_default();
+    let out = args["output"].as_str().unwrap_or_default();
+    let diag = crate::project::checkpoint::BuildDoctor::diagnose_failure(Path::new("."), cmd, out);
+    ToolOutcome::ok(serde_json::to_string_pretty(&diag).unwrap_or_default())
+}
+
 /// The authorisation decisions for the new tools.
 pub fn evaluate_tool(
     policy: &crate::governance::GovernancePolicy,
@@ -945,6 +1134,17 @@ pub fn evaluate_tool(
     args: &serde_json::Value,
 ) -> Option<AuthDecision> {
     match tool_name {
+        "organize_files_execute" => Some(AuthDecision::RequireApproval {
+            reason: "Executing file reorganization moves files into new directory locations."
+                .to_string(),
+            risk: crate::execution::permissions::RiskLevel::Moderate,
+            summary: "Move categorized files into organized folders".to_string(),
+        }),
+        "rollback_code_checkpoint" => Some(AuthDecision::RequireApproval {
+            reason: "Rolling back a code checkpoint restores previous file states.".to_string(),
+            risk: crate::execution::permissions::RiskLevel::Moderate,
+            summary: "Revert agent modified files to checkpoint state".to_string(),
+        }),
         "start_dev_server" | "audit_ui" => {
             let target = args["path"].as_str().unwrap_or("");
             Some(AuthDecision::RequireApproval {
@@ -1031,9 +1231,7 @@ pub fn evaluate_tool(
             }
             None
         }
-        "browser_open" => {
-            None
-        }
+        "browser_open" => None,
         "stop_dev_server" | "browser_close" => {
             let _ = ctx;
             None

@@ -11,4 +11,6 @@ pub use router::{
     ToolDefinition,
 };
 pub use tools::ToolOutcome;
-pub use vision::{VisualAnalysisContext, VisualAnalysisResult, VisualAnalyzer, VisualDefect, VisualRegion};
+pub use vision::{
+    VisualAnalysisContext, VisualAnalysisResult, VisualAnalyzer, VisualDefect, VisualRegion,
+};

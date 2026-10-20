@@ -368,7 +368,8 @@ The program is started as an explicit executable plus argument vector; free-form
         F: FnMut(AgentStepEvent) + Send + 'static,
     {
         let token = cancel_token.unwrap_or_default();
-        self.register_run(run_id, token.clone(), model, api_key, base_url).await;
+        self.register_run(run_id, token.clone(), model, api_key, base_url)
+            .await;
 
         let mut tools = Self::standard_tools();
         if let Some(ref conn_mgr) = connector_manager {
@@ -544,13 +545,15 @@ The program is started as an explicit executable plus argument vector; free-form
                 let message_content = if let Some(ref b64) = visual_data {
                     use base64::Engine;
                     let shot_art_id = format!("art_{}", uuid::Uuid::new_v4());
-                    let shot_name = format!("shot-{}.png", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                    let shot_name =
+                        format!("shot-{}.png", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
                     let artifacts_dir = dirs::config_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
                         .join("kyro")
                         .join("artifacts");
                     let _ = std::fs::create_dir_all(&artifacts_dir);
-                    let shot_path = artifacts_dir.join(format!("{}_{}", &shot_art_id[4..12], shot_name));
+                    let shot_path =
+                        artifacts_dir.join(format!("{}_{}", &shot_art_id[4..12], shot_name));
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
                         let _ = std::fs::write(&shot_path, &bytes);
                         let conv_id = db
@@ -581,7 +584,10 @@ The program is started as an explicit executable plus argument vector; free-form
 
                     if ModelRouter::is_vision_model(model) {
                         MessageContent::from_text_and_image(
-                            &format!("{}\n[Visual artifact saved: {} ({})]", output, shot_name, shot_art_id),
+                            &format!(
+                                "{}\n[Visual artifact saved: {} ({})]",
+                                output, shot_name, shot_art_id
+                            ),
                             b64,
                         )
                     } else {
@@ -2045,6 +2051,38 @@ The program is started as an explicit executable plus argument vector; free-form
             }
             "audit_ui" => {
                 let outcome = self.run_ui_audit(run_id, &tc.arguments, db, token).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "organize_files_preview" => {
+                let outcome = tools::organize_files_preview(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "organize_files_execute" => {
+                let outcome = tools::organize_files_execute(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "organize_files_undo" => {
+                let outcome = tools::organize_files_undo(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "analyze_document" => {
+                let outcome = tools::analyze_document(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "compare_documents" => {
+                let outcome = tools::compare_documents(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "create_code_checkpoint" => {
+                let outcome = tools::create_code_checkpoint(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "rollback_code_checkpoint" => {
+                let outcome = tools::rollback_code_checkpoint(&tc.arguments).await;
+                (outcome.message, outcome.is_error, outcome.visual)
+            }
+            "diagnose_build_failure" => {
+                let outcome = tools::diagnose_build_failure(&tc.arguments).await;
                 (outcome.message, outcome.is_error, outcome.visual)
             }
             custom => {
