@@ -20,7 +20,8 @@ fn main() {
 
     let db = Database::init(config_dir).expect("Failed to initialize Kyro SQLite database");
     let vault = Vault::new(db.clone());
-    let browser = Arc::new(kyro_lib::browser::BrowserAutomationManager::new().with_database(db.clone()));
+    let browser =
+        Arc::new(kyro_lib::browser::BrowserAutomationManager::new().with_database(db.clone()));
     let dev_servers = Arc::new(kyro_lib::project::DevServerManager::new());
     let engine = Arc::new(AgentLoopEngine::with_resources(
         browser.clone(),
@@ -152,7 +153,26 @@ fn main() {
             list_dev_servers,
             get_dev_server,
             get_dev_server_logs,
-            stop_dev_server
+            stop_dev_server,
+            start_dev_server,
+            preview_file_organization,
+            execute_file_organization,
+            undo_file_organization,
+            analyze_document,
+            compare_documents,
+            explain_screen_capture,
+            get_model_capabilities,
+            list_available_models,
+            create_code_checkpoint,
+            rollback_code_checkpoint,
+            diagnose_build_failure,
+            set_audit_baseline,
+            get_audit_baseline,
+            compare_visual_baseline,
+            create_multi_agent_workspace,
+            reconcile_multi_agent_workspace,
+            export_routine,
+            import_routine
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kyro application");

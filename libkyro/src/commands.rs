@@ -1,4 +1,7 @@
+use crate::agent::router::{ModelCapabilities, ModelRouter};
+use crate::agent::vision::{VisualAnalysisContext, VisualAnalysisResult, VisualAnalyzer};
 use crate::agent::{router::DEFAULT_NEMOTRON_MODEL, AgentLoopEngine, AgentStepEvent, ChatMessage};
+use crate::audit::regression::{VisualBaseline, VisualRegressionEngine, VisualRegressionResult};
 use crate::computer_use::{
     capture_region, capture_screen, list_windows, ComputerAction, InputController,
     ScreenshotResult, WindowInfo,
@@ -12,17 +15,31 @@ use crate::governance::{GovernancePolicy, PolicyEngine, TakeoverController, Take
 use crate::grounding::{GroundedScreenResult, SetOfMarksEngine};
 use crate::mcp::McpManager;
 use crate::memory::{AppIndexer, InstalledApp, MemoryStore};
+use crate::multibot::workspace::{
+    MultiAgentOrchestrator, MultiAgentWorkspace, ReconciliationOutcome,
+};
 use crate::multibot::{BotStatus, MultiBotOrchestrator};
+use crate::project::checkpoint::{
+    BuildDoctor, BuildDoctorDiagnostic, CheckpointManager, CodeCheckpoint, RollbackResult,
+};
 use crate::sandbox::{ContainerExecResult, DockerSandbox, SandboxStatus};
+use crate::storage::documents::{
+    DocumentAnalysisResult, DocumentAssistant, DocumentComparisonResult,
+};
+use crate::storage::organizer::{
+    FileOrganizer, OrganizationPlan, OrganizationRule, OrganizationTransaction,
+};
 use crate::storage::{
     AgentRun, ApiKeys, ApiKeysMetadata, ApprovalRequest, ArtifactRecord, BotRecord,
     ConnectorToolPolicyRecord, Conversation, Database, ImportSummary, McpServerRecord, MemoryEntry,
     Message, RoutineRecord, RunEvent, SearchResultItem, SkillRecord, TemplateEngine, TemplatePack,
     TimelineStepRecord, Vault,
 };
+use crate::teach_task::portable_routine::{EditableRoutine, RoutineEngine};
 use crate::teach_task::{RoutineScheduler, Skill, SkillReplayer, TaskRecorder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -950,7 +967,9 @@ pub fn add_artifact_comment(
                 role: "user".to_string(),
                 content: format!(
                     "[User Feedback on visual artifact '{}' ({}): {}]",
-                    art.name, art.id, comment.trim()
+                    art.name,
+                    art.id,
+                    comment.trim()
                 ),
                 tool_calls_json: None,
                 observations_json: None,
@@ -1098,12 +1117,7 @@ pub async fn open_browser_session(
     let policy = PolicyEngine::load(&state.db);
     state
         .browser
-        .create_session(
-            &requested,
-            is_headless,
-            None,
-            &policy.blocked_domains,
-        )
+        .create_session(&requested, is_headless, None, &policy.blocked_domains)
         .await
 }
 
@@ -1200,6 +1214,19 @@ pub fn get_dev_server_logs(
 pub fn stop_dev_server(state: State<AppState>, server_id: String) -> Result<bool, String> {
     state.dev_servers.stop(&server_id)?;
     Ok(true)
+}
+
+/// Starts a managed development server for a project path.
+#[tauri::command]
+pub async fn start_dev_server(
+    state: State<'_, AppState>,
+    project_path: String,
+) -> Result<crate::project::DevServerState, String> {
+    let root = std::path::PathBuf::from(project_path.trim());
+    let candidate = crate::project::discovery::inspect_project_root(&root, true)
+        .ok_or_else(|| format!("'{}' is not a recognized project root.", root.display()))?;
+    let command = crate::project::devserver::DevServerManager::choose_command(&candidate)?;
+    state.dev_servers.start(&command, None, 120000).await
 }
 
 // ==========================================
@@ -1440,4 +1467,277 @@ pub async fn save_account_tool_policy(
         .db
         .set_connector_tool_policy(&record)
         .map_err(|e| e.to_string())
+}
+
+// -----------------------------------------------------------------------------
+// Everyday Workflows: File Organization, Documents & Screen Explainer
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn preview_file_organization(
+    directory: String,
+    rule: Option<OrganizationRule>,
+) -> Result<OrganizationPlan, String> {
+    FileOrganizer::preview(Path::new(&directory), rule)
+}
+
+#[tauri::command]
+pub async fn execute_file_organization(
+    plan: OrganizationPlan,
+    state: tauri::State<'_, AppState>,
+) -> Result<OrganizationTransaction, String> {
+    let trx = FileOrganizer::execute(&plan)?;
+    if let Ok(manifest_json) = serde_json::to_string_pretty(&trx) {
+        let art_id = format!("art_{}", uuid::Uuid::new_v4());
+        let rec = ArtifactRecord {
+            id: art_id,
+            run_id: None,
+            conversation_id: None,
+            name: format!("file-organization-manifest-{}.json", trx.transaction_id),
+            file_path: trx.target_directory.clone(),
+            artifact_type: "json".to_string(),
+            mime_type: "application/json".to_string(),
+            size_bytes: manifest_json.len() as i64,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            metadata_json: Some(manifest_json),
+        };
+        let _ = state.db.create_artifact(&rec);
+    }
+    Ok(trx)
+}
+
+#[tauri::command]
+pub async fn undo_file_organization(
+    mut transaction: OrganizationTransaction,
+) -> Result<usize, String> {
+    FileOrganizer::undo(&mut transaction)
+}
+
+#[tauri::command]
+pub async fn analyze_document(
+    path: String,
+    model: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<DocumentAnalysisResult, String> {
+    let res = DocumentAssistant::analyze(Path::new(&path), model.as_deref())?;
+    let report_content = format!(
+        "# Document Analysis Report: {}\n\n{}\n\n## Summary\n{}\n\n## Key Facts\n{}\n\n## Action Items\n{}\n\n## Dates & Deadlines\n{}\n",
+        res.metadata.file_name,
+        res.privacy_disclosure,
+        res.summary,
+        res.key_facts.iter().map(|f| format!("- {}", f)).collect::<Vec<_>>().join("\n"),
+        res.action_items.iter().map(|a| format!("- [{}] {} (line {:?})", a.priority, a.text, a.line_number)).collect::<Vec<_>>().join("\n"),
+        res.extracted_dates.iter().map(|d| format!("- **{}**: {}", d.raw_date, d.context)).collect::<Vec<_>>().join("\n")
+    );
+    let art_id = format!("art_{}", uuid::Uuid::new_v4());
+    let rec = ArtifactRecord {
+        id: art_id,
+        run_id: None,
+        conversation_id: None,
+        name: format!("analysis-{}.md", res.metadata.file_name),
+        file_path: res.metadata.file_path.clone(),
+        artifact_type: "markdown".to_string(),
+        mime_type: "text/markdown".to_string(),
+        size_bytes: report_content.len() as i64,
+        created_at: chrono::Utc::now().timestamp_millis(),
+        metadata_json: Some(serde_json::to_string(&res).unwrap_or_default()),
+    };
+    let _ = state.db.create_artifact(&rec);
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn compare_documents(
+    path_a: String,
+    path_b: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<DocumentComparisonResult, String> {
+    let res = DocumentAssistant::compare(Path::new(&path_a), Path::new(&path_b))?;
+    let art_id = format!("art_{}", uuid::Uuid::new_v4());
+    let rec = ArtifactRecord {
+        id: art_id,
+        run_id: None,
+        conversation_id: None,
+        name: "document-comparison-report.md".to_string(),
+        file_path: res.doc_a_path.clone(),
+        artifact_type: "markdown".to_string(),
+        mime_type: "text/markdown".to_string(),
+        size_bytes: res.markdown_report.len() as i64,
+        created_at: chrono::Utc::now().timestamp_millis(),
+        metadata_json: Some(serde_json::to_string(&res).unwrap_or_default()),
+    };
+    let _ = state.db.create_artifact(&rec);
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn explain_screen_capture(
+    base64_png: String,
+    question: String,
+    model: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<VisualAnalysisResult, String> {
+    let keys = state.vault.get_all_keys().unwrap_or_default();
+    let api_key = keys.nvidia.unwrap_or_default();
+    let router = Arc::new(ModelRouter::new());
+    let analyzer = VisualAnalyzer::new(router, api_key, None);
+    let ctx = VisualAnalysisContext {
+        route: "desktop_screen".to_string(),
+        preview_url: "screen://current".to_string(),
+        viewport: "desktop".to_string(),
+        dom_summary: None,
+        element_of_interest: Some(question),
+    };
+    let res = analyzer
+        .analyze_screenshot(&base64_png, model.as_deref().unwrap_or(""), &ctx)
+        .await;
+    Ok(res)
+}
+
+// -----------------------------------------------------------------------------
+// Model Capabilities Registry & Available Models
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn get_model_capabilities(model: String) -> Result<ModelCapabilities, String> {
+    Ok(ModelRouter::resolve_capabilities(&model))
+}
+
+#[tauri::command]
+pub async fn list_available_models() -> Result<Vec<ModelCapabilities>, String> {
+    Ok(ModelRouter::list_known_models())
+}
+
+// -----------------------------------------------------------------------------
+// Developer Workflows: Checkpoints, Safe Rollback & Build Doctor
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn create_code_checkpoint(
+    workspace_path: String,
+    description: String,
+) -> Result<CodeCheckpoint, String> {
+    Ok(CheckpointManager::create_checkpoint(
+        Path::new(&workspace_path),
+        &description,
+    ))
+}
+
+#[tauri::command]
+pub async fn rollback_code_checkpoint(
+    mut checkpoint: CodeCheckpoint,
+) -> Result<RollbackResult, String> {
+    CheckpointManager::rollback(&mut checkpoint)
+}
+
+#[tauri::command]
+pub async fn diagnose_build_failure(
+    working_dir: String,
+    command: String,
+    output: String,
+) -> Result<BuildDoctorDiagnostic, String> {
+    Ok(BuildDoctor::diagnose_failure(
+        Path::new(&working_dir),
+        &command,
+        &output,
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// Visual Regression Baselines
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn set_audit_baseline(
+    project_path: String,
+    route: String,
+    viewport: String,
+    base64_png: String,
+    artifact_id: Option<String>,
+) -> Result<VisualBaseline, String> {
+    VisualRegressionEngine::save_baseline(
+        Path::new(&project_path),
+        &route,
+        &viewport,
+        &base64_png,
+        artifact_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub async fn get_audit_baseline(
+    project_path: String,
+    route: String,
+    viewport: String,
+) -> Result<Option<VisualBaseline>, String> {
+    Ok(VisualRegressionEngine::load_baseline(
+        Path::new(&project_path),
+        &route,
+        &viewport,
+    ))
+}
+
+#[tauri::command]
+pub async fn compare_visual_baseline(
+    baseline_b64: String,
+    current_b64: String,
+    route: String,
+    viewport: String,
+    threshold: Option<f32>,
+) -> Result<VisualRegressionResult, String> {
+    VisualRegressionEngine::compare(
+        &baseline_b64,
+        &current_b64,
+        &route,
+        &viewport,
+        threshold.unwrap_or(1.0),
+    )
+}
+
+// -----------------------------------------------------------------------------
+// Developer Multi-Agent Workspace
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn create_multi_agent_workspace(
+    parent_run_id: String,
+    project_path: String,
+    objective: String,
+) -> Result<MultiAgentWorkspace, String> {
+    Ok(MultiAgentOrchestrator::create_workspace(
+        &parent_run_id,
+        Path::new(&project_path),
+        &objective,
+    ))
+}
+
+#[tauri::command]
+pub async fn reconcile_multi_agent_workspace(
+    project_root: String,
+    worktree_path: String,
+    workspace_id: String,
+) -> Result<ReconciliationOutcome, String> {
+    MultiAgentOrchestrator::reconcile_changes(
+        Path::new(&project_root),
+        Path::new(&worktree_path),
+        &workspace_id,
+    )
+}
+
+// -----------------------------------------------------------------------------
+// Portable & Reusable Routines (Export / Import)
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn export_routine(routine: EditableRoutine) -> Result<String, String> {
+    RoutineEngine::export_routine(&routine)
+}
+
+#[tauri::command]
+pub async fn import_routine(json_str: String) -> Result<EditableRoutine, String> {
+    let available_tools: Vec<String> = AgentLoopEngine::standard_tools()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    RoutineEngine::import_routine(&json_str, &available_tools)
 }
