@@ -175,15 +175,26 @@ impl UiAuditWorkflow {
         // 1. If an explicit project path is supplied, use it directly.
         if let Some(ref path) = options.project_path {
             if !path.exists() {
-                return Err(format!("The project path '{}' does not exist.", path.display()));
+                return Err(format!(
+                    "The project path '{}' does not exist.",
+                    path.display()
+                ));
             }
             let candidate = crate::project::discovery::inspect_project_root(path, true)
-                .ok_or_else(|| format!("'{}' does not contain a recognized project manifest or repository marker.", path.display()))?;
+                .ok_or_else(|| {
+                    format!(
+                        "'{}' does not contain a recognized project manifest or repository marker.",
+                        path.display()
+                    )
+                })?;
             let command = DevServerManager::choose_command(&candidate)?;
             return Ok(AuditPlan {
                 project: candidate,
                 command,
-                discovery_summary: format!("Using explicitly provided project path at '{}'.", path.display()),
+                discovery_summary: format!(
+                    "Using explicitly provided project path at '{}'.",
+                    path.display()
+                ),
             });
         }
 
@@ -196,12 +207,20 @@ impl UiAuditWorkflow {
         let as_path = PathBuf::from(trimmed_name);
         if as_path.is_absolute() && as_path.is_dir() {
             let candidate = crate::project::discovery::inspect_project_root(&as_path, true)
-                .ok_or_else(|| format!("'{}' does not contain a recognized project manifest or repository marker.", as_path.display()))?;
+                .ok_or_else(|| {
+                    format!(
+                        "'{}' does not contain a recognized project manifest or repository marker.",
+                        as_path.display()
+                    )
+                })?;
             let command = DevServerManager::choose_command(&candidate)?;
             return Ok(AuditPlan {
                 project: candidate,
                 command,
-                discovery_summary: format!("Using explicit project directory at '{}'.", as_path.display()),
+                discovery_summary: format!(
+                    "Using explicit project directory at '{}'.",
+                    as_path.display()
+                ),
             });
         }
 
@@ -555,13 +574,18 @@ impl UiAuditWorkflow {
                                         _ => crate::audit::findings::Severity::Medium,
                                     },
                                     match vis_res.confidence.as_str() {
-                                        "reproduced" => crate::audit::findings::Confidence::Reproduced,
+                                        "reproduced" => {
+                                            crate::audit::findings::Confidence::Reproduced
+                                        }
                                         "strong_evidence" => {
                                             crate::audit::findings::Confidence::StrongEvidence
                                         }
                                         _ => crate::audit::findings::Confidence::Unverified,
                                     },
-                                    format!("Visual defect on {}: {}", route.path, defect.defect_type),
+                                    format!(
+                                        "Visual defect on {}: {}",
+                                        route.path, defect.defect_type
+                                    ),
                                     &route.path,
                                     nav.url.as_deref().unwrap_or(&url),
                                     "1440x900",
@@ -572,6 +596,40 @@ impl UiAuditWorkflow {
                                     f.console_evidence = vec![vis_res.supporting_evidence.clone()];
                                 }
                                 findings.push(f);
+                            }
+                        }
+
+                        // Check against stored visual baseline if present
+                        if let Some(baseline) =
+                            crate::audit::regression::VisualRegressionEngine::load_baseline(
+                                &project.path,
+                                &route.path,
+                                "1440x900",
+                            )
+                        {
+                            if let Ok(reg) =
+                                crate::audit::regression::VisualRegressionEngine::compare(
+                                    &baseline.base64_png,
+                                    png,
+                                    &route.path,
+                                    "1440x900",
+                                    1.0,
+                                )
+                            {
+                                if reg.has_regression {
+                                    let mut f = Finding::new(
+                                        crate::audit::findings::FindingCategory::DesignInconsistency,
+                                        if reg.diff_percent > 15.0 { crate::audit::findings::Severity::High } else { crate::audit::findings::Severity::Medium },
+                                        crate::audit::findings::Confidence::Reproduced,
+                                        format!("Visual regression on {}: {:.1}% pixel divergence from baseline", route.path, reg.diff_percent),
+                                        &route.path,
+                                        nav.url.as_deref().unwrap_or(&url),
+                                        "1440x900",
+                                    );
+                                    f.actual = reg.description;
+                                    f.artifacts = vec![name.clone()];
+                                    findings.push(f);
+                                }
                             }
                         }
                     }
@@ -1374,7 +1432,8 @@ mod tests {
         let dev_servers = Arc::new(DevServerManager::new());
         let workflow = UiAuditWorkflow::new(browser, dev_servers);
 
-        let temp = std::env::temp_dir().join(format!("kyro_explicit_test_{}", uuid::Uuid::new_v4()));
+        let temp =
+            std::env::temp_dir().join(format!("kyro_explicit_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp).unwrap();
         std::fs::write(
             temp.join("package.json"),
