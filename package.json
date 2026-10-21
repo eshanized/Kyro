@@ -1,8 +1,38 @@
 {
   "name": "kyro",
-  "private": true,
   "version": "0.1.0",
+  "description": "Local-first autonomous desktop AI agent built with Tauri v2, Rust, and React 19",
+  "private": true,
   "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Eshan Roy",
+    "email": "m.eshanized@gmail.com",
+    "url": "https://github.com/eshanized"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eshanized/Kyro.git"
+  },
+  "homepage": "https://github.com/eshanized/Kyro#readme",
+  "bugs": {
+    "url": "https://github.com/eshanized/Kyro/issues"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "desktop",
+    "tauri",
+    "tauri-v2",
+    "rust",
+    "react",
+    "typescript",
+    "computer-use",
+    "automation",
+    "mcp",
+    "model-context-protocol",
+    "local-first"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

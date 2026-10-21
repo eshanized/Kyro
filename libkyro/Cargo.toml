@@ -1,9 +1,15 @@
 [package]
 name = "kyro"
 version = "0.1.0"
-description = "Kyro - Autonomous Desktop AI Agent"
-authors = ["Kyro Team"]
+description = "Kyro - Local-First Autonomous Desktop AI Agent"
+authors = ["Eshan Roy <m.eshanized@gmail.com>", "Kyro Contributors"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/eshanized/Kyro"
+homepage = "https://github.com/eshanized/Kyro"
+readme = "../README.md"
+keywords = ["ai", "agent", "tauri", "desktop", "automation"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "kyro_lib"

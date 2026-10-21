@@ -11,7 +11,8 @@ dist-ssr/
 # Tauri / Rust build artifacts
 target/
 libkyro/target/
-libkyro/gen/schemas/
+libkyro/gen/
+gen/
 **/*.rs.bk
 *.pdb
 
