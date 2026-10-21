@@ -1,4 +1,4 @@
-name: Release Multiplatform Artifacts
+name: Release Linux Packages
 
 on:
   push:
@@ -6,40 +6,29 @@ on:
       - 'v*'
 
 jobs:
-  build-tauri:
+  build-linux:
+    name: Build & Package Linux Binaries
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: 'macos-latest'
-            args: '--target aarch64-apple-darwin'
-          - platform: 'macos-13'
-            args: '--target x86_64-apple-darwin'
-          - platform: 'ubuntu-22.04'
-            args: ''
-          - platform: 'windows-latest'
-            args: ''
 
-    runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
+
+      - name: Symlink Node.js to /usr/local/bin
+        run: sudo ln -sf $(which node) /usr/local/bin/node
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || '' }}
 
-      - name: Install Linux dependencies (Ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04'
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -51,19 +40,134 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            rpm \
+            patchelf \
+            zstd \
+            libarchive-tools
 
       - name: Install Node dependencies
         run: npm ci
 
-      - name: Build Desktop Application (Tauri Action)
+      - name: Build Desktop Application (Debian .deb, Fedora/RHEL .rpm, Universal .AppImage)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Kyro v__VERSION__'
-          releaseBody: 'See the changelog for details on this release.'
-          releaseDraft: true
+          releaseBody: |
+            ### ⚡ Kyro v__VERSION__ — Local-First Autonomous Desktop AI Agent
+
+            Kyro is an open-source, local-first autonomous desktop AI agent built with **Tauri v2**, **Rust**, and **React 19**.
+
+            #### 📦 Available Linux Distro Packages:
+            * **Debian / Ubuntu / Mint / Pop!_OS / Kali**: `.deb` package
+            * **Fedora / RHEL / CentOS / Rocky / openSUSE**: `.rpm` package
+            * **Universal Linux (All Distros, Standalone Executable)**: `.AppImage`
+            * **Arch Linux / Manjaro / EndeavourOS / SteamOS**: `.pkg.tar.zst` package (`pacman -U`)
+            * **Universal Portable Tarball**: `.tar.gz` (includes automated `install.sh`)
+            * **Integrity & Checksums**: `SHA256SUMS.txt`
+          releaseDraft: false
           prerelease: false
-          args: ${{ matrix.args }}
+
+      - name: Package Arch Linux (.pkg.tar.zst), Portable Tarball (.tar.gz), and Checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+          echo "Packaging extra distro targets for version ${VERSION} (${TAG})..."
+
+          BIN_PATH="libkyro/target/release/kyro"
+          if [ ! -f "$BIN_PATH" ]; then
+            # Locate binary from bundles if path differed
+            BIN_PATH=$(find libkyro/target/release -maxdepth 1 -name "kyro" -type f -perm /111 | head -n 1)
+          fi
+
+          echo "Using binary at: $BIN_PATH"
+
+          # 1. Universal Portable Tarball (.tar.gz)
+          PORTABLE_DIR="kyro-${VERSION}-linux-x86_64"
+          mkdir -p "$PORTABLE_DIR"
+          cp "$BIN_PATH" "$PORTABLE_DIR/kyro"
+          chmod +x "$PORTABLE_DIR/kyro"
+          cp "logo.svg" "$PORTABLE_DIR/"
+          cp "assets/logo.svg" "$PORTABLE_DIR/kyro.png" 2>/dev/null || true
+
+          cat << 'DESKTOP' > "$PORTABLE_DIR/kyro.desktop"
+          [Desktop Entry]
+          Name=Kyro
+          Comment=Local-First Autonomous Desktop AI Agent
+          Exec=kyro
+          Icon=kyro
+          Terminal=false
+          Type=Application
+          Categories=Utility;Development;
+          DESKTOP
+
+          cat << 'INSTALL' > "$PORTABLE_DIR/install.sh"
+          #!/usr/bin/env bash
+          set -e
+          PREFIX="${1:-$HOME/.local}"
+          echo "Installing Kyro into $PREFIX..."
+          mkdir -p "$PREFIX/bin" "$PREFIX/share/applications" "$PREFIX/share/icons/hicolor/512x512/apps"
+          cp kyro "$PREFIX/bin/kyro"
+          chmod +x "$PREFIX/bin/kyro"
+          cp kyro.png "$PREFIX/share/icons/hicolor/512x512/apps/kyro.png" 2>/dev/null || true
+          sed -e "s|^Exec=.*|Exec=$PREFIX/bin/kyro|g" kyro.desktop > "$PREFIX/share/applications/kyro.desktop"
+          echo "Kyro installed successfully! Run 'kyro' from your terminal or launcher."
+          INSTALL
+          chmod +x "$PORTABLE_DIR/install.sh"
+
+          tar -czf "kyro-${VERSION}-linux-x86_64.tar.gz" "$PORTABLE_DIR"
+
+          # 2. Arch Linux Package (.pkg.tar.zst)
+          ARCH_DIR="arch_pkg_root"
+          rm -rf "$ARCH_DIR"
+          mkdir -p "$ARCH_DIR/usr/bin" "$ARCH_DIR/usr/share/applications" "$ARCH_DIR/usr/share/icons/hicolor/512x512/apps"
+          cp "$BIN_PATH" "$ARCH_DIR/usr/bin/kyro"
+          chmod +x "$ARCH_DIR/usr/bin/kyro"
+          cp "$PORTABLE_DIR/kyro.desktop" "$ARCH_DIR/usr/share/applications/kyro.desktop"
+          cp "assets/logo.svg" "$ARCH_DIR/usr/share/icons/hicolor/512x512/apps/kyro.svg" 2>/dev/null || true
+
+          SIZE=$(du -sb "$ARCH_DIR" | awk '{print $1}')
+          cat << PKGINFO > "$ARCH_DIR/.PKGINFO"
+          pkgname = kyro-bin
+          pkgbase = kyro-bin
+          pkgver = ${VERSION}-1
+          pkgdesc = Local-First Autonomous Desktop AI Agent built with Tauri v2, Rust & React 19
+          url = https://github.com/eshanized/Kyro
+          builddate = $(date +%s)
+          packager = Kyro Release Pipeline <m.eshanized@gmail.com>
+          size = $SIZE
+          arch = x86_64
+          license = MIT
+          depend = webkit2gtk-4.1
+          depend = openssl
+          depend = libxdo
+          depend = libayatana-appindicator
+          provides = kyro=${VERSION}
+          conflicts = kyro
+          PKGINFO
+
+          (cd "$ARCH_DIR" && bsdtar -czf .MTREE --format=mtree --options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' .PKGINFO usr)
+          (cd "$ARCH_DIR" && bsdtar --zstd -cf "../kyro-${VERSION}-1-x86_64.pkg.tar.zst" .PKGINFO .MTREE usr)
+
+          # 3. Collect all release artifacts and compute SHA256 checksums
+          mkdir -p dist_artifacts
+          cp -f libkyro/target/release/bundle/deb/*.deb dist_artifacts/ 2>/dev/null || true
+          cp -f libkyro/target/release/bundle/rpm/*.rpm dist_artifacts/ 2>/dev/null || true
+          cp -f libkyro/target/release/bundle/appimage/*.AppImage dist_artifacts/ 2>/dev/null || true
+          cp -f "kyro-${VERSION}-linux-x86_64.tar.gz" dist_artifacts/
+          cp -f "kyro-${VERSION}-1-x86_64.pkg.tar.zst" dist_artifacts/
+
+          (cd dist_artifacts && sha256sum * > SHA256SUMS.txt)
+          cp dist_artifacts/SHA256SUMS.txt ./
+
+          # Upload extra artifacts and checksums to the release
+          gh release upload "$TAG" \
+            "kyro-${VERSION}-linux-x86_64.tar.gz" \
+            "kyro-${VERSION}-1-x86_64.pkg.tar.zst" \
+            "SHA256SUMS.txt" \
+            --clobber
