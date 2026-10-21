@@ -172,7 +172,20 @@ fn main() {
             create_multi_agent_workspace,
             reconcile_multi_agent_workspace,
             export_routine,
-            import_routine
+            import_routine,
+            list_authorized_folders,
+            add_authorized_folder,
+            remove_authorized_folder,
+            search_authorized_documents,
+            execute_safe_file_op,
+            detect_folder_duplicates,
+            list_file_transactions,
+            generate_study_notes,
+            explain_document_passage,
+            get_today_dashboard_data,
+            list_routine_runs,
+            execute_routine_now,
+            natural_language_to_routine
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kyro application");

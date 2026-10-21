@@ -14,6 +14,7 @@ pub use manager::{
     RegisteredConnectorTool,
 };
 pub use native::github::GitHubAdapter;
+pub use native::google::GoogleAdapter;
 pub use native::NativeConnectorAdapter;
 pub use remote_mcp::{RemoteMcpClient, ValidatedRemoteEndpoint};
 
