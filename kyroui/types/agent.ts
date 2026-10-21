@@ -425,3 +425,305 @@ export interface BrowserSettings {
   headless_default: boolean;
 }
 
+export interface ModelCapabilities {
+  provider: string;
+  model_id: string;
+  text_input: boolean;
+  text_output: boolean;
+  vision: boolean;
+  image_input?: boolean;
+  tool_calling: boolean;
+  supported_formats: string[];
+  max_image_size_bytes?: number | null;
+  max_tokens?: number | null;
+  capability_status: string;
+  configuration_error?: string | null;
+}
+
+export interface OrganizationRule {
+  name: string;
+  custom_extensions: Record<string, string>;
+  group_duplicates: boolean;
+  duplicates_folder_name: string;
+  recursive: boolean;
+}
+
+export interface PlannedFileOp {
+  source_path: string;
+  destination_path: string;
+  category: string;
+  reason: string;
+  file_size: number;
+  file_hash?: string | null;
+  is_duplicate: boolean;
+  duplicate_of?: string | null;
+  conflict?: string | null;
+}
+
+export interface OrganizationPlan {
+  plan_id: string;
+  target_directory: string;
+  total_scanned: number;
+  duplicates_count: number;
+  conflicts_count: number;
+  operations: PlannedFileOp[];
+}
+
+export interface OrganizationOpRecord {
+  source_path: string;
+  destination_path: string;
+  file_hash: string;
+  file_size: number;
+  status: "completed" | "failed" | "undone";
+  error?: string | null;
+}
+
+export interface OrganizationTransaction {
+  transaction_id: string;
+  target_directory: string;
+  created_at: number;
+  status: "completed" | "partially_failed" | "undone";
+  operations: OrganizationOpRecord[];
+}
+
+export interface ActionItem {
+  text: string;
+  priority: "high" | "medium" | "normal";
+  line_number?: number | null;
+}
+
+export interface ExtractedDate {
+  raw_date: string;
+  context: string;
+}
+
+export interface DocumentSection {
+  heading: string;
+  content: string;
+}
+
+export interface DocumentMetadata {
+  file_name: string;
+  file_path: string;
+  format: string;
+  size_bytes: number;
+  page_count?: number | null;
+  word_count: number;
+  character_count: number;
+  is_local_only: boolean;
+}
+
+export interface DocumentAnalysisResult {
+  metadata: DocumentMetadata;
+  summary: string;
+  key_facts: string[];
+  action_items: ActionItem[];
+  extracted_dates: ExtractedDate[];
+  missing_or_ambiguous: string[];
+  sections: DocumentSection[];
+  privacy_disclosure: string;
+  raw_text: string;
+}
+
+export interface DocumentComparisonResult {
+  doc_a_path: string;
+  doc_b_path: string;
+  summary_differences: string;
+  common_topics: string[];
+  added_in_b: string[];
+  removed_from_a: string[];
+  action_items_comparison: string[];
+  markdown_report: string;
+}
+
+export interface VisualDefect {
+  defect_type: string;
+  description: string;
+  location?: string | null;
+  severity: string;
+}
+
+export interface VisualRegion {
+  name: string;
+  bounds?: string | null;
+  dom_ref?: string | null;
+  description: string;
+}
+
+export interface VisualDiscrepancy {
+  dom_reference?: string | null;
+  description: string;
+}
+
+export interface VisualAnalysisResult {
+  summary: string;
+  key_regions: VisualRegion[];
+  visible_defects: VisualDefect[];
+  discrepancies: VisualDiscrepancy[];
+  confidence: string;
+  supporting_evidence: string;
+  uncertainty: string;
+  analyzed_by_model?: string | null;
+  artifact_id?: string | null;
+  vision_supported: boolean;
+}
+
+export interface FileDiff {
+  file_path: string;
+  original_content?: string | null;
+  new_content: string;
+  additions: number;
+  deletions: number;
+  unified_diff: string;
+  risk_assessment: "low" | "medium" | "high";
+}
+
+export interface CodeCheckpoint {
+  checkpoint_id: string;
+  workspace_path: string;
+  description: string;
+  created_at: number;
+  pre_existing_dirty_files: string[];
+  modified_files: FileDiff[];
+  status: "active" | "rolled_back";
+}
+
+export interface RollbackResult {
+  checkpoint_id: string;
+  files_reverted: string[];
+  conflicts_detected: string[];
+  status: "success" | "partial" | "failed";
+}
+
+export interface BuildDoctorDiagnostic {
+  root_cause_error: string;
+  file?: string | null;
+  line_number?: number | null;
+  error_code?: string | null;
+  category: "syntax" | "type_error" | "missing_import" | "test_failure" | "dependency" | "runtime";
+  suggested_repair: string;
+  reproduced: boolean;
+}
+
+export interface VisualBaseline {
+  project_path: string;
+  route: string;
+  viewport: string;
+  base64_png: string;
+  created_at: number;
+  artifact_id?: string | null;
+}
+
+export interface VisualRegressionResult {
+  has_regression: boolean;
+  diff_percent: number;
+  route: string;
+  viewport: string;
+  description: string;
+  baseline_artifact?: string | null;
+  current_artifact?: string | null;
+}
+
+export interface SpecialistTask {
+  task_id: string;
+  role: "repository_investigator" | "implementation_engineer" | "test_regression_specialist" | "code_reviewer" | "documentation_reviewer";
+  objective: string;
+  dependencies: string[];
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  child_run_id?: string | null;
+  isolated_worktree_path?: string | null;
+  output?: string | null;
+  error?: string | null;
+  started_at?: number | null;
+  completed_at?: number | null;
+}
+
+export interface MultiAgentWorkspace {
+  workspace_id: string;
+  parent_run_id: string;
+  project_path: string;
+  tasks: SpecialistTask[];
+  status: "active" | "completed" | "reconciled" | "failed";
+}
+
+export interface ReconciliationOutcome {
+  workspace_id: string;
+  changes_detected: boolean;
+  modified_files: string[];
+  unified_diff: string;
+  conflicts_detected: string[];
+  can_safely_merge: boolean;
+  reconciliation_summary: string;
+}
+
+export interface RoutineParameter {
+  name: string;
+  label: string;
+  default_value: string;
+  is_secret: boolean;
+  description: string;
+}
+
+export interface RoutineStep {
+  id: string;
+  title: string;
+  action_type: "tool_call" | "prompt" | "skill";
+  tool_name?: string | null;
+  parameters: any;
+  expected_output?: string | null;
+  timeout_ms: number;
+  on_error: "stop" | "retry" | "continue";
+  requires_approval: boolean;
+}
+
+export interface ProjectCandidate {
+  name: string;
+  path: string;
+  kind: string;
+  manifest?: string | null;
+  lockfile?: string | null;
+  package_manager?: string | null;
+  is_git_repo: boolean;
+  scripts: string[];
+  name_matched: boolean;
+}
+
+export interface DiscoveryResult {
+  searched_root: string;
+  candidates: ProjectCandidate[];
+  exact_match?: ProjectCandidate | null;
+  error?: string | null;
+}
+
+export interface DevServerState {
+  id: string;
+  pid: number;
+  working_directory: string;
+  command: string;
+  status: "starting" | "ready" | "failed" | "stopped";
+  failure?: string | null;
+  error_message?: string | null;
+  exit_code?: number | null;
+  ready_url?: string | null;
+  port?: number | null;
+  framework?: string | null;
+  package_manager?: string | null;
+  started_at: number;
+  ready_at?: number | null;
+  run_id?: string | null;
+}
+
+export interface EditableRoutine {
+  version: "kyro.routine.v1";
+  id: string;
+  name: string;
+  description: string;
+  cron_expression?: string | null;
+  enabled: boolean;
+  parameters: RoutineParameter[];
+  steps: RoutineStep[];
+  created_at: number;
+  updated_at: number;
+  trusted: boolean;
+}
+
