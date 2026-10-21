@@ -131,24 +131,39 @@ fn test_google_adapter_tools_and_risk_boundaries() {
     assert!(tools.len() >= 7);
 
     // Read-only tools
-    let list_msgs = tools.iter().find(|t| t.name == "gmail_list_messages").unwrap();
+    let list_msgs = tools
+        .iter()
+        .find(|t| t.name == "gmail_list_messages")
+        .unwrap();
     assert!(list_msgs.is_read_only);
     assert_eq!(list_msgs.risk_level, RiskLevel::Safe);
 
-    let get_msg = tools.iter().find(|t| t.name == "gmail_get_message").unwrap();
+    let get_msg = tools
+        .iter()
+        .find(|t| t.name == "gmail_get_message")
+        .unwrap();
     assert!(get_msg.is_read_only);
     assert_eq!(get_msg.risk_level, RiskLevel::Safe);
 
-    let list_events = tools.iter().find(|t| t.name == "calendar_list_events").unwrap();
+    let list_events = tools
+        .iter()
+        .find(|t| t.name == "calendar_list_events")
+        .unwrap();
     assert!(list_events.is_read_only);
     assert_eq!(list_events.risk_level, RiskLevel::Safe);
 
-    let find_times = tools.iter().find(|t| t.name == "calendar_find_meeting_times").unwrap();
+    let find_times = tools
+        .iter()
+        .find(|t| t.name == "calendar_find_meeting_times")
+        .unwrap();
     assert!(find_times.is_read_only);
     assert_eq!(find_times.risk_level, RiskLevel::Safe);
 
     // Consequential / write tools
-    let create_draft = tools.iter().find(|t| t.name == "gmail_create_draft").unwrap();
+    let create_draft = tools
+        .iter()
+        .find(|t| t.name == "gmail_create_draft")
+        .unwrap();
     assert!(!create_draft.is_read_only);
     assert_eq!(create_draft.risk_level, RiskLevel::Moderate);
 
@@ -156,7 +171,10 @@ fn test_google_adapter_tools_and_risk_boundaries() {
     assert!(!send_email.is_read_only);
     assert_eq!(send_email.risk_level, RiskLevel::Destructive);
 
-    let create_event = tools.iter().find(|t| t.name == "calendar_create_event").unwrap();
+    let create_event = tools
+        .iter()
+        .find(|t| t.name == "calendar_create_event")
+        .unwrap();
     assert!(!create_event.is_read_only);
     assert_eq!(create_event.risk_level, RiskLevel::Moderate);
 }
@@ -181,9 +199,14 @@ fn test_file_assistant_study_notes_and_explanation() {
     let notes = FileAssistant::generate_study_notes(&doc, None).unwrap();
     assert_eq!(notes.doc_name, "syllabus.txt");
     assert!(!notes.revision_flashcards.is_empty());
-    assert!(notes.key_dates_and_milestones.iter().any(|d| d.contains("2026-12-18")));
+    assert!(notes
+        .key_dates_and_milestones
+        .iter()
+        .any(|d| d.contains("2026-12-18")));
 
-    let explanation = FileAssistant::explain_passage(&doc, "Grading Policy: 40% assignments, 60% exams.").unwrap();
+    let explanation =
+        FileAssistant::explain_passage(&doc, "Grading Policy: 40% assignments, 60% exams.")
+            .unwrap();
     assert!(explanation.contains("Plain Language Explanation"));
 
     fs::remove_dir_all(&dir).ok();
