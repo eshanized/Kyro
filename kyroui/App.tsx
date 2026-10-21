@@ -19,6 +19,10 @@ import { McpModal } from "./components/McpModal";
 import { ConnectionsModal } from "./components/ConnectionsModal";
 import { TimelineDrawer } from "./components/TimelineDrawer";
 import { ArtifactsModal } from "./components/ArtifactsModal";
+import { FileOrganizerModal } from "./components/FileOrganizerModal";
+import { DocumentAssistantModal } from "./components/DocumentAssistantModal";
+import { ScreenExplainerModal } from "./components/ScreenExplainerModal";
+import { DevWorkbenchModal } from "./components/DevWorkbenchModal";
 import { CommandPalette } from "./components/CommandPalette";
 import { InlineNotice } from "./components/InlineNotice";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
@@ -30,7 +34,8 @@ import {
   Plus,
   Settings,
   Terminal,
-  Monitor,
+  GitCommit,
+  Eye,
   Camera,
   Crop,
   StopCircle,
@@ -39,7 +44,6 @@ import {
   Users,
   Workflow,
   Server,
-  Globe,
   AlertTriangle,
   Play,
   Ghost,
@@ -61,6 +65,11 @@ import {
   Copy,
   Check,
   Trash2,
+  FolderTree,
+  FileText,
+  Sparkles,
+  Code2,
+  Stethoscope,
 } from "lucide-react";
 
 export const App: React.FC = () => {
@@ -75,6 +84,29 @@ export const App: React.FC = () => {
   const [sessionToDelete, setSessionToDelete] = useState<Conversation | null>(null);
   const [isDeletingSession, setIsDeletingSession] = useState(false);
   const [sessionDeleteError, setSessionDeleteError] = useState<string | null>(null);
+
+  // Experience Mode
+  const [experienceMode, setExperienceMode] = useState<"everyday" | "dev">(() => {
+    return (localStorage.getItem("kyro_experience_mode") as "everyday" | "dev") || "everyday";
+  });
+
+  const handleSetExperienceMode = (mode: "everyday" | "dev") => {
+    setExperienceMode(mode);
+    try {
+      localStorage.setItem("kyro_experience_mode", mode);
+    } catch {
+      // ignore
+    }
+  };
+
+  // Everyday & Dev Modals
+  const [isFileOrganizerOpen, setIsFileOrganizerOpen] = useState(false);
+  const [isDocumentAssistantOpen, setIsDocumentAssistantOpen] = useState(false);
+  const [isScreenExplainerOpen, setIsScreenExplainerOpen] = useState(false);
+  const [isDevWorkbenchOpen, setIsDevWorkbenchOpen] = useState(false);
+  const [devWorkbenchTab, setDevWorkbenchTab] = useState<
+    "projects" | "checkpoints" | "doctor" | "audit" | "workspace"
+  >("projects");
 
   // Modals & Drawers
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -327,7 +359,7 @@ export const App: React.FC = () => {
   const loadDefaultBot = async () => {
     try {
       const bots = await invoke<BotRecord[]>("list_bots");
-      if (bots.length > 0) {
+      if (Array.isArray(bots) && bots.length > 0) {
         setActiveBot(bots[0]);
       }
     } catch (e) {
@@ -338,14 +370,16 @@ export const App: React.FC = () => {
   const loadConversations = async () => {
     try {
       const list = await invoke<Conversation[]>("list_conversations");
-      setConversations(list);
-      const currentId = activeConvIdRef.current;
-      if (list.length === 0) {
-        setActiveConvId(null);
-        setMessages([]);
-        setLiveStepsByRun({});
-      } else if (!currentId || !list.some((c) => c.id === currentId)) {
-        setActiveConvId(list[0].id);
+      if (Array.isArray(list)) {
+        setConversations(list);
+        const currentId = activeConvIdRef.current;
+        if (list.length === 0) {
+          setActiveConvId(null);
+          setMessages([]);
+          setLiveStepsByRun({});
+        } else if (!currentId || !list.some((c) => c.id === currentId)) {
+          setActiveConvId(list[0].id);
+        }
       }
     } catch (err) {
       console.error("Failed to load conversations:", err);
@@ -747,10 +781,38 @@ export const App: React.FC = () => {
             </div>
           </div>
 
+          {/* Experience Mode Switcher */}
+          <div className="my-2 p-1 bg-[#141414] border border-neutral-800 rounded-xl grid grid-cols-2 gap-1 text-xs">
+            <button
+              onClick={() => handleSetExperienceMode("everyday")}
+              className={`py-1.5 px-2 rounded-lg font-medium flex items-center justify-center gap-1.5 transition ${
+                experienceMode === "everyday"
+                  ? "bg-neutral-800 text-neutral-100 shadow-sm"
+                  : "text-neutral-400 hover:text-neutral-200"
+              }`}
+              title="Kyro Everyday: Screen intelligence, file organizer, document review & automations"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+              <span>Everyday</span>
+            </button>
+            <button
+              onClick={() => handleSetExperienceMode("dev")}
+              className={`py-1.5 px-2 rounded-lg font-medium flex items-center justify-center gap-1.5 transition ${
+                experienceMode === "dev"
+                  ? "bg-purple-950/70 text-purple-200 border border-purple-800/60 shadow-sm"
+                  : "text-neutral-400 hover:text-neutral-200"
+              }`}
+              title="Kyro Dev: Autonomous developer agent, dev servers, diffs, checkpoints & visual regression"
+            >
+              <Code2 className="w-3.5 h-3.5 text-purple-400" />
+              <span>Dev Mode</span>
+            </button>
+          </div>
+
           {/* New Chat Button */}
           <button
             onClick={handleNewConversation}
-            className="my-3 w-full py-2 px-3 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 text-xs font-medium flex items-center justify-center gap-1.5 transition shadow-sm"
+            className="mb-3 w-full py-2 px-3 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 text-xs font-medium flex items-center justify-center gap-1.5 transition shadow-sm"
           >
             <Plus className="w-4 h-4" /> New Session
           </button>
@@ -796,36 +858,90 @@ export const App: React.FC = () => {
 
           {/* Navigation Tools */}
           <div className="space-y-1 mb-3">
-            <button
-              onClick={() => setIsConnectionsOpen(true)}
-              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/80 flex items-center gap-2 transition"
-            >
-              <Plug className="w-4 h-4 text-neutral-400" /> App Connections
-            </button>
-            <button
-              onClick={() => setIsArtifactsOpen(true)}
-              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-            >
-              <Layers className="w-4 h-4 text-neutral-400" /> Artifacts Registry
-            </button>
-            <button
-              onClick={() => handleOpenTeachTask("skills")}
-              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-            >
-              <Workflow className="w-4 h-4 text-neutral-400" /> Teach-a-Task & Routines
-            </button>
-            <button
-              onClick={() => setIsTeammatesOpen(true)}
-              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-            >
-              <Users className="w-4 h-4 text-neutral-400" /> Teammate Roster
-            </button>
-            <button
-              onClick={() => setIsMcpOpen(true)}
-              className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-            >
-              <Server className="w-4 h-4 text-neutral-400" /> MCP Tool Servers
-            </button>
+            {experienceMode === "everyday" ? (
+              <>
+                <button
+                  onClick={() => setIsScreenExplainerOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-amber-200 bg-amber-950/20 hover:bg-amber-950/40 border border-amber-800/40 flex items-center gap-2 transition"
+                >
+                  <Camera className="w-4 h-4 text-amber-400" /> Explain Screen
+                </button>
+                <button
+                  onClick={() => setIsFileOrganizerOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/60 flex items-center gap-2 transition"
+                >
+                  <FolderTree className="w-4 h-4 text-neutral-400" /> Organize Files
+                </button>
+                <button
+                  onClick={() => setIsDocumentAssistantOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/60 flex items-center gap-2 transition"
+                >
+                  <FileText className="w-4 h-4 text-neutral-400" /> Document Assistant
+                </button>
+                <button
+                  onClick={() => handleOpenTeachTask("routines")}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Workflow className="w-4 h-4 text-neutral-400" /> Automations & Routines
+                </button>
+                <button
+                  onClick={() => setIsArtifactsOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Layers className="w-4 h-4 text-neutral-400" /> Artifacts Registry
+                </button>
+                <button
+                  onClick={() => setIsConnectionsOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Plug className="w-4 h-4 text-neutral-400" /> App Connections
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => setIsDevWorkbenchOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-semibold text-purple-200 bg-purple-950/40 hover:bg-purple-950/60 border border-purple-800/70 flex items-center justify-between transition shadow-sm"
+                >
+                  <span className="flex items-center gap-2">
+                    <Code2 className="w-4 h-4 text-purple-400" /> Dev Workbench
+                  </span>
+                  <span className="text-[9px] font-mono uppercase bg-purple-900/60 px-1 py-0.5 rounded text-purple-300">
+                    Active
+                  </span>
+                </button>
+                <button
+                  onClick={() => setIsConnectionsOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/80 flex items-center gap-2 transition"
+                >
+                  <Plug className="w-4 h-4 text-neutral-400" /> App Connections
+                </button>
+                <button
+                  onClick={() => setIsArtifactsOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Layers className="w-4 h-4 text-neutral-400" /> Artifacts Registry
+                </button>
+                <button
+                  onClick={() => handleOpenTeachTask("skills")}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Workflow className="w-4 h-4 text-neutral-400" /> Teach-a-Task & Routines
+                </button>
+                <button
+                  onClick={() => setIsTeammatesOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Users className="w-4 h-4 text-neutral-400" /> Teammate Roster
+                </button>
+                <button
+                  onClick={() => setIsMcpOpen(true)}
+                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                >
+                  <Server className="w-4 h-4 text-neutral-400" /> MCP Tool Servers
+                </button>
+              </>
+            )}
           </div>
 
           {/* Conversations list */}
@@ -903,81 +1019,115 @@ export const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2">
+            {experienceMode === "everyday" ? (
+              <>
+                <button
+                  onClick={() => setIsScreenExplainerOpen(true)}
+                  className="px-3 py-1.5 bg-amber-950/30 hover:bg-amber-950/50 border border-amber-800/50 rounded-lg text-xs text-amber-200 flex items-center gap-1.5 transition font-medium"
+                  title="Explain My Screen"
+                >
+                  <Camera className="w-3.5 h-3.5 text-amber-400" /> Explain Screen
+                </button>
+                <button
+                  onClick={() => setIsFileOrganizerOpen(true)}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Organize Files"
+                >
+                  <FolderTree className="w-3.5 h-3.5 text-neutral-400" /> Organize
+                </button>
+                <button
+                  onClick={() => setIsDocumentAssistantOpen(true)}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Local Document Assistant"
+                >
+                  <FileText className="w-3.5 h-3.5 text-neutral-400" /> Documents
+                </button>
+                <button
+                  onClick={() => setIsTimelineOpen(true)}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Inspect step-by-step history"
+                >
+                  <History className="w-3.5 h-3.5 text-neutral-400" /> Timeline
+                </button>
+                <button
+                  onClick={handleCaptureScreen}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Capture display snapshot"
+                >
+                  <Camera className="w-3.5 h-3.5 text-neutral-400" /> Screen
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => setIsDevWorkbenchOpen(true)}
+                  className="px-3 py-1.5 bg-purple-950/50 hover:bg-purple-900/50 border border-purple-800/70 rounded-lg text-xs text-purple-200 flex items-center gap-1.5 transition font-medium shadow-sm"
+                  title="Open Developer Workbench (Projects, Dev Servers, Checkpoints, Build Doctor)"
+                >
+                  <Code2 className="w-3.5 h-3.5 text-purple-300" /> Workbench
+                </button>
+                <button
+                  onClick={handleToggleGhostMode}
+                  className={`px-3 py-1.5 border rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
+                    isGhostMode
+                      ? "bg-purple-950/40 text-purple-200 border-purple-700/60 shadow-sm"
+                      : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-400 border-neutral-800"
+                  }`}
+                  title="Runs actions inside isolated virtual display (:99). Your physical mouse & screen stay 100% free!"
+                >
+                  <Ghost
+                    className={`w-3.5 h-3.5 ${isGhostMode ? "text-purple-300 animate-pulse" : "text-neutral-400"}`}
+                  />
+                  {isGhostMode ? "Ghost (:99)" : "Ghost"}
+                </button>
+                <button
+                  onClick={handleCaptureGrounded}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Detect UI elements and render numbered markers [1], [2], [3] for zero-miss clicks"
+                >
+                  <Target className="w-3.5 h-3.5 text-neutral-400" /> Ground
+                </button>
+                <button
+                  onClick={() => setIsTimelineOpen(true)}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Inspect step-by-step before/after diffs with click target rings"
+                >
+                  <History className="w-3.5 h-3.5 text-neutral-400" /> Timeline
+                </button>
+                <button
+                  onClick={handleCaptureScreen}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Capture display snapshot"
+                >
+                  <Camera className="w-3.5 h-3.5 text-neutral-400" /> Screen
+                </button>
+                <button
+                  onClick={() => invoke("toggle_overlay_window", { show: true })}
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  title="Snip region of screen"
+                >
+                  <Crop className="w-3.5 h-3.5 text-neutral-400" /> Snip
+                </button>
+                <button
+                  onClick={() => setShowTerminal(!showTerminal)}
+                  className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition ${
+                    showTerminal
+                      ? "bg-neutral-800 text-neutral-100 border-neutral-700"
+                      : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-300 border-neutral-800"
+                  }`}
+                >
+                  <Terminal className="w-3.5 h-3.5 text-neutral-400" /> PTY
+                </button>
+              </>
+            )}
+
             {/* Quick Actions / Palette */}
             <button
               onClick={() => setIsCommandPaletteOpen(true)}
-              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+              className="px-2.5 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
               title="Global Command Palette (Ctrl+K)"
             >
-              <Command className="w-3.5 h-3.5 text-neutral-400" /> Palette
-            </button>
-
-            {/* Artifacts */}
-            <button
-              onClick={() => setIsArtifactsOpen(true)}
-              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
-              title="Artifacts Registry"
-            >
-              <Layers className="w-3.5 h-3.5 text-neutral-400" /> Artifacts
-            </button>
-
-            {/* Ghost Mode Toggle */}
-            <button
-              onClick={handleToggleGhostMode}
-              className={`px-3 py-1.5 border rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
-                isGhostMode
-                  ? "bg-purple-950/40 text-purple-200 border-purple-700/60 shadow-sm"
-                  : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-400 border-neutral-800"
-              }`}
-              title="Runs actions inside isolated virtual display (:99). Your physical mouse & screen stay 100% free!"
-            >
-              <Ghost
-                className={`w-3.5 h-3.5 ${isGhostMode ? "text-purple-300 animate-pulse" : "text-neutral-400"}`}
-              />
-              {isGhostMode ? "Ghost Mode: ON (:99)" : "Ghost Mode"}
-            </button>
-
-            {/* Set-of-Marks Grounding */}
-            <button
-              onClick={handleCaptureGrounded}
-              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
-              title="Detect UI elements and render numbered markers [1], [2], [3] for zero-miss clicks"
-            >
-              <Target className="w-3.5 h-3.5 text-neutral-400" /> Set-of-Marks
-            </button>
-
-            {/* Step Timeline */}
-            <button
-              onClick={() => setIsTimelineOpen(true)}
-              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
-              title="Inspect step-by-step before/after diffs with click target rings"
-            >
-              <History className="w-3.5 h-3.5 text-neutral-400" /> Timeline
-            </button>
-
-            <button
-              onClick={handleCaptureScreen}
-              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
-              title="Capture display snapshot"
-            >
-              <Camera className="w-3.5 h-3.5 text-neutral-400" /> Screen
-            </button>
-            <button
-              onClick={() => invoke("toggle_overlay_window", { show: true })}
-              className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
-              title="Snip region of screen"
-            >
-              <Crop className="w-3.5 h-3.5 text-neutral-400" /> Snip
-            </button>
-            <button
-              onClick={() => setShowTerminal(!showTerminal)}
-              className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition ${
-                showTerminal
-                  ? "bg-neutral-800 text-neutral-100 border-neutral-700"
-                  : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-300 border-neutral-800"
-              }`}
-            >
-              <Terminal className="w-3.5 h-3.5 text-neutral-400" /> PTY
+              <Command className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
@@ -1118,7 +1268,7 @@ export const App: React.FC = () => {
         {/* Message Thread & Live Steps */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
           {messages.length === 0 && liveSteps.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-4">
+            <div className="h-full flex flex-col items-center justify-center text-center max-w-lg mx-auto space-y-4">
               <div className="relative">
                 <div className="w-16 h-16 rounded-2xl bg-[#141414] border border-neutral-800 flex items-center justify-center p-3 shadow-lg">
                   <KyroLogo className="w-full h-full" />
@@ -1132,32 +1282,167 @@ export const App: React.FC = () => {
                   />
                 </div>
               </div>
-              <h2 className="text-lg font-semibold text-neutral-100">
-                Kyro Autonomous Workspace
-              </h2>
-              <p className="text-xs text-neutral-400 leading-relaxed">
-                Powered by <strong>NVIDIA Nemotron-3 Ultra 550B</strong> with native Computer Use, interactive terminal execution, local artifacts, and data sovereignty.
-              </p>
-              <div className="grid grid-cols-2 gap-2 text-left w-full pt-2">
-                <button
-                  onClick={() =>
-                    setPrompt("Open the browser and check the latest Hacker News stories")
-                  }
-                  className="p-2.5 rounded-xl bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 text-[11px] text-neutral-300 transition flex items-center gap-2"
-                >
-                  <Globe className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
-                  <span>"Open browser and check HN"</span>
-                </button>
-                <button
-                  onClick={() =>
-                    setPrompt("Capture the desktop and identify all open application windows")
-                  }
-                  className="p-2.5 rounded-xl bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 text-[11px] text-neutral-300 transition flex items-center gap-2"
-                >
-                  <Monitor className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
-                  <span>"Inspect all open windows"</span>
-                </button>
-              </div>
+
+              {experienceMode === "everyday" ? (
+                <>
+                  <div>
+                    <h2 className="text-lg font-semibold text-neutral-100">
+                      Kyro Everyday Assistant
+                    </h2>
+                    <p className="text-xs text-neutral-400 leading-relaxed mt-1">
+                      Understand screens, safely organize downloads, analyze documents, and automate repetitive tasks with zero developer jargon.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2.5 text-left w-full pt-1">
+                    <button
+                      onClick={() => setIsScreenExplainerOpen(true)}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-amber-800/40 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <Camera className="w-4 h-4 text-amber-400" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Explain Screen
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Diagnose visual errors, find buttons, and get grounded explanations.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => setIsFileOrganizerOpen(true)}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <FolderTree className="w-4 h-4 text-neutral-300" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Organize Files
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Categorize cluttered folders, find SHA-256 duplicates with safe undo.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => setIsDocumentAssistantOpen(true)}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <FileText className="w-4 h-4 text-neutral-300" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Document Assistant
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Parse text and PDFs locally. Extract key dates, actions & compare docs.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => handleOpenTeachTask("routines")}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <Workflow className="w-4 h-4 text-neutral-300" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Automate Routine
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Record and replay step-by-step browser & desktop automations.
+                      </p>
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    <h2 className="text-lg font-semibold text-neutral-100 flex items-center justify-center gap-2">
+                      <span>Kyro Autonomous Workspace</span>
+                      <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-purple-900/40 text-purple-300 border border-purple-800/60 font-semibold">
+                        DEV
+                      </span>
+                    </h2>
+                    <p className="text-xs text-neutral-400 leading-relaxed mt-1">
+                      Local-first developer agent with managed dev-servers, reversible checkpoints, Build Doctor diagnostics, and responsive visual regression.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2.5 text-left w-full pt-1">
+                    <button
+                      onClick={() => {
+                        setDevWorkbenchTab("projects");
+                        setIsDevWorkbenchOpen(true);
+                      }}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-purple-800/40 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <Server className="w-4 h-4 text-purple-400" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Dev Servers
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Discover local projects, start managed servers, and stream logs.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setDevWorkbenchTab("checkpoints");
+                        setIsDevWorkbenchOpen(true);
+                      }}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <GitCommit className="w-4 h-4 text-neutral-300" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Code Checkpoints
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Record Git-aware reversible snapshots with 1-click safe rollback.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setDevWorkbenchTab("doctor");
+                        setIsDevWorkbenchOpen(true);
+                      }}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <Stethoscope className="w-4 h-4 text-neutral-300" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Build Doctor
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Parse compiler errors (Rust, TS, Vitest) and get instant repair patches.
+                      </p>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setDevWorkbenchTab("audit");
+                        setIsDevWorkbenchOpen(true);
+                      }}
+                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <Eye className="w-4 h-4 text-neutral-300" />
+                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                          Visual Baselines
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-neutral-400 leading-snug">
+                        Audit routes across viewports and compare against visual baselines.
+                      </p>
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <>
@@ -1420,6 +1705,28 @@ export const App: React.FC = () => {
         isOpen={isArtifactsOpen}
         onClose={() => setIsArtifactsOpen(false)}
         conversationId={activeConvId || undefined}
+      />
+
+      <FileOrganizerModal
+        isOpen={isFileOrganizerOpen}
+        onClose={() => setIsFileOrganizerOpen(false)}
+      />
+
+      <DocumentAssistantModal
+        isOpen={isDocumentAssistantOpen}
+        onClose={() => setIsDocumentAssistantOpen(false)}
+      />
+
+      <ScreenExplainerModal
+        isOpen={isScreenExplainerOpen}
+        onClose={() => setIsScreenExplainerOpen(false)}
+        initialScreenshotBase64={screenPreview ? screenPreview.replace(/^data:image\/[a-z]+;base64,/, "") : null}
+      />
+
+      <DevWorkbenchModal
+        isOpen={isDevWorkbenchOpen}
+        onClose={() => setIsDevWorkbenchOpen(false)}
+        initialTab={devWorkbenchTab}
       />
 
       <CommandPalette
