@@ -166,7 +166,32 @@ For in-depth architectural specifications:
 
 ---
 
-## 📥 Prebuilt Linux Binaries
+## ⚡ Quick Install & Uninstall (via curl)
+
+Install the latest release of Kyro directly into `~/.local/bin` (no root required) or `/usr/local/bin` (if run as root):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/install.sh | bash
+```
+
+Custom installation directory (e.g. `/usr/local`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/install.sh | bash -s -- --prefix /usr/local
+```
+
+To uninstall Kyro anytime:
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/uninstall.sh | bash
+```
+
+To purge all local configuration, databases, and checkpoints upon uninstallation:
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/uninstall.sh | bash -s -- --purge
+```
+
+---
+
+## 📥 Prebuilt Linux Distribution Packages
 
 Prebuilt packages for every major Linux distribution family are published under each [GitHub Release](https://github.com/eshanized/Kyro/releases):
 
