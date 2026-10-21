@@ -48,6 +48,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Symlink Node.js to /usr/local/bin
+        run: sudo ln -sf $(which node) /usr/local/bin/node
+
       - name: Install Linux system dependencies
         run: |
           sudo apt-get update
