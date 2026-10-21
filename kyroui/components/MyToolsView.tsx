@@ -8,27 +8,17 @@ import {
   Globe,
   Plug,
   Search,
-  CheckCircle2,
-  AlertTriangle,
   FolderOpen,
   Plus,
   Trash2,
   Copy,
-  ArrowRight,
   RefreshCw,
   GitCompare,
-  Layers,
-  HelpCircle,
-  ExternalLink,
-  Shield,
-  FileCheck,
-  Send,
 } from "lucide-react";
 import {
   AuthorizedFolderRecord,
   DocumentSearchResult,
   DuplicateGroup,
-  SafeFileOpResult,
   StudyNotesResult,
 } from "../types/agent";
 
@@ -518,11 +508,19 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
       {activeCategory === "study" && (
         <div className="space-y-6">
           <div className="p-4 rounded-xl bg-[#121212] border border-neutral-800 space-y-4">
-            <div>
-              <h3 className="text-sm font-semibold text-neutral-200">Study Notes & Revision Flashcards</h3>
-              <p className="text-xs text-neutral-400">
-                Turn lengthy PDF documents, syllabus files, and articles into clear explanations, key dates, and question/answer study cards.
-              </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-neutral-200">Study Notes & Revision Flashcards</h3>
+                <p className="text-xs text-neutral-400">
+                  Turn lengthy PDF documents, syllabus files, and articles into clear explanations, key dates, and question/answer study cards.
+                </p>
+              </div>
+              <button
+                onClick={onOpenDocAssistant}
+                className="px-3 py-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 text-neutral-300 border border-neutral-700 text-xs flex items-center gap-1.5 transition shrink-0"
+              >
+                <FileText className="w-3.5 h-3.5" /> Full Assistant
+              </button>
             </div>
 
             <div className="flex items-center gap-2">
