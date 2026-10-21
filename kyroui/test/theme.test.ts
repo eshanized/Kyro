@@ -36,16 +36,16 @@ describe("Theme System & Token Consistency", () => {
     expect(cssContent).toMatch(/--code-bg:\s*#000000;/);
   });
 
-  it("loads and uses Geist Sans as primary typography", () => {
-    expect(cssContent).toContain('@import "@fontsource/geist-sans";');
+  it("loads and uses Roboto as primary typography", () => {
+    expect(cssContent).toContain('@import "@fontsource/roboto');
     expect(cssContent).toContain('@import "@fontsource/geist-mono";');
-    expect(cssContent).toMatch(/font-family:.*Geist Sans/);
+    expect(cssContent).toMatch(/font-family:.*Roboto/);
   });
 
-  it("configures Geist Sans and Geist Mono in tailwind configuration", () => {
+  it("configures Roboto and Geist Mono in tailwind configuration", () => {
     const tailwindPath = path.resolve(__dirname, "../../tailwind.config.js");
     const tailwindContent = fs.readFileSync(tailwindPath, "utf-8");
-    expect(tailwindContent).toContain('"Geist Sans"');
+    expect(tailwindContent).toContain('"Roboto"');
     expect(tailwindContent).toContain('"Geist Mono"');
     expect(tailwindContent).toContain("var(--background)");
     expect(tailwindContent).toContain("var(--foreground)");
