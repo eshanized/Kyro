@@ -166,7 +166,49 @@ For in-depth architectural specifications:
 
 ---
 
-## 🚀 Quick Start
+## ⚡ Quick Install & Uninstall (via curl)
+
+Install the latest release of Kyro directly into `~/.local/bin` (no root required) or `/usr/local/bin` (if run as root):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/install.sh | bash
+```
+
+Custom installation directory (e.g. `/usr/local`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/install.sh | bash -s -- --prefix /usr/local
+```
+
+To uninstall Kyro anytime:
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/uninstall.sh | bash
+```
+
+To purge all local configuration, databases, and checkpoints upon uninstallation:
+```bash
+curl -fsSL https://raw.githubusercontent.com/eshanized/Kyro/master/uninstall.sh | bash -s -- --purge
+```
+
+---
+
+## 📥 Prebuilt Linux Distribution Packages
+
+Prebuilt packages for every major Linux distribution family are published under each [GitHub Release](https://github.com/eshanized/Kyro/releases):
+
+| Distribution / Environment | Package Format | Quick Install Command |
+|:---|:---:|:---|
+| **Ubuntu, Debian, Pop!_OS, Linux Mint, Kali** | `.deb` | `sudo apt install ./Kyro_0.1.0_amd64.deb` |
+| **Fedora, RHEL, CentOS Stream, Rocky, Alma** | `.rpm` | `sudo dnf install ./Kyro-0.1.0-1.x86_64.rpm` |
+| **openSUSE (Leap / Tumbleweed)** | `.rpm` | `sudo zypper install ./Kyro-0.1.0-1.x86_64.rpm` |
+| **Arch Linux, Manjaro, EndeavourOS, SteamOS** | `.pkg.tar.zst` | `sudo pacman -U kyro-0.1.0-1-x86_64.pkg.tar.zst` |
+| **Universal Linux (Standalone / Zero Install)** | `.AppImage` | `chmod +x Kyro_0.1.0_amd64.AppImage && ./Kyro_0.1.0_amd64.AppImage` |
+| **Portable Linux Archive (Custom Prefix)** | `.tar.gz` | `tar -xzf kyro-0.1.0-linux-x86_64.tar.gz && ./kyro-0.1.0-linux-x86_64/install.sh` |
+
+Verify asset integrity with `sha256sum -c SHA256SUMS.txt`.
+
+---
+
+## 🚀 Building from Source
 
 ### 1. Prerequisites
 

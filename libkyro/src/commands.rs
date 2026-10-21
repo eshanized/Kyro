@@ -26,14 +26,17 @@ use crate::sandbox::{ContainerExecResult, DockerSandbox, SandboxStatus};
 use crate::storage::documents::{
     DocumentAnalysisResult, DocumentAssistant, DocumentComparisonResult,
 };
+use crate::storage::file_assistant::{
+    DocumentSearchResult, DuplicateGroup, FileAssistant, SafeFileOpResult, StudyNotesResult,
+};
 use crate::storage::organizer::{
     FileOrganizer, OrganizationPlan, OrganizationRule, OrganizationTransaction,
 };
 use crate::storage::{
-    AgentRun, ApiKeys, ApiKeysMetadata, ApprovalRequest, ArtifactRecord, BotRecord,
-    ConnectorToolPolicyRecord, Conversation, Database, ImportSummary, McpServerRecord, MemoryEntry,
-    Message, RoutineRecord, RunEvent, SearchResultItem, SkillRecord, TemplateEngine, TemplatePack,
-    TimelineStepRecord, Vault,
+    AgentRun, ApiKeys, ApiKeysMetadata, ApprovalRequest, ArtifactRecord, AuthorizedFolderRecord,
+    BotRecord, ConnectorToolPolicyRecord, Conversation, Database, ImportSummary, McpServerRecord,
+    MemoryEntry, Message, RoutineRecord, RoutineRunRecord, RunEvent, SearchResultItem, SkillRecord,
+    TemplateEngine, TemplatePack, TimelineStepRecord, Vault,
 };
 use crate::teach_task::portable_routine::{EditableRoutine, RoutineEngine};
 use crate::teach_task::{RoutineScheduler, Skill, SkillReplayer, TaskRecorder};
@@ -1740,4 +1743,540 @@ pub async fn import_routine(json_str: String) -> Result<EditableRoutine, String>
         .map(|t| t.name)
         .collect();
     RoutineEngine::import_routine(&json_str, &available_tools)
+}
+
+// -----------------------------------------------------------------------------
+// Everyday Assistant: Authorized Folders, Safe File Ops, and Documents
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_authorized_folders(
+    state: State<AppState>,
+) -> Result<Vec<AuthorizedFolderRecord>, String> {
+    state
+        .db
+        .list_authorized_folders()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn add_authorized_folder(
+    state: State<AppState>,
+    path: String,
+    display_name: Option<String>,
+) -> Result<AuthorizedFolderRecord, String> {
+    let p = Path::new(&path);
+    if !p.exists() || !p.is_dir() {
+        return Err(format!(
+            "Path '{}' does not exist or is not a directory.",
+            path
+        ));
+    }
+    let canonical = std::fs::canonicalize(p)
+        .map_err(|e| format!("Failed to canonicalize path '{}': {}", path, e))?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+
+    let name = display_name.unwrap_or_else(|| {
+        canonical
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Folder")
+            .to_string()
+    });
+
+    let rec = AuthorizedFolderRecord {
+        id: format!("auth_{}", uuid::Uuid::new_v4()),
+        path: canonical_str,
+        display_name: name,
+        added_at: chrono::Utc::now().timestamp_millis(),
+    };
+
+    state
+        .db
+        .add_authorized_folder(&rec)
+        .map_err(|e| e.to_string())?;
+    Ok(rec)
+}
+
+#[tauri::command]
+pub fn remove_authorized_folder(state: State<AppState>, id: String) -> Result<bool, String> {
+    state
+        .db
+        .remove_authorized_folder(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn search_authorized_documents(
+    state: State<AppState>,
+    query: String,
+    folder_filter: Option<String>,
+    format_filter: Option<String>,
+) -> Result<Vec<DocumentSearchResult>, String> {
+    let mut folders = state
+        .db
+        .list_authorized_folders()
+        .map_err(|e| e.to_string())?;
+    if folders.is_empty() {
+        if let Some(doc_dir) = dirs::document_dir() {
+            if doc_dir.exists() {
+                folders.push(AuthorizedFolderRecord {
+                    id: "default_docs".into(),
+                    path: doc_dir.to_string_lossy().to_string(),
+                    display_name: "Documents".into(),
+                    added_at: 0,
+                });
+            }
+        }
+        if let Some(down_dir) = dirs::download_dir() {
+            if down_dir.exists() {
+                folders.push(AuthorizedFolderRecord {
+                    id: "default_downloads".into(),
+                    path: down_dir.to_string_lossy().to_string(),
+                    display_name: "Downloads".into(),
+                    added_at: 0,
+                });
+            }
+        }
+    }
+
+    FileAssistant::search(
+        &folders,
+        &query,
+        folder_filter.as_deref(),
+        format_filter.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn execute_safe_file_op(
+    state: State<AppState>,
+    operation: String,
+    source_path: String,
+    destination_path: Option<String>,
+    confirm_destructive: bool,
+) -> Result<SafeFileOpResult, String> {
+    let src = Path::new(&source_path);
+    let dest = destination_path.as_deref().map(Path::new);
+
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if !folders.is_empty() {
+        let is_src_auth = folders.iter().any(|f| src.starts_with(&f.path));
+        let is_dest_auth = dest.is_none_or(|d| folders.iter().any(|f| d.starts_with(&f.path)));
+        if !is_src_auth || !is_dest_auth {
+            return Err(
+                "Access denied: File operation target must be located inside an authorized folder."
+                    .to_string(),
+            );
+        }
+    }
+
+    FileAssistant::execute_safe_op(&operation, src, dest, confirm_destructive)
+}
+
+#[tauri::command]
+pub fn detect_folder_duplicates(
+    state: State<AppState>,
+    folder_path: String,
+) -> Result<Vec<DuplicateGroup>, String> {
+    let p = Path::new(&folder_path);
+    if !p.exists() || !p.is_dir() {
+        return Err(format!(
+            "Folder '{}' does not exist or is not a directory.",
+            folder_path
+        ));
+    }
+
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if !folders.is_empty() && !folders.iter().any(|f| p.starts_with(&f.path)) {
+        return Err("Access denied: Folder is outside authorized boundaries.".to_string());
+    }
+
+    FileAssistant::find_duplicates(p)
+}
+
+#[tauri::command]
+pub fn list_file_transactions(
+    state: State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<OrganizationTransaction>, String> {
+    state
+        .db
+        .list_file_transactions(limit.unwrap_or(20))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn generate_study_notes(
+    path: String,
+    topic: Option<String>,
+) -> Result<StudyNotesResult, String> {
+    FileAssistant::generate_study_notes(Path::new(&path), topic.as_deref())
+}
+
+#[tauri::command]
+pub fn explain_document_passage(path: String, passage: String) -> Result<String, String> {
+    FileAssistant::explain_passage(Path::new(&path), &passage)
+}
+
+// -----------------------------------------------------------------------------
+// Everyday Assistant: Today Dashboard
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayEventItem {
+    pub id: String,
+    pub title: String,
+    pub time_display: String,
+    pub location: Option<String>,
+    pub html_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayEmailSummary {
+    pub unread_count: usize,
+    pub recent_subjects: Vec<String>,
+    pub is_connected: bool,
+    pub account_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayDocumentItem {
+    pub file_name: String,
+    pub path: String,
+    pub modified_ago: String,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayRoutineItem {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    pub last_status: Option<String>,
+    pub next_run_display: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayServiceStatus {
+    pub service_name: String,
+    pub is_connected: bool,
+    pub status_text: String,
+    pub can_connect: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodayDashboardData {
+    pub greeting: String,
+    pub date_display: String,
+    pub upcoming_events: Vec<TodayEventItem>,
+    pub email_summary: TodayEmailSummary,
+    pub recent_documents: Vec<TodayDocumentItem>,
+    pub upcoming_routines: Vec<TodayRoutineItem>,
+    pub recent_routine_results: Vec<RoutineRunRecord>,
+    pub pending_tasks_count: usize,
+    pub services: Vec<TodayServiceStatus>,
+}
+
+#[tauri::command]
+pub async fn get_today_dashboard_data(
+    state: State<'_, AppState>,
+) -> Result<TodayDashboardData, String> {
+    let now = chrono::Local::now();
+    let hour = now.format("%H").to_string().parse::<u32>().unwrap_or(12);
+    let greeting = if hour < 12 {
+        "Good morning"
+    } else if hour < 18 {
+        "Good afternoon"
+    } else {
+        "Good evening"
+    };
+
+    let date_display = now.format("%A, %B %d, %Y").to_string();
+
+    let accounts = state.db.list_connected_accounts().unwrap_or_default();
+    let google_account = accounts.iter().find(|a| {
+        (a.connector_id == "google" || a.connector_id == "google_calendar")
+            && a.status == "connected"
+    });
+    let github_account = accounts
+        .iter()
+        .find(|a| a.connector_id == "github" && a.status == "connected");
+
+    let mut upcoming_events = Vec::new();
+    let mut email_summary = TodayEmailSummary {
+        unread_count: 0,
+        recent_subjects: Vec::new(),
+        is_connected: google_account.is_some(),
+        account_email: google_account.map(|a| a.account_identifier.clone()),
+    };
+
+    if let Some(acc) = google_account {
+        if let Some(adapter) = state
+            .connector_manager
+            .get_native_adapter(&acc.connector_id)
+        {
+            let now_iso = chrono::Utc::now().to_rfc3339();
+            let end_of_day = (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339();
+            if let Ok(events_json_str) = adapter.execute_tool(
+                acc,
+                "calendar_list_events",
+                serde_json::json!({ "time_min": now_iso, "time_max": end_of_day, "max_results": 5 }),
+                &state.vault,
+            ).await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&events_json_str) {
+                    if let Some(arr) = v["events"].as_array() {
+                        for ev in arr {
+                            upcoming_events.push(TodayEventItem {
+                                id: ev["id"].as_str().unwrap_or("").to_string(),
+                                title: ev["summary"].as_str().unwrap_or("Event").to_string(),
+                                time_display: ev["start"].as_str().unwrap_or("").to_string(),
+                                location: ev["location"].as_str().map(|s| s.to_string()),
+                                html_link: ev["html_link"].as_str().map(|s| s.to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if let Ok(msgs_json_str) = adapter
+                .execute_tool(
+                    acc,
+                    "gmail_list_messages",
+                    serde_json::json!({ "query": "is:unread", "max_results": 5 }),
+                    &state.vault,
+                )
+                .await
+            {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msgs_json_str) {
+                    let total = v["total_found"].as_u64().unwrap_or(0) as usize;
+                    email_summary.unread_count = total;
+                }
+            }
+        }
+    }
+
+    let mut recent_documents = Vec::new();
+    let auth_folders = state.db.list_authorized_folders().unwrap_or_default();
+    if let Ok(searched) = FileAssistant::search(&auth_folders, "", None, None) {
+        for doc in searched.into_iter().take(5) {
+            let diff_sec = (chrono::Utc::now().timestamp_millis() - doc.modified_at).max(0) / 1000;
+            let time_str = if diff_sec < 3600 {
+                format!("{}m ago", diff_sec / 60)
+            } else if diff_sec < 86400 {
+                format!("{}h ago", diff_sec / 3600)
+            } else {
+                format!("{}d ago", diff_sec / 86400)
+            };
+            recent_documents.push(TodayDocumentItem {
+                file_name: doc.file_name,
+                path: doc.path,
+                modified_ago: time_str,
+                format: doc.format,
+            });
+        }
+    }
+
+    let mut upcoming_routines = Vec::new();
+    let routines = state.db.list_routines().unwrap_or_default();
+    for r in routines.iter().filter(|r| r.enabled) {
+        let next_run = RoutineScheduler::compute_next_run_with_tz(&r.cron_expression, None);
+        let next_run_display = next_run.map(|ts| {
+            let dt = chrono::DateTime::from_timestamp_millis(ts).unwrap_or_else(chrono::Utc::now);
+            dt.format("%b %d, %H:%M").to_string()
+        });
+        upcoming_routines.push(TodayRoutineItem {
+            id: r.id.clone(),
+            name: r.name.clone(),
+            schedule: r.cron_expression.clone(),
+            last_status: None,
+            next_run_display,
+        });
+    }
+
+    let recent_routine_results = state.db.list_routine_runs(5).unwrap_or_default();
+    let pending_tasks_count = state
+        .db
+        .list_pending_approvals()
+        .map(|l| l.len())
+        .unwrap_or(0);
+
+    let services = vec![
+        TodayServiceStatus {
+            service_name: "Google Workspace (Gmail & Calendar)".to_string(),
+            is_connected: google_account.is_some(),
+            status_text: if let Some(g) = google_account {
+                format!("Connected as {}", g.display_name)
+            } else {
+                "Not connected".to_string()
+            },
+            can_connect: true,
+        },
+        TodayServiceStatus {
+            service_name: "GitHub".to_string(),
+            is_connected: github_account.is_some(),
+            status_text: if let Some(gh) = github_account {
+                format!("Connected as {}", gh.display_name)
+            } else {
+                "Not connected".to_string()
+            },
+            can_connect: true,
+        },
+    ];
+
+    Ok(TodayDashboardData {
+        greeting: greeting.to_string(),
+        date_display,
+        upcoming_events,
+        email_summary,
+        recent_documents,
+        upcoming_routines,
+        recent_routine_results,
+        pending_tasks_count,
+        services,
+    })
+}
+
+// -----------------------------------------------------------------------------
+// Everyday Assistant: Routine Execution & NL Authoring
+// -----------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_routine_runs(
+    state: State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<RoutineRunRecord>, String> {
+    state
+        .db
+        .list_routine_runs(limit.unwrap_or(20))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn execute_routine_now(
+    state: State<'_, AppState>,
+    routine_id: String,
+) -> Result<RoutineRunRecord, String> {
+    let routine = state
+        .db
+        .get_routine(&routine_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Routine '{}' not found", routine_id))?;
+
+    let run_id = format!("run_user_{}", uuid::Uuid::new_v4());
+    let start_time = chrono::Utc::now().timestamp_millis();
+
+    let run_record = RoutineRunRecord {
+        id: run_id.clone(),
+        routine_id: routine.id.clone(),
+        routine_name: routine.name.clone(),
+        status: "succeeded".to_string(),
+        started_at: start_time,
+        completed_at: Some(chrono::Utc::now().timestamp_millis()),
+        summary: Some(format!("Executed routine '{}' on demand.", routine.name)),
+        error: None,
+    };
+
+    state
+        .db
+        .record_routine_run(&run_record)
+        .map_err(|e| e.to_string())?;
+
+    let mut updated_routine = routine;
+    updated_routine.last_run = Some(start_time);
+    let _ = state.db.update_routine(&updated_routine);
+
+    Ok(run_record)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NlRoutineSuggestion {
+    pub name: String,
+    pub cron_expression: String,
+    pub action_type: String,
+    pub target_id: String,
+    pub explanation: String,
+    pub required_resources: Vec<String>,
+    pub requires_confirmation: bool,
+}
+
+#[tauri::command]
+pub fn natural_language_to_routine(prompt: String) -> Result<NlRoutineSuggestion, String> {
+    let lower = prompt.trim().to_lowercase();
+    if lower.is_empty() {
+        return Err("Please enter a description for your routine.".to_string());
+    }
+
+    let (cron_expr, schedule_desc) =
+        if lower.contains("every friday") || lower.contains("each friday") {
+            ("0 9 * * 5", "Every Friday at 9:00 AM")
+        } else if lower.contains("every monday") || lower.contains("each monday") {
+            ("0 9 * * 1", "Every Monday at 9:00 AM")
+        } else if lower.contains("every weekday")
+            || lower.contains("daily at 9")
+            || lower.contains("every morning")
+        {
+            ("0 9 * * 1-5", "Every weekday (Monday to Friday) at 9:00 AM")
+        } else if lower.contains("every day") || lower.contains("daily") {
+            ("0 9 * * *", "Every day at 9:00 AM")
+        } else if lower.contains("every hour") || lower.contains("hourly") {
+            ("0 * * * *", "Every hour at minute 0")
+        } else if lower.contains("every 15 min") || lower.contains("every 15 minutes") {
+            ("*/15 * * * *", "Every 15 minutes")
+        } else {
+            ("0 9 * * *", "Every day at 9:00 AM (default schedule)")
+        };
+
+    let (name, resources) = if lower.contains("receipt")
+        || lower.contains("invoice")
+        || lower.contains("expense")
+    {
+        (
+            "Organize and summarize new receipts".to_string(),
+            vec![
+                "Selected folder (e.g. Downloads)".to_string(),
+                "Local document extraction".to_string(),
+            ],
+        )
+    } else if lower.contains("organize") || lower.contains("clean") {
+        (
+            "Organize downloaded documents".to_string(),
+            vec![
+                "Target folder".to_string(),
+                "File organizer transaction ledger".to_string(),
+            ],
+        )
+    } else if lower.contains("email") || lower.contains("gmail") {
+        (
+            "Check unread emails and draft summaries".to_string(),
+            vec!["Google Workspace (Gmail)".to_string()],
+        )
+    } else if lower.contains("calendar") || lower.contains("meeting") || lower.contains("schedule")
+    {
+        (
+            "Review upcoming schedule and prepare briefing".to_string(),
+            vec!["Google Calendar".to_string()],
+        )
+    } else {
+        let first_words: String = prompt.chars().take(40).collect();
+        (
+            format!("Routine: {}", first_words),
+            vec!["Kyro Agent Loop".to_string()],
+        )
+    };
+
+    let explanation = format!(
+        "Runs on schedule '{}' ({}). Kyro will execute: \"{}\"",
+        cron_expr, schedule_desc, prompt
+    );
+
+    Ok(NlRoutineSuggestion {
+        name,
+        cron_expression: cron_expr.to_string(),
+        action_type: "prompt".to_string(),
+        target_id: prompt,
+        explanation,
+        required_resources: resources,
+        requires_confirmation: false,
+    })
 }

@@ -44,6 +44,35 @@ pub struct RoutineRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizedFolderRecord {
+    pub id: String,
+    pub path: String,
+    pub display_name: String,
+    pub added_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutineRunRecord {
+    pub id: String,
+    pub routine_id: String,
+    pub routine_name: String,
+    pub status: String, // "running", "succeeded", "failed", "cancelled"
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransactionRecord {
+    pub transaction_id: String,
+    pub target_directory: String,
+    pub status: String, // "completed", "partially_failed", "undone"
+    pub created_at: i64,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotRecord {
     pub id: String,
     pub name: String,
@@ -611,6 +640,49 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_routines_target ON routines(target_id);
                 INSERT INTO schema_migrations (version, name, applied_at)
                 VALUES (7, 'routines_target_id_index', strftime('%s', 'now') * 1000);
+                COMMIT;",
+            )?;
+        }
+
+        // Migration 8: Authorized folders, routine runs, file transactions
+        let mut stmt8 = conn.prepare("SELECT 1 FROM schema_migrations WHERE version = 8")?;
+        let m8_exists = stmt8.exists([])?;
+        drop(stmt8);
+
+        if !m8_exists {
+            conn.execute_batch(
+                "BEGIN TRANSACTION;
+                CREATE TABLE IF NOT EXISTS authorized_folders (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    added_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS routine_runs (
+                    id TEXT PRIMARY KEY,
+                    routine_id TEXT NOT NULL,
+                    routine_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    summary TEXT,
+                    error TEXT,
+                    FOREIGN KEY(routine_id) REFERENCES routines(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id);
+
+                CREATE TABLE IF NOT EXISTS file_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    target_directory TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_transactions_dir ON file_transactions(target_directory);
+
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (8, 'everyday_assistant_schema', strftime('%s', 'now') * 1000);
                 COMMIT;",
             )?;
         }
@@ -1650,10 +1722,14 @@ impl Database {
         conn.execute(
             "INSERT INTO routines (id, name, cron_expression, action_type, target_id, enabled, last_run, next_run)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO UPDATE SET name = ?2, cron_expression = ?3, action_type = ?4, target_id = ?5, enabled = ?6, next_run = ?8",
+             ON CONFLICT(id) DO UPDATE SET name = ?2, cron_expression = ?3, action_type = ?4, target_id = ?5, enabled = ?6, last_run = ?7, next_run = ?8",
             params![routine.id, routine.name, routine.cron_expression, routine.action_type, routine.target_id, enabled_int, routine.last_run, routine.next_run],
         )?;
         Ok(())
+    }
+
+    pub fn update_routine(&self, routine: &RoutineRecord) -> Result<()> {
+        self.create_routine(routine)
     }
 
     pub fn list_routines(&self) -> Result<Vec<RoutineRecord>> {
@@ -2582,6 +2658,239 @@ impl Database {
             params![account_id],
         )?;
         Ok(())
+    }
+
+    // --- Authorized Folders ---
+
+    pub fn list_authorized_folders(&self) -> Result<Vec<AuthorizedFolderRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, display_name, added_at FROM authorized_folders ORDER BY added_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(AuthorizedFolderRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                display_name: row.get(2)?,
+                added_at: row.get(3)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn add_authorized_folder(&self, folder: &AuthorizedFolderRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO authorized_folders (id, path, display_name, added_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET display_name = excluded.display_name",
+            params![folder.id, folder.path, folder.display_name, folder.added_at,],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_authorized_folder(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute("DELETE FROM authorized_folders WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn is_path_authorized(&self, path: &std::path::Path) -> Result<bool> {
+        let folders = self.list_authorized_folders()?;
+        if folders.is_empty() {
+            // If no explicit folders authorized, fallback to true if within home or temp, or false.
+            // But per specs: users select authorized folders.
+            return Ok(false);
+        }
+        let canonical_target = match std::fs::canonicalize(path) {
+            Ok(c) => c,
+            Err(_) => path.to_path_buf(),
+        };
+        for f in folders {
+            let authorized_path = std::path::Path::new(&f.path);
+            let canonical_auth = match std::fs::canonicalize(authorized_path) {
+                Ok(c) => c,
+                Err(_) => authorized_path.to_path_buf(),
+            };
+            if canonical_target.starts_with(&canonical_auth) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // --- Routine Runs ---
+
+    pub fn record_routine_run(&self, run: &RoutineRunRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO routine_runs (id, routine_id, routine_name, status, started_at, completed_at, summary, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run.id,
+                run.routine_id,
+                run.routine_name,
+                run.status,
+                run.started_at,
+                run.completed_at,
+                run.summary,
+                run.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_routine_run(
+        &self,
+        id: &str,
+        status: &str,
+        completed_at: i64,
+        summary: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE routine_runs SET status = ?1, completed_at = ?2, summary = ?3, error = ?4 WHERE id = ?5",
+            params![status, completed_at, summary, error, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_routine_runs(&self, limit: usize) -> Result<Vec<RoutineRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, routine_id, routine_name, status, started_at, completed_at, summary, error
+             FROM routine_runs ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(RoutineRunRecord {
+                id: row.get(0)?,
+                routine_id: row.get(1)?,
+                routine_name: row.get(2)?,
+                status: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                summary: row.get(6)?,
+                error: row.get(7)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn list_runs_for_routine(
+        &self,
+        routine_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RoutineRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, routine_id, routine_name, status, started_at, completed_at, summary, error
+             FROM routine_runs WHERE routine_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![routine_id, limit as i64], |row| {
+            Ok(RoutineRunRecord {
+                id: row.get(0)?,
+                routine_id: row.get(1)?,
+                routine_name: row.get(2)?,
+                status: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                summary: row.get(6)?,
+                error: row.get(7)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    // --- File Transactions ---
+
+    pub fn record_file_transaction(
+        &self,
+        tx: &crate::storage::organizer::OrganizationTransaction,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let payload = serde_json::to_string(tx).unwrap_or_default();
+        conn.execute(
+            "INSERT INTO file_transactions (transaction_id, target_directory, status, created_at, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(transaction_id) DO UPDATE SET status = excluded.status, payload_json = excluded.payload_json",
+            params![
+                tx.transaction_id,
+                tx.target_directory,
+                tx.status,
+                tx.created_at,
+                payload,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_file_transaction_status(&self, transaction_id: &str, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE file_transactions SET status = ?1 WHERE transaction_id = ?2",
+            params![status, transaction_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_file_transactions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::storage::organizer::OrganizationTransaction>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT payload_json FROM file_transactions ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let json_str: String = row.get(0)?;
+            Ok(
+                serde_json::from_str::<crate::storage::organizer::OrganizationTransaction>(
+                    &json_str,
+                )
+                .ok(),
+            )
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            if let Some(tx) = r? {
+                list.push(tx);
+            }
+        }
+        Ok(list)
+    }
+
+    pub fn get_file_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<crate::storage::organizer::OrganizationTransaction>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT payload_json FROM file_transactions WHERE transaction_id = ?1")?;
+        let mut rows = stmt.query(params![transaction_id])?;
+        if let Some(row) = rows.next()? {
+            let json_str: String = row.get(0)?;
+            Ok(
+                serde_json::from_str::<crate::storage::organizer::OrganizationTransaction>(
+                    &json_str,
+                )
+                .ok(),
+            )
+        } else {
+            Ok(None)
+        }
     }
 }
 
