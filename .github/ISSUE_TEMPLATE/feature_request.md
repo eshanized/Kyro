@@ -2,7 +2,7 @@
 name: Feature Request
 about: Suggest an idea or capability enhancement for Kyro
 title: '[FEAT] '
-labels: ['enhancement']
+labels: ['type: feature', 'needs triage']
 assignees: ''
 ---
 

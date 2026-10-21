@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 GitHub Discussions
+    url: https://github.com/eshanized/Kyro/discussions
+    about: Ask questions, share ideas, showcase projects, and connect with the community.
+  - name: 🛡️ Security Vulnerability Report
+    url: https://github.com/eshanized/Kyro/security/policy
+    about: Privately disclose potential security vulnerabilities directly to maintainers.
+  - name: 📖 Architectural Documentation
+    url: https://github.com/eshanized/Kyro/tree/master/docs
+    about: Read deep-dive specifications, runtime diagrams, and connector documentation.

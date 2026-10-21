@@ -11,11 +11,13 @@
 
 <p align="center">
   <a href="https://github.com/eshanized/Kyro/actions/workflows/ci.yml"><img src="https://github.com/eshanized/Kyro/actions/workflows/ci.yml/badge.svg" alt="Continuous Integration" /></a>
+  <a href="https://github.com/eshanized/Kyro/discussions"><img src="https://img.shields.io/badge/Discussions-Join-purple?logo=github&logoColor=white" alt="GitHub Discussions" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
   <a href="https://tauri.app"><img src="https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white" alt="Tauri v2" /></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75+-DEA584?logo=rust&logoColor=white" alt="Rust 1.75+" /></a>
   <a href="https://react.dev"><img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black" alt="React 19" /></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white" alt="TypeScript 5.7" /></a>
+  <a href="#-zero-trust-security--privacy"><img src="https://img.shields.io/badge/Privacy-100%25%20Local--First-2ea44f?logo=sqlite&logoColor=white" alt="Local-First Privacy" /></a>
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
