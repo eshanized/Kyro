@@ -727,3 +727,132 @@ export interface EditableRoutine {
   trusted: boolean;
 }
 
+export interface AuthorizedFolderRecord {
+  id: string;
+  path: string;
+  display_name: string;
+  added_at: number;
+}
+
+export interface RoutineRunRecord {
+  id: string;
+  routine_id: string;
+  routine_name: string;
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  started_at: number;
+  completed_at?: number | null;
+  summary?: string | null;
+  error?: string | null;
+}
+
+export interface DocumentSearchResult {
+  path: string;
+  file_name: string;
+  format: string;
+  size_bytes: number;
+  modified_at: number;
+  matched_by: string;
+  snippet?: string | null;
+  relevance_score: number;
+}
+
+export interface DuplicateFileItem {
+  path: string;
+  size_bytes: number;
+  modified_at: number;
+  is_original: boolean;
+}
+
+export interface DuplicateGroup {
+  file_hash: string;
+  size_bytes: number;
+  files: DuplicateFileItem[];
+  evidence: string;
+}
+
+export interface SafeFileOpResult {
+  operation: string;
+  source_path: string;
+  destination_path?: string | null;
+  success: boolean;
+  requires_confirmation: boolean;
+  message: string;
+  undoable: boolean;
+}
+
+export interface RevisionFlashcard {
+  question: string;
+  answer: string;
+}
+
+export interface StudyNotesResult {
+  doc_name: string;
+  doc_path: string;
+  format: string;
+  overview: string;
+  core_concepts: string[];
+  key_dates_and_milestones: string[];
+  summary_points: string[];
+  revision_flashcards: RevisionFlashcard[];
+}
+
+export interface TodayEventItem {
+  id: string;
+  title: string;
+  time_display: string;
+  location?: string | null;
+  html_link?: string | null;
+}
+
+export interface TodayEmailSummary {
+  unread_count: number;
+  recent_subjects: string[];
+  is_connected: boolean;
+  account_email?: string | null;
+}
+
+export interface TodayDocumentItem {
+  file_name: string;
+  path: string;
+  modified_ago: string;
+  format: string;
+}
+
+export interface TodayRoutineItem {
+  id: string;
+  name: string;
+  schedule: string;
+  last_status?: string | null;
+  next_run_display?: string | null;
+}
+
+export interface TodayServiceStatus {
+  service_name: string;
+  is_connected: boolean;
+  status_text: string;
+  can_connect: boolean;
+}
+
+export interface TodayDashboardData {
+  greeting: string;
+  date_display: string;
+  upcoming_events: TodayEventItem[];
+  email_summary: TodayEmailSummary;
+  recent_documents: TodayDocumentItem[];
+  upcoming_routines: TodayRoutineItem[];
+  recent_routine_results: RoutineRunRecord[];
+  pending_tasks_count: number;
+  services: TodayServiceStatus[];
+}
+
+export interface NlRoutineSuggestion {
+  name: string;
+  cron_expression: string;
+  action_type: string;
+  target_id: string;
+  explanation: string;
+  required_resources: string[];
+  requires_confirmation: boolean;
+}
+
+

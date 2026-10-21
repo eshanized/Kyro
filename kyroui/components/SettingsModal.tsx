@@ -10,6 +10,7 @@ import {
   ImportSummary,
   BrowserCapabilities,
   BrowserSettings,
+  AuthorizedFolderRecord,
 } from "../types/agent";
 import {
   Key,
@@ -26,6 +27,7 @@ import {
   FileCode,
   Globe,
   RefreshCw,
+  FolderLock,
 } from "lucide-react";
 import { KyroLogo } from "./Logo";
 import { InlineNotice } from "./InlineNotice";
@@ -53,8 +55,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [secretPendingDeletion, setSecretPendingDeletion] = useState<string | null>(null);
   const [isDeletingSecret, setIsDeletingSecret] = useState(false);
   const [activeTab, setActiveTab] = useState<
-    "model" | "governance" | "browser" | "telegram" | "sandbox" | "templates" | "diagnostics"
+    "model" | "privacy" | "governance" | "browser" | "telegram" | "sandbox" | "templates" | "diagnostics"
   >("model");
+  const [authorizedFolders, setAuthorizedFolders] = useState<AuthorizedFolderRecord[]>([]);
+  const [newFolderPath, setNewFolderPath] = useState("");
+  const [newFolderLabel, setNewFolderLabel] = useState("");
   const [browserCapabilities, setBrowserCapabilities] = useState<BrowserCapabilities | null>(null);
   const [browserSettings, setBrowserSettings] = useState<BrowserSettings>({
     selected_browser: "auto",
@@ -87,13 +92,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      if (initialTab && ["model", "governance", "browser", "telegram", "sandbox", "templates", "diagnostics"].includes(initialTab)) {
+      if (initialTab && ["model", "privacy", "governance", "browser", "telegram", "sandbox", "templates", "diagnostics"].includes(initialTab)) {
         setActiveTab(initialTab as any);
       }
       loadSettings();
       loadHealthAndTemplates();
     }
   }, [isOpen, initialTab]);
+
+  const loadAuthorizedFolders = async () => {
+    try {
+      const folders = await invoke<AuthorizedFolderRecord[]>("list_authorized_folders");
+      setAuthorizedFolders(folders);
+    } catch (err) {
+      console.error("Failed to load authorized folders:", err);
+    }
+  };
+
+  const handleAddFolder = async () => {
+    if (!newFolderPath.trim()) return;
+    try {
+      await invoke("add_authorized_folder", {
+        path: newFolderPath.trim(),
+        label: newFolderLabel.trim() || null,
+      });
+      setNewFolderPath("");
+      setNewFolderLabel("");
+      await loadAuthorizedFolders();
+      setNotice({ tone: "success", message: "Authorized folder added successfully." });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to authorize folder: " + err });
+    }
+  };
+
+  const handleRemoveFolder = async (path: string) => {
+    try {
+      await invoke("remove_authorized_folder", { path });
+      await loadAuthorizedFolders();
+      setNotice({ tone: "info", message: `Folder authorization removed for ${path}.` });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to remove folder: " + err });
+    }
+  };
 
   const loadSettings = async () => {
     try {
@@ -105,6 +145,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       const sb = await invoke<SandboxStatus>("get_sandbox_status");
       setSandbox(sb);
       await loadBrowserInfo();
+      await loadAuthorizedFolders();
     } catch (err) {
       console.error("Failed to load settings:", err);
     }
@@ -284,6 +325,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <Key className="w-3.5 h-3.5" /> Model & Credentials
           </button>
           <button
+            onClick={() => setActiveTab("privacy")}
+            className={`py-3 px-3 border-b-2 flex items-center gap-1.5 transition whitespace-nowrap ${
+              activeTab === "privacy"
+                ? "border-neutral-200 text-neutral-100 font-medium"
+                : "border-transparent text-neutral-400 hover:text-neutral-200"
+            }`}
+          >
+            <FolderLock className="w-3.5 h-3.5" /> Privacy & Folders
+          </button>
+          <button
             onClick={() => setActiveTab("governance")}
             className={`py-3 px-3 border-b-2 flex items-center gap-1.5 transition whitespace-nowrap ${
               activeTab === "governance"
@@ -407,6 +458,105 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </button>
                   )}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: PRIVACY & AUTHORIZED FOLDERS */}
+          {activeTab === "privacy" && (
+            <div className="space-y-5">
+              <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed">
+                <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
+                  <Shield className="w-4 h-4 text-amber-400" /> Local-First Architecture & Data Isolation
+                </div>
+                Kyro processes your documents and tasks locally on this computer. Your personal files never leave this machine without your explicit authorization. SQLite database and all credentials stay stored on this device.
+              </div>
+
+              {/* Authorized Folders */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-xs font-semibold text-neutral-100">Authorized Folders</h3>
+                    <p className="text-[11px] text-neutral-400">
+                      Kyro can only search, analyze, and organize files inside these explicitly authorized directories.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="p-3.5 bg-[#141414] border border-neutral-800 rounded-xl space-y-3">
+                  <div className="text-xs font-medium text-neutral-200">Authorize a New Folder</div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    <input
+                      type="text"
+                      placeholder="Folder path (e.g. /home/user/Documents)"
+                      value={newFolderPath}
+                      onChange={(e) => setNewFolderPath(e.target.value)}
+                      className="md:col-span-2 px-3 py-2 bg-[#000000] border border-neutral-800 rounded-lg text-xs text-neutral-100 placeholder:text-neutral-600 focus:outline-none focus:border-neutral-600 font-mono"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Label (optional, e.g. College Work)"
+                      value={newFolderLabel}
+                      onChange={(e) => setNewFolderLabel(e.target.value)}
+                      className="px-3 py-2 bg-[#000000] border border-neutral-800 rounded-lg text-xs text-neutral-100 placeholder:text-neutral-600 focus:outline-none focus:border-neutral-600"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between pt-1">
+                    <div className="text-[11px] text-neutral-400">
+                      Kyro will be granted access to read and safely index documents inside this folder.
+                    </div>
+                    <button
+                      onClick={handleAddFolder}
+                      disabled={!newFolderPath.trim()}
+                      className="px-3.5 py-1.5 bg-neutral-200 hover:bg-white text-neutral-950 font-medium rounded-lg text-xs transition disabled:opacity-40"
+                    >
+                      Authorize Folder
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {authorizedFolders.length === 0 ? (
+                    <div className="p-4 bg-[#141414] border border-neutral-800 rounded-xl text-center text-xs text-neutral-500">
+                      No folders authorized yet. Add a folder above to enable natural-language document search and assistance.
+                    </div>
+                  ) : (
+                    authorizedFolders.map((folder) => (
+                      <div
+                        key={folder.id}
+                        className="p-3 bg-[#141414] border border-neutral-800 rounded-xl flex items-center justify-between text-xs"
+                      >
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-neutral-200">
+                              {folder.display_name || folder.path.split("/").filter(Boolean).pop() || "Folder"}
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-neutral-800 text-neutral-200 border border-neutral-700">
+                              Authorized
+                            </span>
+                          </div>
+                          <div className="font-mono text-[11px] text-neutral-400">{folder.path}</div>
+                        </div>
+                        <button
+                          onClick={() => handleRemoveFolder(folder.path)}
+                          className="p-1.5 text-neutral-400 hover:text-red-400 rounded-lg hover:bg-neutral-800 transition"
+                          title="Revoke Folder Authorization"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Local Retention Policy */}
+              <div className="p-4 bg-[#141414] border border-neutral-800 rounded-xl space-y-2">
+                <div className="text-xs font-semibold text-neutral-200">Local Retention Policy</div>
+                <p className="text-xs text-neutral-400 leading-relaxed">
+                  Routine runs, task execution logs, and file operation transaction logs are stored inside your local SQLite database
+                  in your user app data directory. Kyro does not transmit audit logs to any central telemetry server.
+                </p>
               </div>
             </div>
           )}
