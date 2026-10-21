@@ -53,10 +53,14 @@ graph TD
 ## 2. Component Inventory
 
 ### 2.1 Frontend Modules (`kyroui/`)
-- `App.tsx`: Main workspace view displaying conversation threads, live step timeline, tool execution cards, screen preview, model status, voice dictation, file attachments, and prompt dispatch.
+- `App.tsx`: Main workspace view displaying dual-mode experiences (Everyday vs Dev), conversation threads, live step timeline, tool execution cards, screen preview, model status, voice dictation, file attachments, and prompt dispatch.
 - `hud/HudPanel.tsx`: Compact floating HUD window (`label: hud`) for autonomous task execution and quick snipping.
 - `hud/Snipper.tsx`: Interactive screenshot region selector for visual grounding.
 - `components/CommandPalette.tsx`: Global instant command palette (`Ctrl+K`) with multi-category universal search across conversations, messages, memories, skills, routines, and artifacts.
+- `components/FileOrganizerModal.tsx`: Safe reversible file organizer UI with extension categorization, SHA-256 duplicate detection, operation plan preview, and one-click rollback.
+- `components/DocumentAssistantModal.tsx`: Local-first document assistant with plain-text and PDF parser, date/action item extraction, side-by-side document diff comparison, and privacy disclosure.
+- `components/ScreenExplainerModal.tsx`: Multimodal visual explainer modal with screenshot capture, structured facts vs inferred causes breakdown, and 1-click grounded action triggering.
+- `components/DevWorkbenchModal.tsx`: Developer Workbench with 5 specialist tabs: Projects & Dev Servers, Code Checkpoints & Diffs, Build Doctor diagnostics, UI Audit & Visual Baselines, and Multi-Agent Workspace with isolated Git worktrees.
 - `components/ArtifactsModal.tsx`: Local artifact registry drawer for previewing code, markdown, logs, json, and exporting generated files.
 - `components/SettingsModal.tsx`: Configuration for NVIDIA API keys, Telegram credentials, governance matrix policy, model selections, extensible template packs, and system diagnostics.
 - `components/ConnectionsModal.tsx`: Connections and app integrations modal: Discover Catalog, Connected Accounts, Custom Local MCP, and per-action governance policy manager.
@@ -68,11 +72,12 @@ graph TD
 - `types/agent.ts`: Type definitions for domain entities, IPC payloads, and events.
 
 ### 2.2 Backend Modules (`libkyro/src/`)
-- `main.rs`: Application entry point, config directory resolution, subsystem initialization, and Tauri command registration.
-- `commands.rs`: Typed Tauri IPC command handlers (50+ commands covering execution, governance, memory, artifacts, search, and diagnostics).
+- `main.rs`: Application entry point, config directory resolution, subsystem initialization, and Tauri command registration (69 registered commands).
+- `commands.rs`: Typed Tauri IPC command handlers covering execution, governance, memory, artifacts, search, diagnostics, file organization, document analysis, vision explanation, code checkpoints, build doctor, visual baselines, and multi-agent workspace.
 - `agent/`:
   - `loop_engine.rs`: Multi-step agent execution loop, tool definitions, tool dispatch, step events, per-run cancellation, artifact generation.
-  - `router.rs`: Model client for NVIDIA NIM / OpenAI-compatible endpoints with multimodal content parts and exponential backoff retry.
+  - `router.rs`: Model client for NVIDIA NIM / OpenAI-compatible endpoints with capability registry, MIME/dimension validation, multimodal content parts, and exponential backoff retry.
+  - `vision.rs`: Multimodal screenshot and visual defect analyzer with primary and fallback vision model resolution.
   - `cancellation.rs`: Scoped cancellation tokens with child run propagation.
 - `governance/`:
   - `auth.rs`: Centralized `AuthorizationEngine` evaluating shell modes, computer use modes, blocked domains, path boundaries, credential checkpoints, and approval queues.
@@ -92,31 +97,30 @@ graph TD
 - `storage/`:
   - `db.rs`: SQLite database connection management, migrations (v1-v5), queries for conversations, messages, skills, routines, bots, MCP servers, runs, events, memories, timeline steps, artifacts, connector definitions, connected accounts, and connector tool policies.
   - `vault.rs`: Credential and API key management via OS Keyring and authenticated AES-256-GCM encrypted database fallback, with namespaced connector account secrets.
+  - `organizer.rs`: Safe file organizer engine with extension rules, SHA-256 duplicate detection, destination collision handling, path containment verification, and manifest-backed reversible rollback.
+  - `documents.rs`: Local document assistant engine for plain-text and PDF parsing, FlateDecode decompression, Tj/TJ text operator extraction, deterministic date & action item parsing, and document diffing.
   - `templates.rs`: Extensible template packs, schema versioning, secret sanitization, and pre-packaged starters.
-- `connector/`:
-  - `catalog.rs`: Built-in catalog specifications for Native APIs and MCP connectors.
-  - `auth.rs`: PKCE OAuth state generation, cryptographic verification, and local callback listener.
-  - `manager.rs`: Centralized connector runtime orchestrating native adapters, remote MCP clients, local MCP servers, and tool execution.
-  - `remote_mcp.rs`: Remote MCP client over HTTP JSON-RPC 2.0.
-  - `native/`: Native API adapters (including `GitHubAdapter` with 11 tools).
-- `mcp/`:
-  - `client.rs`: Stdio JSON-RPC transport for Model Context Protocol servers.
-  - `manager.rs`: Server lifecycle, discovery, schema validation, and tool execution.
+- `project/`:
+  - `discovery.rs`: Dynamic project root resolution, candidate ranking, bounded search traversal, exclusion filters (`node_modules`, `.git`, `dist`, `build`, etc.), OS Desktop path resolution via `dirs::desktop_dir()`.
+  - `devserver.rs`: Development server process lifecycle, ready line detection, port extraction, framework recognition.
+  - `checkpoint.rs`: Git-aware reversible code checkpoints, uncommitted modification preservation, unified diff calculation, and conflict-checked safe rollback.
+  - `doctor`: Automated Build Doctor parsing compiler errors (Rust `error[E...]`, TypeScript `error TS...`, Vitest test failures) and generating repair patches.
+- `audit/`:
+  - `workflow.rs`: Autonomous UI audit orchestrator: plan generation, server boot, multi-viewport responsive checks, route discovery, interaction exploration, finding aggregation, markdown report synthesis.
+  - `regression.rs`: Visual regression baseline engine with persistent baseline registry in `~/.config/kyro/baselines/` and diff percentage calculations.
+  - `routes.rs`: Static file and router config route extraction.
+  - `findings.rs`: Categorized finding models (Bug, Accessibility, DesignInconsistency, Performance, Warning) and deduplication.
+  - `report.rs`: Markdown report generator with summary metrics and reproducible evidence attachments.
+- `multibot/`:
+  - `bot.rs`: Bot profile definitions.
+  - `group.rs`: Mention parsing and group system prompt generation.
+  - `workspace.rs`: Multi-agent developer workspace with 5 specialist roles (`RepositoryInvestigator`, `ImplementationEngineer`, `TestRegressionSpecialist`, `CodeReviewer`, `DocumentationReviewer`), task dependency graph, isolated Git worktrees, and reviewed reconciliation.
 - `teach_task/`:
   - `recorder.rs`: Task recording session manager with credential sanitization.
   - `replay.rs`: Deterministic workflow replayer with step progress reporting.
   - `scheduler.rs`: Routine background worker for cron/periodic execution.
   - `self_healing.rs`: Parameter substitution and coordinate recalibration.
-- `timeline/`:
-  - `diff.rs`: Frame-to-frame pixel diff calculation, click marker annotation, and step tracking.
-- `memory/`:
-  - `indexer.rs`: Installed desktop application indexer (`.desktop` parsing).
-  - `store.rs`: Scoped context block builder (preferences, agent facts, project memory) and relevance retrieval.
-- `multibot/`:
-  - `bot.rs`: Bot profile definitions.
-  - `group.rs`: Mention parsing and group system prompt generation.
-- `telegram/`:
-  - `bridge.rs`: Long-polling worker for Telegram bot command and notification exchange.
+  - `portable_routine.rs`: Portable routine serialization format `kyro.routine.v1` with secret redaction on export and untrusted capability validation on import.
 - `sandbox/`:
   - `docker.rs`: Container isolation detection and CLI execution.
 - `browser/`:
