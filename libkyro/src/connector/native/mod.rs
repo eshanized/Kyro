@@ -1,4 +1,5 @@
 pub mod github;
+pub mod google;
 
 use crate::connector::ConnectorToolDefinition;
 use crate::storage::{ConnectedAccountRecord, Vault};

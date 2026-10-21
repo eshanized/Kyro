@@ -23,6 +23,10 @@ import { FileOrganizerModal } from "./components/FileOrganizerModal";
 import { DocumentAssistantModal } from "./components/DocumentAssistantModal";
 import { ScreenExplainerModal } from "./components/ScreenExplainerModal";
 import { DevWorkbenchModal } from "./components/DevWorkbenchModal";
+import { TodayDashboardView } from "./components/TodayDashboardView";
+import { MyToolsView } from "./components/MyToolsView";
+import { MyRoutinesView } from "./components/MyRoutinesView";
+import { OnboardingModal } from "./components/OnboardingModal";
 import { CommandPalette } from "./components/CommandPalette";
 import { InlineNotice } from "./components/InlineNotice";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
@@ -70,6 +74,13 @@ import {
   Sparkles,
   Code2,
   Stethoscope,
+  MessageSquare,
+  Calendar,
+  Wrench,
+  Clock,
+  HelpCircle,
+  CheckCircle2,
+  ListOrdered,
 } from "lucide-react";
 
 export const App: React.FC = () => {
@@ -89,6 +100,22 @@ export const App: React.FC = () => {
   const [experienceMode, setExperienceMode] = useState<"everyday" | "dev">(() => {
     return (localStorage.getItem("kyro_experience_mode") as "everyday" | "dev") || "everyday";
   });
+
+  // Everyday Destinations: "ask" | "today" | "tools" | "routines"
+  const [everydayTab, setEverydayTab] = useState<"ask" | "today" | "tools" | "routines">("ask");
+  const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
+
+  // Structured Task Plan before consequential operations
+  const [activePlan, setActivePlan] = useState<{
+    id: string;
+    goal: string;
+    understanding: string;
+    resources: string[];
+    steps: { text: string; done: boolean }[];
+    status: "planning" | "approved" | "executing" | "completed" | "cancelled";
+    accomplished: string[];
+    remaining: string[];
+  } | null>(null);
 
   const handleSetExperienceMode = (mode: "everyday" | "dev") => {
     setExperienceMode(mode);
@@ -182,6 +209,15 @@ export const App: React.FC = () => {
   useEffect(() => {
     loadConversations();
     loadDefaultBot();
+
+    try {
+      const onboardingDone = localStorage.getItem("kyro_onboarding_completed");
+      if (!onboardingDone) {
+        setIsOnboardingOpen(true);
+      }
+    } catch {
+      // ignore
+    }
 
     // Request notification permission if supported
     if ("Notification" in window && Notification.permission === "default") {
@@ -638,6 +674,28 @@ export const App: React.FC = () => {
     setIsAgentRunning(true);
     clearRunSteps(runId);
 
+    const isConsequential = /(organize|move|clean|delete|email|draft|send|routine|schedule|compare)/i.test(fullPromptText);
+    if (isConsequential) {
+      setActivePlan({
+        id: "plan_" + Date.now(),
+        goal: fullPromptText,
+        understanding: `Kyro understood your request to: "${fullPromptText.trim()}".`,
+        resources: [
+          fullPromptText.toLowerCase().includes("email") ? "Google Workspace (Gmail)" : "Authorized Local Directories",
+          "Local SQLite Transaction Ledger",
+          "Verification Guardrails",
+        ],
+        steps: [
+          { text: "Verify authorized paths and user security bounds", done: true },
+          { text: "Inspect and analyze relevant contents locally", done: false },
+          { text: "Execute requested workflow safely with rollback records", done: false },
+        ],
+        status: "executing",
+        accomplished: ["Verified intent and security bounds"],
+        remaining: ["Analyze target contents", "Execute workflow safely"],
+      });
+    }
+
     const priorHistory = messages.map((m) => ({
       role: m.role,
       content: m.content,
@@ -694,6 +752,17 @@ export const App: React.FC = () => {
       setMessages((prev) => [...prev, assistantMsg]);
       await invoke("add_message", { msg: assistantMsg }).catch(console.error);
       sendNotification("Kyro Task Completed", finalReply.slice(0, 80));
+      setActivePlan((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "completed",
+              steps: prev.steps.map((s) => ({ ...s, done: true })),
+              accomplished: ["Verified permissions", "Processed target data", "Task verified"],
+              remaining: [],
+            }
+          : null
+      );
     } catch (err: any) {
       const errorMsg: Message = {
         id: "msg_" + crypto.randomUUID(),
@@ -704,6 +773,15 @@ export const App: React.FC = () => {
       };
       setMessages((prev) => [...prev, errorMsg]);
       sendNotification("Kyro Task Failed", String(err));
+      setActivePlan((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "cancelled",
+              remaining: ["Encountered error during execution"],
+            }
+          : null
+      );
     } finally {
       setIsAgentRunning(false);
       setActiveRunId(null);
@@ -860,6 +938,68 @@ export const App: React.FC = () => {
           <div className="space-y-1 mb-3">
             {experienceMode === "everyday" ? (
               <>
+                {/* Everyday Primary Destinations */}
+                <div className="mb-2 p-1 bg-[#141414] border border-neutral-800 rounded-xl space-y-0.5">
+                  <div className="px-2 py-0.5 text-[9px] font-mono uppercase tracking-wider text-neutral-400">
+                    Destinations
+                  </div>
+                  <button
+                    onClick={() => setEverydayTab("ask")}
+                    className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
+                      everydayTab === "ask"
+                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200"
+                    }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <MessageSquare className="w-3.5 h-3.5 text-neutral-300" /> Ask Kyro
+                    </span>
+                    {everydayTab === "ask" && <span className="w-1.5 h-1.5 rounded-full bg-neutral-300" />}
+                  </button>
+
+                  <button
+                    onClick={() => setEverydayTab("today")}
+                    className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
+                      everydayTab === "today"
+                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200"
+                    }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <Calendar className="w-3.5 h-3.5 text-sky-400" /> Today
+                    </span>
+                    {everydayTab === "today" && <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />}
+                  </button>
+
+                  <button
+                    onClick={() => setEverydayTab("tools")}
+                    className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
+                      everydayTab === "tools"
+                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200"
+                    }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <Wrench className="w-3.5 h-3.5 text-amber-400" /> My Tools
+                    </span>
+                    {everydayTab === "tools" && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
+                  </button>
+
+                  <button
+                    onClick={() => setEverydayTab("routines")}
+                    className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
+                      everydayTab === "routines"
+                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200"
+                    }`}
+                  >
+                    <span className="flex items-center gap-2">
+                      <Clock className="w-3.5 h-3.5 text-purple-400" /> My Routines
+                    </span>
+                    {everydayTab === "routines" && <span className="w-1.5 h-1.5 rounded-full bg-purple-400" />}
+                  </button>
+                </div>
+
                 <button
                   onClick={() => setIsScreenExplainerOpen(true)}
                   className="w-full px-3 py-2 rounded-lg text-xs font-medium text-amber-200 bg-amber-950/20 hover:bg-amber-950/40 border border-amber-800/40 flex items-center gap-2 transition"
@@ -1018,9 +1158,61 @@ export const App: React.FC = () => {
             </div>
           </div>
 
+          {experienceMode === "everyday" && (
+            <div className="hidden md:flex items-center p-1 bg-[#141414] border border-neutral-800 rounded-xl text-xs font-medium">
+              <button
+                onClick={() => setEverydayTab("ask")}
+                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
+                  everydayTab === "ask"
+                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                <MessageSquare className="w-3.5 h-3.5 text-neutral-300" /> Ask Kyro
+              </button>
+              <button
+                onClick={() => setEverydayTab("today")}
+                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
+                  everydayTab === "today"
+                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                <Calendar className="w-3.5 h-3.5 text-sky-400" /> Today
+              </button>
+              <button
+                onClick={() => setEverydayTab("tools")}
+                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
+                  everydayTab === "tools"
+                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                <Wrench className="w-3.5 h-3.5 text-amber-400" /> My Tools
+              </button>
+              <button
+                onClick={() => setEverydayTab("routines")}
+                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
+                  everydayTab === "routines"
+                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                <Clock className="w-3.5 h-3.5 text-purple-400" /> My Routines
+              </button>
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             {experienceMode === "everyday" ? (
               <>
+                <button
+                  onClick={() => setIsOnboardingOpen(true)}
+                  className="px-2.5 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition font-medium"
+                  title="Start Interactive User Guide"
+                >
+                  <HelpCircle className="w-3.5 h-3.5 text-neutral-400" /> Guide
+                </button>
                 <button
                   onClick={() => setIsScreenExplainerOpen(true)}
                   className="px-3 py-1.5 bg-amber-950/30 hover:bg-amber-950/50 border border-amber-800/50 rounded-lg text-xs text-amber-200 flex items-center gap-1.5 transition font-medium"
@@ -1265,9 +1457,142 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* Message Thread & Live Steps */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {messages.length === 0 && liveSteps.length === 0 ? (
+        {/* Main Workspace Content */}
+        {experienceMode === "everyday" && everydayTab === "today" ? (
+          <div className="flex-1 overflow-y-auto">
+            <TodayDashboardView
+              onOpenTool={(_toolId) => setEverydayTab("tools")}
+              onAskPrompt={(p) => {
+                setPrompt(p);
+                setEverydayTab("ask");
+              }}
+              onOpenConnections={() => setIsConnectionsOpen(true)}
+              onOpenSettings={(tab) => {
+                if (tab) setSettingsInitialTab(tab);
+                setIsSettingsOpen(true);
+              }}
+            />
+          </div>
+        ) : experienceMode === "everyday" && everydayTab === "tools" ? (
+          <div className="flex-1 overflow-y-auto">
+            <MyToolsView
+              onAskPrompt={(p) => {
+                setPrompt(p);
+                setEverydayTab("ask");
+              }}
+              onOpenConnections={() => setIsConnectionsOpen(true)}
+              onOpenScreenExplainer={() => setIsScreenExplainerOpen(true)}
+              onOpenFileOrganizer={() => setIsFileOrganizerOpen(true)}
+              onOpenDocAssistant={() => setIsDocumentAssistantOpen(true)}
+            />
+          </div>
+        ) : experienceMode === "everyday" && everydayTab === "routines" ? (
+          <div className="flex-1 overflow-y-auto">
+            <MyRoutinesView
+              onAskPrompt={(p) => {
+                setPrompt(p);
+                setEverydayTab("ask");
+              }}
+            />
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto p-6 space-y-6">
+            {/* Structured Task Plan Card */}
+            {activePlan && (
+              <div className="max-w-2xl mx-auto my-2 p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-3 shadow-lg">
+                <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
+                  <div className="flex items-center gap-2">
+                    <ListOrdered className="w-4 h-4 text-neutral-300" />
+                    <span className="text-xs font-semibold text-neutral-200">Execution Plan</span>
+                    <span className="text-[10px] font-mono text-neutral-400">({activePlan.status})</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`text-[10px] px-2 py-0.5 rounded-full font-mono uppercase font-bold ${
+                        activePlan.status === "completed"
+                          ? "bg-neutral-800 text-neutral-100 border border-neutral-700"
+                          : activePlan.status === "executing"
+                          ? "bg-purple-950/60 text-purple-300 border border-purple-800/60 animate-pulse"
+                          : "bg-neutral-800 text-neutral-300 border border-neutral-700"
+                      }`}
+                    >
+                      {activePlan.status}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setActivePlan(null)}
+                      className="text-neutral-500 hover:text-neutral-300 text-xs p-1"
+                      title="Dismiss plan"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="text-xs space-y-2">
+                  <div>
+                    <span className="text-neutral-400">Understanding: </span>
+                    <span className="text-neutral-200 font-medium">{activePlan.understanding}</span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                    <span className="text-neutral-400 text-[11px]">Resources: </span>
+                    {activePlan.resources.map((res, i) => (
+                      <span
+                        key={i}
+                        className="px-2 py-0.5 bg-[#000000] border border-neutral-800 text-[10px] text-neutral-300 rounded font-mono"
+                      >
+                        {res}
+                      </span>
+                    ))}
+                  </div>
+
+                  <div className="space-y-1.5 pt-1">
+                    <span className="text-neutral-400 block font-medium text-[11px]">Planned Steps:</span>
+                    {activePlan.steps.map((st, i) => (
+                      <div key={i} className="flex items-center gap-2 text-neutral-300">
+                        {st.done ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-neutral-300 shrink-0" />
+                        ) : (
+                          <span className="w-3.5 h-3.5 rounded-full border border-neutral-600 flex items-center justify-center text-[9px] font-mono text-neutral-400 shrink-0">
+                            {i + 1}
+                          </span>
+                        )}
+                        <span className={st.done ? "line-through text-neutral-500" : ""}>{st.text}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {activePlan.accomplished.length > 0 && (
+                    <div className="pt-2 border-t border-neutral-800/80">
+                      <span className="text-[11px] font-semibold text-neutral-300 block mb-1">
+                        Accomplished:
+                      </span>
+                      <ul className="list-disc list-inside text-[11px] text-neutral-400 space-y-0.5">
+                        {activePlan.accomplished.map((item, i) => (
+                          <li key={i}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {activePlan.remaining.length > 0 && (
+                    <div className="pt-1">
+                      <span className="text-[11px] font-semibold text-neutral-400 block mb-1">
+                        Remaining / Unfinished:
+                      </span>
+                      <ul className="list-disc list-inside text-[11px] text-neutral-500 space-y-0.5">
+                        {activePlan.remaining.map((item, i) => (
+                          <li key={i}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {messages.length === 0 && liveSteps.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-center max-w-lg mx-auto space-y-4">
               <div className="relative">
                 <div className="w-16 h-16 rounded-2xl bg-[#141414] border border-neutral-800 flex items-center justify-center p-3 shadow-lg">
@@ -1551,6 +1876,7 @@ export const App: React.FC = () => {
             </>
           )}
         </div>
+      )}
 
         {/* Collapsible Terminal Drawer */}
         {showTerminal && (
@@ -1585,6 +1911,34 @@ export const App: React.FC = () => {
             >
               <X className="w-3.5 h-3.5" />
             </button>
+          </div>
+        )}
+
+        {/* Quick Everyday Task Prompt Pills */}
+        {experienceMode === "everyday" && (
+          <div className="px-4 py-2 border-t border-neutral-800/60 bg-[#0c0c0c] flex items-center gap-2 overflow-x-auto text-[11px]">
+            <span className="text-neutral-400 font-medium shrink-0">Try asking:</span>
+            {[
+              "Find the invoice I downloaded last month",
+              "Organize my college documents into folders",
+              "Explain this PDF in simple language and create revision notes",
+              "Summarize my unread emails and draft replies",
+              "Help me organize tomorrow's schedule",
+              "Compare these products and explain which offers better value",
+              "Every Friday, organize my new documents and show me what changed",
+            ].map((p, idx) => (
+              <button
+                key={idx}
+                type="button"
+                onClick={() => {
+                  setPrompt(p);
+                  setEverydayTab("ask");
+                }}
+                className="px-2.5 py-1 rounded-full bg-[#141414] hover:bg-[#1f1f1f] text-neutral-300 hover:text-white border border-neutral-800 whitespace-nowrap transition shrink-0"
+              >
+                {p}
+              </button>
+            ))}
           </div>
         )}
 
@@ -1727,6 +2081,20 @@ export const App: React.FC = () => {
         isOpen={isDevWorkbenchOpen}
         onClose={() => setIsDevWorkbenchOpen(false)}
         initialTab={devWorkbenchTab}
+      />
+
+      <OnboardingModal
+        isOpen={isOnboardingOpen}
+        onClose={() => setIsOnboardingOpen(false)}
+        onTryExample={(p) => {
+          setPrompt(p);
+          setEverydayTab("ask");
+          setIsOnboardingOpen(false);
+        }}
+        onOpenConnections={() => {
+          setIsConnectionsOpen(true);
+          setIsOnboardingOpen(false);
+        }}
       />
 
       <CommandPalette

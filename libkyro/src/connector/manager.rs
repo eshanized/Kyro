@@ -1,6 +1,7 @@
 use super::auth::{OAuthFlowInit, OAuthManager, OAuthSessionStatus, PendingOAuthSession};
 use super::catalog::{get_default_catalog_items, ConnectorCatalogItem};
 use super::native::github::GitHubAdapter;
+use super::native::google::GoogleAdapter;
 use super::native::NativeConnectorAdapter;
 use super::remote_mcp::RemoteMcpClient;
 use crate::agent::ToolDefinition;
@@ -224,6 +225,11 @@ impl ConnectorManager {
     pub fn new(db: Database, vault: Vault, local_mcp: McpManager) -> Self {
         let mut adapters: HashMap<String, Arc<dyn NativeConnectorAdapter>> = HashMap::new();
         adapters.insert("github".to_string(), Arc::new(GitHubAdapter::new()));
+        adapters.insert("google".to_string(), Arc::new(GoogleAdapter::new()));
+        adapters.insert(
+            "google_calendar".to_string(),
+            Arc::new(GoogleAdapter::new()),
+        );
 
         Self {
             db,
@@ -235,6 +241,13 @@ impl ConnectorManager {
             tool_registry: Arc::new(Mutex::new(HashMap::new())),
             account_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn get_native_adapter(
+        &self,
+        connector_id: &str,
+    ) -> Option<Arc<dyn NativeConnectorAdapter>> {
+        self.native_adapters.get(connector_id).cloned()
     }
 
     /// List all catalog integrations with real-time status and connected account counts
@@ -466,7 +479,8 @@ impl ConnectorManager {
         client_id_opt: Option<String>,
         client_secret_opt: Option<String>,
     ) -> Result<OAuthFlowInit, String> {
-        if connector_id != "github" {
+        if connector_id != "github" && connector_id != "google" && connector_id != "google_calendar"
+        {
             return Err(format!(
                 "OAuth authorization is not supported or not implemented for provider '{}'",
                 connector_id
@@ -487,7 +501,7 @@ impl ConnectorManager {
 
         let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
 
-        let (auth_url, token_endpoint, client_id) = {
+        let (auth_url, token_endpoint, client_id) = if connector_id == "github" {
             let cid = client_id_opt
                 .unwrap_or_else(|| std::env::var("KYRO_GITHUB_CLIENT_ID").unwrap_or_default());
             if cid.trim().is_empty() {
@@ -500,6 +514,32 @@ impl ConnectorManager {
             (
                 url,
                 "https://github.com/login/oauth/access_token".to_string(),
+                cid,
+            )
+        } else {
+            let cid = client_id_opt
+                .unwrap_or_else(|| std::env::var("KYRO_GOOGLE_CLIENT_ID").unwrap_or_default());
+            if cid.trim().is_empty() {
+                return Err("Google OAuth requires a Client ID. Configure one in Kyro Settings or provide KYRO_GOOGLE_CLIENT_ID.".to_string());
+            }
+            let scopes = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email";
+            let mut url = reqwest::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+                .map_err(|e| format!("Failed to parse Google OAuth URL: {}", e))?;
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("client_id", &cid);
+                q.append_pair("redirect_uri", &redirect_uri);
+                q.append_pair("response_type", "code");
+                q.append_pair("scope", scopes);
+                q.append_pair("access_type", "offline");
+                q.append_pair("prompt", "consent");
+                q.append_pair("state", &state);
+                q.append_pair("code_challenge", &code_challenge);
+                q.append_pair("code_challenge_method", "S256");
+            }
+            (
+                url.to_string(),
+                "https://oauth2.googleapis.com/token".to_string(),
                 cid,
             )
         };
@@ -620,6 +660,32 @@ impl ConnectorManager {
             if let Ok(Some(acc)) = self.db.get_connected_account(account_id) {
                 if acc.connector_id == "github" {
                     for def in GitHubAdapter::default_tools() {
+                        let scoped_name = format!("{}__{}", account_id, def.name);
+                        let fp = compute_schema_fingerprint(&def.parameters);
+                        let can_auto = def.risk_level != RiskLevel::Destructive;
+                        tools.push(AccountToolView {
+                            name: scoped_name,
+                            original_name: def.name.clone(),
+                            description: def.description.clone(),
+                            is_read_only: def.is_read_only,
+                            risk_level: match def.risk_level {
+                                RiskLevel::Safe => "safe",
+                                RiskLevel::Moderate => "moderate",
+                                RiskLevel::Destructive => "destructive",
+                            }
+                            .to_string(),
+                            default_policy: if def.is_read_only && def.risk_level == RiskLevel::Safe
+                            {
+                                "allow".to_string()
+                            } else {
+                                "ask".to_string()
+                            },
+                            can_auto_approve: can_auto,
+                            schema_fingerprint: fp,
+                        });
+                    }
+                } else if acc.connector_id == "google" || acc.connector_id == "google_calendar" {
+                    for def in GoogleAdapter::default_tools() {
                         let scoped_name = format!("{}__{}", account_id, def.name);
                         let fp = compute_schema_fingerprint(&def.parameters);
                         let can_auto = def.risk_level != RiskLevel::Destructive;
@@ -882,6 +948,53 @@ impl ConnectorManager {
                 };
 
                 (login.clone(), format!("GitHub (@{})", login), final_scopes)
+            }
+            "google" | "google_calendar" => {
+                let http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_default();
+                let resp = match http
+                    .get("https://www.googleapis.com/oauth2/v2/userinfo")
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", token_res.access_token),
+                    )
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let err_msg = format!("Google userinfo verification failed: {}", e);
+                        self.oauth_manager
+                            .finalize_failure(session_id, err_msg.clone())
+                            .await;
+                        return Err(err_msg);
+                    }
+                };
+
+                let user_json: Value = match resp.json().await {
+                    Ok(j) => j,
+                    Err(e) => {
+                        let err_msg = format!("Failed to parse Google userinfo response: {}", e);
+                        self.oauth_manager
+                            .finalize_failure(session_id, err_msg.clone())
+                            .await;
+                        return Err(err_msg);
+                    }
+                };
+
+                let email = user_json["email"]
+                    .as_str()
+                    .unwrap_or("google_user@gmail.com")
+                    .to_string();
+                let name = user_json["name"].as_str().unwrap_or(&email).to_string();
+
+                (
+                    email.clone(),
+                    format!("Google ({})", name),
+                    token_res.granted_scopes.clone(),
+                )
             }
             other => {
                 let err_msg = format!("Unsupported OAuth provider '{}'", other);

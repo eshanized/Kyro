@@ -302,10 +302,18 @@ impl Drop for WorkerHandle {
 /// Locates the Node.js runtime.
 pub fn find_node() -> Option<PathBuf> {
     let resolver = crate::execution::launcher::ExecutableResolver::new();
-    resolver
-        .resolve(&crate::execution::launcher::ProgramSpec::new("node"))
-        .ok()
-        .map(|r| r.path)
+    if let Ok(resolved) = resolver.resolve(&crate::execution::launcher::ProgramSpec::new("node")) {
+        return Some(resolved.path);
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("node");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
