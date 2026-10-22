@@ -50,6 +50,10 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .manage(state)
         .setup(move |_app| {
+            // Prune un-authorized or stale indexed documents on startup
+            if let Ok(folders) = db.list_authorized_folders() {
+                let _ = db.prune_unauthorized_indexed_documents(&folders);
+            }
             RoutineScheduler::start_worker(
                 db.clone(),
                 vault.clone(),

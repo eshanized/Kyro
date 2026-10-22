@@ -132,3 +132,53 @@ This log chronicles the engineering remediation, feature completion, and verific
   - `kyroui` vitest suite: 7 test files passed (52 tests total, including `browser_settings.test.tsx`).
   - `cargo clippy`: 0 warnings.
   - `npm run build`: built clean.
+
+## 2026-10-22: Everyday Assistant Functional Completion & Security Hardening Remediation
+
+### 1. P0 — Email Header Injection Elimination (`libkyro/src/connector/native/google.rs`)
+- **CRLF & Header Injection Rejection**: `GoogleAdapter::encode_rfc2822_message` strictly scans `to`, `subject`, and `in_reply_to` headers for `\r`, `\n`, `\0`, or control characters, returning explicit `Err` on any header injection attempt.
+- **Robust Recipient Parsing & Validation**: Implemented `validate_and_sanitize_recipient` and `validate_email_address`. Accurately parses RFC 5322 address formats (`user@example.com` or `Display Name <user@example.com>`), verifies single `@`, non-empty local part, valid domain syntax, and rejects invalid characters or multiple `@` characters.
+- **RFC 2047 Word Encoding**: Encodes non-ASCII subjects and display names containing Unicode or special characters into standards-compliant RFC 2047 encoded words (`=?UTF-8?B?...?=`) using base64.
+- **Threading Header Sanitation**: Sanitizes `in_reply_to` parameter into strict message-id `<...>` without delimiter escaping, injecting both `In-Reply-To` and `References`.
+- **Connector Call Sites & Token Extraction**: Updated `gmail_create_draft` and `gmail_send_email` to handle `Result` from message construction. Implemented `GoogleAdapter::extract_token` to seamlessly unpack JSON secrets stored in vault (`{"access_token": ...}`) or raw bearer tokens for both `execute_tool` and `test_connection`.
+
+### 2. P0 — Provider-Specific OAuth Token Refresh (`libkyro/src/connector/manager.rs`)
+- **Google OAuth Refresh Support**: Added token endpoint `https://oauth2.googleapis.com/token` for connector IDs `google` and `google_calendar`. Added provider-specific client ID and secret resolution from account config, vault, and `KYRO_GOOGLE_CLIENT_ID` / `KYRO_GOOGLE_CLIENT_SECRET`.
+- **Single-Flight Synchronization**: Lock re-check in `refresh_account_token` checks if token was updated within 15 seconds or if `expires_at > now + 60_000`, immediately reusing refreshed tokens across concurrent calls.
+- **Lifecycle Status Transitions**: Correctly classifies permanent authentication errors (`invalid_grant`, `invalid_client`, HTTP 4xx) to transition account to canonical status `"needs_reauth"`. Transient errors (HTTP 5xx, timeouts, connection refused, DNS errors) transition status to `"error"` with detailed error logs. Updated post-401 failure in `dispatch_action` to mark `"needs_reauth"` instead of uncanonical `"reauthorization_required"`.
+
+### 3. P1 — Calendar Availability & Scheduling Semantics (`libkyro/src/connector/native/google.rs`)
+- **Cancelled & Transparent Event Filtering**: `calendar_find_meeting_times` filters out events with `status == "cancelled"` and transparent events (`transparency == "transparent"`) so they do not block available slots.
+- **Exclusive All-Day Event Bounds**: Treats Google Calendar all-day event end date as exclusive (00:00:00 midnight of the end date instead of 23:59:59).
+- **Pagination Support**: Added pagination loop requesting `nextPageToken` (capped at 10 pages) ensuring full coverage of calendar busy intervals across the requested time window.
+- **Past Slot Filtering**: Filters out candidate meeting slots starting in the past with a 15-minute lead time buffer.
+
+### 4. P1 — Guaranteed Routine Run Terminal States & Provider Neutrality (`libkyro/src/teach_task/scheduler.rs`)
+- **Guaranteed Terminal Status in SQLite**: Refactored `execute_routine_unified` so that ANY failure during prompt or skill execution (vault read failure, unconfigured API key, agent initialization failure, or cancellation) reliably updates both `routine_runs` and `agent_runs` to terminal statuses (`failed` or `cancelled`) with recorded error messages.
+- **Provider Neutrality**: Replaced hardcoded NVIDIA fallback (`keys.nvidia.unwrap_or_default()`) with generic provider key resolution (`vault.get_secret(&format!("{}_api_key", caps.provider))` or env variable), failing explicitly with clear user guidance if the selected model's provider is unconfigured.
+- **Persistence Error Propagation**: Validated and logged database update results from `db.update_routine_run` and `db.update_run_status`.
+
+### 5. P1 — Revoked-Folder Document Index Pruning (`libkyro/src/commands.rs`, `libkyro/src/main.rs`)
+- **Folder Revocation Pruning**: `remove_authorized_folder` now immediately queries remaining authorized folders and invokes `db.prune_unauthorized_indexed_documents(&remaining_folders)`, deleting all indexed document records, cached text, and metadata for un-authorized paths.
+- **Startup Reconciliation**: App initialization in `main.rs` setup now calls `db.prune_unauthorized_indexed_documents` against all currently authorized folders at launch.
+
+### 6. P1 — Filesystem Authorization & TOCTOU Hardening (`libkyro/src/storage/organizer.rs`, `file_assistant.rs`)
+- **Immediate Re-Canonicalization**: In `FileOrganizer::execute`, `op.source_path` is canonicalized immediately before moving and verified against `canonical_root` to eliminate time-of-check/time-of-use symlink swaps. Destination directory is verified post-creation with `canonicalize` and containment check. Destination collision check inspects symlink metadata to prevent writing through symlinks.
+- **Search Symlink Confinement**: In `FileAssistant::collect_searchable_files`, symlinks are followed only if their canonical target stays within `canonical_root`, and canonicalized paths are pushed to the search index.
+
+### 7. P1 — Study Assistant Topic Filtering (`kyroui/components/MyToolsView.tsx`)
+- Added optional topic filter input in the Study Notes & Revision Flashcards tool.
+- Bound input to `generate_study_notes` IPC call with `topic: studyTopic.trim() || null`, enabling targeted study note generation and concept extraction.
+
+### 8. Verification Results
+- `cargo fmt --check`: Passed cleanly (0 formatting differences).
+- `cargo clippy --all-targets --all-features -- -D warnings`: Passed cleanly (0 warnings).
+- `cargo test --all-features`: 251 tests passed across all unit and integration test suites:
+  - 146 unit tests in `libkyro/src/lib.rs`
+  - 18 everyday assistant tests in `libkyro/tests/everyday_assistant_tests.rs`
+  - 58 engine tests in `libkyro/tests/engine_tests.rs`
+  - 29 security tests in `libkyro/tests/security_tests.rs`
+- Vitest: 75/75 tests passed across 11 test suites.
+- TypeScript `tsc --noEmit`: 0 errors.
+- Vite production build: Built cleanly.
+- `make verify`: Full pipeline PASS.

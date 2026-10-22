@@ -411,44 +411,69 @@ impl RoutineScheduler {
                     configured_model, err
                 ))
             } else {
-                let keys = vault
-                    .get_all_keys()
-                    .map_err(|e| format!("Vault error: {}", e))?;
-                let api_key = match caps.provider.as_str() {
-                    "nvidia" => keys.nvidia.unwrap_or_default(),
-                    _ => keys.nvidia.unwrap_or_default(),
-                };
+                let api_key_res: Result<String, String> = (|| {
+                    let keys = vault
+                        .get_all_keys()
+                        .map_err(|e| format!("Vault error reading keys: {}", e))?;
+                    let api_key = match caps.provider.as_str() {
+                        "nvidia" => keys.nvidia.clone().unwrap_or_default(),
+                        other => vault
+                            .get_secret(&format!("{}_api_key", other))
+                            .ok()
+                            .flatten()
+                            .or_else(|| vault.get_secret(other).ok().flatten())
+                            .or_else(|| {
+                                std::env::var(format!("{}_API_KEY", other.to_uppercase())).ok()
+                            })
+                            .or_else(|| {
+                                if other == "meta" || other == "mistral" || other == "qwen" {
+                                    // NIM hosted model fallback
+                                    keys.nvidia.clone()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default(),
+                    };
 
-                if api_key.is_empty() {
-                    Err(format!(
-                        "{} API key not configured for routine. Please add your key in Kyro Settings under Model & Credentials.",
-                        caps.provider.to_uppercase()
-                    ))
-                } else {
-                    let history = vec![ChatMessage {
-                        role: "user".to_string(),
-                        content: MessageContent::from_text(&latest_routine.target_id),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    }];
+                    if api_key.is_empty() {
+                        Err(format!(
+                            "{} API key not configured for routine. Please add your key in Kyro Settings under Model & Credentials.",
+                            caps.provider.to_uppercase()
+                        ))
+                    } else {
+                        Ok(api_key)
+                    }
+                })();
 
-                    let sys_prompt = "You are Kyro executing an autonomous routine. Complete the requested objective deterministically, safely, and truthfully.";
+                match api_key_res {
+                    Err(e) => Err(e),
+                    Ok(api_key) => {
+                        let history = vec![ChatMessage {
+                            role: "user".to_string(),
+                            content: MessageContent::from_text(&latest_routine.target_id),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        }];
 
-                    engine
-                        .run_step_with_connectors(
-                            &run_id,
-                            &configured_model,
-                            &api_key,
-                            None,
-                            sys_prompt,
-                            history,
-                            db.clone(),
-                            mcp,
-                            connector_manager,
-                            Some(cancel_token.clone()),
-                            |_| {},
-                        )
-                        .await
+                        let sys_prompt = "You are Kyro executing an autonomous routine. Complete the requested objective deterministically, safely, and truthfully.";
+
+                        engine
+                            .run_step_with_connectors(
+                                &run_id,
+                                &configured_model,
+                                &api_key,
+                                None,
+                                sys_prompt,
+                                history,
+                                db.clone(),
+                                mcp,
+                                connector_manager,
+                                Some(cancel_token.clone()),
+                                |_| {},
+                            )
+                            .await
+                    }
                 }
             }
         } else {
@@ -486,15 +511,27 @@ impl RoutineScheduler {
             }
         };
 
-        // 4. Update terminal status truthfully
-        let _ = db.update_routine_run(
+        // 4. Update terminal status truthfully in SQLite
+        if let Err(e) = db.update_routine_run(
             &run_id,
             &status,
             completed_at,
             summary.as_deref(),
             error.as_deref(),
-        );
-        let _ = db.update_run_status(&run_id, &status, None, Some(completed_at), error.as_deref());
+        ) {
+            log::error!(
+                "[Scheduler] Failed to update routine run status in SQLite: {}",
+                e
+            );
+        }
+        if let Err(e) =
+            db.update_run_status(&run_id, &status, None, Some(completed_at), error.as_deref())
+        {
+            log::error!(
+                "[Scheduler] Failed to update agent run status in SQLite: {}",
+                e
+            );
+        }
         let _ = db.update_routine_last_run(&latest_routine.id, start_time);
 
         let final_record = RoutineRunRecord {

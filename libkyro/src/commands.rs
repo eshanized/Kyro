@@ -1965,10 +1965,21 @@ pub fn remove_authorized_folder(
     let target = id
         .or(path)
         .ok_or_else(|| "Missing required parameter 'id' or 'path'".to_string())?;
-    state
+    let removed = state
         .db
         .remove_authorized_folder(&target)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if removed {
+        // Immediately prune indexed documents and cached text/metadata that are outside remaining authorized folders
+        if let Ok(remaining_folders) = state.db.list_authorized_folders() {
+            let _ = state
+                .db
+                .prune_unauthorized_indexed_documents(&remaining_folders);
+        }
+    }
+
+    Ok(removed)
 }
 
 #[tauri::command]

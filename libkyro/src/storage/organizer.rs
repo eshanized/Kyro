@@ -378,8 +378,24 @@ impl FileOrganizer {
                 continue;
             }
 
-            // Path containment enforcement
-            if !op.source_path.starts_with(&canonical_root) {
+            // Immediate TOCTOU re-canonicalization and containment enforcement
+            let canon_source = match fs::canonicalize(&op.source_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    op_records.push(OrganizationOpRecord {
+                        source_path: op.source_path.to_string_lossy().to_string(),
+                        destination_path: op.destination_path.to_string_lossy().to_string(),
+                        file_hash: op.file_hash.clone().unwrap_or_default(),
+                        file_size: op.file_size,
+                        status: "failed".to_string(),
+                        error: Some(format!("Source path cannot be canonicalized: {}", e)),
+                    });
+                    has_partial_failure = true;
+                    continue;
+                }
+            };
+
+            if !canon_source.starts_with(&canonical_root) {
                 op_records.push(OrganizationOpRecord {
                     source_path: op.source_path.to_string_lossy().to_string(),
                     destination_path: op.destination_path.to_string_lossy().to_string(),
@@ -391,22 +407,8 @@ impl FileOrganizer {
                 has_partial_failure = true;
                 continue;
             }
-            if !op.destination_path.starts_with(&canonical_root) {
-                op_records.push(OrganizationOpRecord {
-                    source_path: op.source_path.to_string_lossy().to_string(),
-                    destination_path: op.destination_path.to_string_lossy().to_string(),
-                    file_hash: op.file_hash.clone().unwrap_or_default(),
-                    file_size: op.file_size,
-                    status: "failed".to_string(),
-                    error: Some(
-                        "Security rejection: destination path escapes target root".to_string(),
-                    ),
-                });
-                has_partial_failure = true;
-                continue;
-            }
 
-            // Ensure destination directory exists
+            // Ensure destination directory exists and is contained within authorized root
             if let Some(dest_dir) = op.destination_path.parent() {
                 if let Err(e) = fs::create_dir_all(dest_dir) {
                     op_records.push(OrganizationOpRecord {
@@ -420,24 +422,44 @@ impl FileOrganizer {
                     has_partial_failure = true;
                     continue;
                 }
+                match fs::canonicalize(dest_dir) {
+                    Ok(canon_dest_dir) => {
+                        if !canon_dest_dir.starts_with(&canonical_root) {
+                            op_records.push(OrganizationOpRecord {
+                                source_path: op.source_path.to_string_lossy().to_string(),
+                                destination_path: op.destination_path.to_string_lossy().to_string(),
+                                file_hash: op.file_hash.clone().unwrap_or_default(),
+                                file_size: op.file_size,
+                                status: "failed".to_string(),
+                                error: Some(
+                                    "Security rejection: destination directory escapes target root"
+                                        .to_string(),
+                                ),
+                            });
+                            has_partial_failure = true;
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        op_records.push(OrganizationOpRecord {
+                            source_path: op.source_path.to_string_lossy().to_string(),
+                            destination_path: op.destination_path.to_string_lossy().to_string(),
+                            file_hash: op.file_hash.clone().unwrap_or_default(),
+                            file_size: op.file_size,
+                            status: "failed".to_string(),
+                            error: Some(format!(
+                                "Destination directory cannot be canonicalized: {}",
+                                e
+                            )),
+                        });
+                        has_partial_failure = true;
+                        continue;
+                    }
+                }
             }
 
-            // Verify source still exists before moving
-            if !op.source_path.exists() {
-                op_records.push(OrganizationOpRecord {
-                    source_path: op.source_path.to_string_lossy().to_string(),
-                    destination_path: op.destination_path.to_string_lossy().to_string(),
-                    file_hash: op.file_hash.clone().unwrap_or_default(),
-                    file_size: op.file_size,
-                    status: "failed".to_string(),
-                    error: Some("Source file no longer exists at original path".to_string()),
-                });
-                has_partial_failure = true;
-                continue;
-            }
-
-            // Prevent collision overwrite
-            if op.destination_path.exists() {
+            // Prevent collision overwrite or writing through symlinks
+            if op.destination_path.exists() || fs::symlink_metadata(&op.destination_path).is_ok() {
                 op_records.push(OrganizationOpRecord {
                     source_path: op.source_path.to_string_lossy().to_string(),
                     destination_path: op.destination_path.to_string_lossy().to_string(),
@@ -452,8 +474,8 @@ impl FileOrganizer {
                 continue;
             }
 
-            // Perform atomic or cross-filesystem move
-            match fs::rename(&op.source_path, &op.destination_path) {
+            // Perform atomic or cross-filesystem move using canonical source
+            match fs::rename(&canon_source, &op.destination_path) {
                 Ok(_) => {
                     op_records.push(OrganizationOpRecord {
                         source_path: op.source_path.to_string_lossy().to_string(),
@@ -466,9 +488,9 @@ impl FileOrganizer {
                 }
                 Err(e) => {
                     // Attempt copy + remove fallback for cross-filesystem moves
-                    match fs::copy(&op.source_path, &op.destination_path) {
+                    match fs::copy(&canon_source, &op.destination_path) {
                         Ok(_) => {
-                            let _ = fs::remove_file(&op.source_path);
+                            let _ = fs::remove_file(&canon_source);
                             op_records.push(OrganizationOpRecord {
                                 source_path: op.source_path.to_string_lossy().to_string(),
                                 destination_path: op.destination_path.to_string_lossy().to_string(),

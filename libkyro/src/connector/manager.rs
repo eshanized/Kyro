@@ -738,8 +738,15 @@ impl ConnectorManager {
         let secret_val: Value =
             serde_json::from_str(&secret_raw).map_err(|e| format!("Invalid secret JSON: {}", e))?;
 
-        // Concurrency guard: check if another concurrent turn already refreshed the token in the last 15 seconds
         let now = chrono::Utc::now().timestamp_millis();
+        let account = self
+            .db
+            .get_connected_account(account_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Account '{}' not found", account_id))?;
+
+        // Concurrency guard: check if another concurrent turn already refreshed the token in the last 15 seconds
+        // or if expires_at indicates token is valid well into the future
         if let Some(updated_at) = secret_val.get("updated_at").and_then(|u| u.as_i64()) {
             if now.saturating_sub(updated_at) < 15_000 {
                 if let Some(tok) = secret_val.get("access_token").and_then(|t| t.as_str()) {
@@ -753,41 +760,67 @@ impl ConnectorManager {
                 }
             }
         }
+        if let Some(expires_at) = account.expires_at {
+            if expires_at > now + 60_000 {
+                if let Some(tok) = secret_val.get("access_token").and_then(|t| t.as_str()) {
+                    if !tok.is_empty() {
+                        return Ok(tok.to_string());
+                    }
+                }
+            }
+        }
 
         let refresh_tok = match secret_val.get("refresh_token").and_then(|t| t.as_str()) {
             Some(t) if !t.is_empty() => t,
             _ => return Err("Account credentials do not include a refresh token".to_string()),
         };
 
-        let account = self
-            .db
-            .get_connected_account(account_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Account '{}' not found", account_id))?;
-
         let config: Value = serde_json::from_str(&account.config_json).unwrap_or_default();
-        let env_cid = std::env::var("KYRO_GITHUB_CLIENT_ID").unwrap_or_default();
+        let env_cid = match account.connector_id.as_str() {
+            "github" => std::env::var("KYRO_GITHUB_CLIENT_ID").unwrap_or_default(),
+            "google" | "google_calendar" => {
+                std::env::var("KYRO_GOOGLE_CLIENT_ID").unwrap_or_default()
+            }
+            _ => std::env::var(format!(
+                "KYRO_{}_CLIENT_ID",
+                account.connector_id.to_uppercase()
+            ))
+            .unwrap_or_default(),
+        };
         let client_id = config
             .get("client_id")
             .and_then(|c| c.as_str())
             .unwrap_or(&env_cid);
+
+        let env_sec = match account.connector_id.as_str() {
+            "github" => std::env::var("KYRO_GITHUB_CLIENT_SECRET").ok(),
+            "google" | "google_calendar" => std::env::var("KYRO_GOOGLE_CLIENT_SECRET").ok(),
+            _ => std::env::var(format!(
+                "KYRO_{}_CLIENT_SECRET",
+                account.connector_id.to_uppercase()
+            ))
+            .ok(),
+        };
         let client_secret = secret_val
             .get("client_secret")
             .and_then(|s| s.as_str())
-            .or_else(|| config.get("client_secret").and_then(|s| s.as_str()));
+            .or_else(|| config.get("client_secret").and_then(|s| s.as_str()))
+            .or(env_sec.as_deref());
 
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
             .unwrap_or_default();
 
-        let token_endpoint = if account.connector_id == "github" {
-            "https://github.com/login/oauth/access_token"
-        } else {
-            return Err(format!(
-                "Unsupported provider '{}' for token refresh",
-                account.connector_id
-            ));
+        let token_endpoint = match account.connector_id.as_str() {
+            "github" => "https://github.com/login/oauth/access_token",
+            "google" | "google_calendar" => "https://oauth2.googleapis.com/token",
+            other => {
+                return Err(format!(
+                    "Unsupported provider '{}' for token refresh",
+                    other
+                ));
+            }
         };
 
         let refresh_result = OAuthManager::refresh_access_token(
@@ -803,13 +836,37 @@ impl ConnectorManager {
             Ok(r) => r,
             Err(e) => {
                 let err_msg = format!("OAuth token refresh failed: {}", e);
-                let _ = self.db.update_connected_account_status(
-                    account_id,
-                    "needs_reauth",
-                    Some("Reauthorization required: OAuth refresh token has expired or is invalid"),
-                    Some(&err_msg),
-                    Some(now),
-                );
+                let err_lower = err_msg.to_lowercase();
+                let is_transient = (err_lower.contains("status 5")
+                    || err_lower.contains("status: 5")
+                    || err_lower.contains("timeout")
+                    || err_lower.contains("timed out")
+                    || err_lower.contains("connection refused")
+                    || err_lower.contains("dns")
+                    || err_lower.contains("temporarily unavailable")
+                    || err_lower.contains("rate limit")
+                    || err_lower.contains("429"))
+                    && !err_lower.contains("invalid_grant")
+                    && !err_lower.contains("revoked")
+                    && !err_lower.contains("expired");
+
+                if is_transient {
+                    let _ = self.db.update_connected_account_status(
+                        account_id,
+                        "error",
+                        Some("Transient failure refreshing OAuth token"),
+                        Some(&err_msg),
+                        Some(now),
+                    );
+                } else {
+                    let _ = self.db.update_connected_account_status(
+                        account_id,
+                        "needs_reauth",
+                        Some("Reauthorization required: OAuth refresh token has expired or is invalid"),
+                        Some(&err_msg),
+                        Some(now),
+                    );
+                }
                 return Err(err_msg);
             }
         };
@@ -1673,12 +1730,16 @@ impl ConnectorManager {
 
                 // Handle 401 Unauthorized / Token Expiration for OAuth accounts
                 if let Err(ref e) = res {
-                    let is_unauthorized = e.contains("401")
-                        || e.to_lowercase().contains("bad credentials")
-                        || e.to_lowercase().contains("token expired");
+                    let err_low = e.to_lowercase();
+                    let is_unauthorized = err_low.contains("401")
+                        || err_low.contains("bad credentials")
+                        || err_low.contains("token expired")
+                        || err_low.contains("unauthorized")
+                        || err_low.contains("invalid credentials")
+                        || err_low.contains("autherror");
                     if is_unauthorized {
                         log::warn!(
-                            "GitHub adapter received 401 Unauthorized for account '{}'. Attempting token refresh.",
+                            "Native connector adapter received 401 Unauthorized for account '{}'. Attempting token refresh.",
                             entry.account_id
                         );
                         if let Ok(_new_token) = self.refresh_account_token(&entry.account_id).await
@@ -1694,10 +1755,10 @@ impl ConnectorManager {
                                 .await;
                             return Some(retry_res);
                         } else {
-                            // Mark account as reauthorization_required
+                            // Mark account as needs_reauth
                             let _ = self.db.update_connected_account_status(
                                 &entry.account_id,
-                                "reauthorization_required",
+                                "needs_reauth",
                                 Some("OAuth token expired and could not be refreshed. Please re-authorize."),
                                 None,
                                 None,

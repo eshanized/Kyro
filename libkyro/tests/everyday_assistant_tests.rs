@@ -9,9 +9,10 @@ use kyro_lib::connector::native::google::GoogleAdapter;
 use kyro_lib::connector::NativeConnectorAdapter;
 use kyro_lib::execution::permissions::RiskLevel;
 use kyro_lib::storage::file_assistant::FileAssistant;
+use kyro_lib::storage::organizer::{FileOrganizer, OrganizationPlan, PlannedFileOp};
 use kyro_lib::storage::{
-    AuthorizedFolderRecord, ConnectedAccountRecord, Database, RoutineRecord, RoutineRunRecord,
-    Vault,
+    AuthorizedFolderRecord, ConnectedAccountRecord, Database, DocumentIndexRecord, RoutineRecord,
+    RoutineRunRecord, Vault,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -605,4 +606,277 @@ fn test_google_mime_and_html_decoding() {
     assert_eq!(text_plain.as_deref(), Some(body_text));
     assert_eq!(attachments.len(), 1);
     assert!(attachments[0].contains("summary.pdf"));
+}
+
+#[test]
+fn test_rfc2822_crlf_header_injection_rejection() {
+    // 1. CRLF in recipient
+    let r1 = GoogleAdapter::encode_rfc2822_message(
+        "alice@example.com\r\nBcc: evil@attacker.com",
+        "Hello",
+        "Body content",
+        None,
+    );
+    assert!(r1.is_err(), "CRLF in recipient must be rejected");
+    assert!(r1.unwrap_err().contains("injection"));
+
+    // 2. LF-only in recipient
+    let r2 = GoogleAdapter::encode_rfc2822_message(
+        "alice@example.com\nBcc: evil@attacker.com",
+        "Hello",
+        "Body content",
+        None,
+    );
+    assert!(r2.is_err(), "LF in recipient must be rejected");
+
+    // 3. CRLF in subject
+    let r3 = GoogleAdapter::encode_rfc2822_message(
+        "alice@example.com",
+        "Status Update\r\nBcc: evil@attacker.com",
+        "Body content",
+        None,
+    );
+    assert!(r3.is_err(), "CRLF in subject must be rejected");
+    assert!(r3.unwrap_err().contains("injection"));
+
+    // 4. Content-Type injection in subject
+    let r4 = GoogleAdapter::encode_rfc2822_message(
+        "alice@example.com",
+        "Quarterly Report\r\nContent-Type: text/html",
+        "Body content",
+        None,
+    );
+    assert!(
+        r4.is_err(),
+        "Content-Type injection in subject must be rejected"
+    );
+
+    // 5. CRLF in in_reply_to
+    let r5 = GoogleAdapter::encode_rfc2822_message(
+        "alice@example.com",
+        "Re: Status",
+        "Body content",
+        Some("<msg123>\r\nBcc: evil@attacker.com"),
+    );
+    assert!(r5.is_err(), "CRLF in in_reply_to must be rejected");
+
+    // 6. Header injection via colons in in_reply_to
+    let r6 = GoogleAdapter::encode_rfc2822_message(
+        "alice@example.com",
+        "Re: Status",
+        "Body content",
+        Some("msg123: injection"),
+    );
+    assert!(
+        r6.is_err(),
+        "Colon header injection in in_reply_to must be rejected"
+    );
+}
+
+#[test]
+fn test_rfc2822_malformed_email_address_rejection() {
+    // Missing @
+    assert!(GoogleAdapter::encode_rfc2822_message("alice", "Test", "Body", None).is_err());
+    // Missing local part
+    assert!(GoogleAdapter::encode_rfc2822_message("@example.com", "Test", "Body", None).is_err());
+    // Missing domain part
+    assert!(GoogleAdapter::encode_rfc2822_message("alice@", "Test", "Body", None).is_err());
+    // Missing top-level domain dot
+    assert!(
+        GoogleAdapter::encode_rfc2822_message("alice@localhost", "Test", "Body", None).is_err()
+    );
+    // Spaces inside raw address
+    assert!(
+        GoogleAdapter::encode_rfc2822_message("alice smith@example.com", "Test", "Body", None)
+            .is_err()
+    );
+    // Double dot in domain
+    assert!(
+        GoogleAdapter::encode_rfc2822_message("alice@example..com", "Test", "Body", None).is_err()
+    );
+    // Empty recipient
+    assert!(GoogleAdapter::encode_rfc2822_message("", "Test", "Body", None).is_err());
+}
+
+#[test]
+fn test_rfc2822_unicode_subjects_and_rfc2047_encoding() {
+    let to = "Recipient <user@example.com>";
+    let subject = "Actualización de Seguridad 🚀";
+    let body = "Este es un mensaje con caracteres UTF-8.\r\nLínea 2.";
+    let in_reply_to = Some("<thread123@kyro.local>");
+
+    let encoded_res = GoogleAdapter::encode_rfc2822_message(to, subject, body, in_reply_to);
+    assert!(
+        encoded_res.is_ok(),
+        "Valid Unicode email must be encoded successfully"
+    );
+
+    let b64 = encoded_res.unwrap();
+    let decoded_bytes = GoogleAdapter::decode_base64url(&b64).expect("Base64url decoding");
+    let mime_str = String::from_utf8(decoded_bytes).expect("Valid UTF-8 RFC 2822 text");
+
+    // Verify headers structure
+    assert!(mime_str.contains("To: Recipient <user@example.com>\r\n"));
+    assert!(mime_str.contains("MIME-Version: 1.0\r\n"));
+    assert!(mime_str.contains("Content-Type: text/plain; charset=UTF-8\r\n"));
+    // Subject should be RFC 2047 encoded
+    assert!(mime_str.contains("Subject: =?UTF-8?B?"));
+    // Threading headers
+    assert!(mime_str.contains("In-Reply-To: <thread123@kyro.local>\r\n"));
+    assert!(mime_str.contains("References: <thread123@kyro.local>\r\n"));
+    // Header section must end with \r\n\r\n before body
+    assert!(mime_str.contains("\r\n\r\nEste es un mensaje con caracteres UTF-8."));
+    // Must NOT contain unencoded raw injected headers
+    assert!(!mime_str.contains("Bcc:"));
+}
+
+#[test]
+fn test_google_token_extraction_raw_and_vault_json() {
+    let adapter = GoogleAdapter::new();
+
+    // 1. Raw token string
+    let raw = "ya29.a0AfH6_SAMPLE_BEARER_TOKEN";
+    assert_eq!(adapter.extract_token(raw).unwrap(), raw);
+
+    // 2. JSON vault secret payload
+    let json_secret = r#"{"access_token": "ya29.extracted_token_123", "refresh_token": "1//rot_abc", "client_secret": null}"#;
+    assert_eq!(
+        adapter.extract_token(json_secret).unwrap(),
+        "ya29.extracted_token_123"
+    );
+
+    // 3. Fallback token field
+    let json_token = r#"{"token": "ya29.token_field_val"}"#;
+    assert_eq!(
+        adapter.extract_token(json_token).unwrap(),
+        "ya29.token_field_val"
+    );
+
+    // 4. Empty secret error
+    assert!(adapter.extract_token("   ").is_err());
+}
+
+#[test]
+fn test_revoked_folder_pruning_removes_unauthorized_indexed_docs() {
+    let (dir, db, _vault) = temp_db("prune_revoked");
+    let folder_a = dir.join("folder_a");
+    let folder_b = dir.join("folder_b");
+    fs::create_dir_all(&folder_a).unwrap();
+    fs::create_dir_all(&folder_b).unwrap();
+
+    let doc_a = folder_a.join("report_a.txt");
+    let doc_b = folder_b.join("report_b.txt");
+    fs::write(&doc_a, "Sensitive internal notes from folder A").unwrap();
+    fs::write(&doc_b, "Public syllabus from folder B").unwrap();
+
+    let auth_a = AuthorizedFolderRecord {
+        id: "auth_a".to_string(),
+        path: folder_a.to_string_lossy().to_string(),
+        display_name: "Folder A".to_string(),
+        added_at: 100,
+    };
+    let auth_b = AuthorizedFolderRecord {
+        id: "auth_b".to_string(),
+        path: folder_b.to_string_lossy().to_string(),
+        display_name: "Folder B".to_string(),
+        added_at: 101,
+    };
+    db.add_authorized_folder(&auth_a).unwrap();
+    db.add_authorized_folder(&auth_b).unwrap();
+
+    // Index both documents
+    let rec_a = DocumentIndexRecord {
+        path: doc_a.to_string_lossy().to_string(),
+        file_name: "report_a.txt".to_string(),
+        format: "txt".to_string(),
+        size_bytes: 40,
+        modified_at: 1000,
+        sha256: "hash_a".to_string(),
+        extracted_text: Some("Sensitive internal notes from folder A".to_string()),
+        indexed_at: 1000,
+    };
+    let rec_b = DocumentIndexRecord {
+        path: doc_b.to_string_lossy().to_string(),
+        file_name: "report_b.txt".to_string(),
+        format: "txt".to_string(),
+        size_bytes: 30,
+        modified_at: 1000,
+        sha256: "hash_b".to_string(),
+        extracted_text: Some("Public syllabus from folder B".to_string()),
+        indexed_at: 1000,
+    };
+    db.upsert_indexed_document(&rec_a).unwrap();
+    db.upsert_indexed_document(&rec_b).unwrap();
+
+    assert_eq!(db.list_indexed_documents().unwrap().len(), 2);
+
+    // Revoke folder A
+    db.remove_authorized_folder("auth_a").unwrap();
+    let remaining_folders = db.list_authorized_folders().unwrap();
+    assert_eq!(remaining_folders.len(), 1);
+
+    // Prune unauthorized indexed documents
+    let pruned_count = db
+        .prune_unauthorized_indexed_documents(&remaining_folders)
+        .unwrap();
+    assert_eq!(
+        pruned_count, 1,
+        "Exactly one unauthorized document must be pruned"
+    );
+
+    let remaining_docs = db.list_indexed_documents().unwrap();
+    assert_eq!(remaining_docs.len(), 1);
+    assert_eq!(remaining_docs[0].path, doc_b.to_string_lossy().to_string());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_file_organizer_toctou_symlink_traversal_rejection() {
+    let (dir, _db, _vault) = temp_db("toctou_symlink");
+    let authorized_root = dir.join("authorized");
+    let outside_dir = dir.join("outside_forbidden");
+    fs::create_dir_all(&authorized_root).unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+
+    let outside_secret = outside_dir.join("etc_shadow_mock.txt");
+    fs::write(&outside_secret, "root:x:0:0:root").unwrap();
+
+    // Create a symlink inside authorized root pointing to forbidden outside file
+    let malicious_symlink = authorized_root.join("innocent_looking_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_secret, &malicious_symlink).unwrap();
+
+    let plan = OrganizationPlan {
+        plan_id: "test_toctou".to_string(),
+        target_directory: authorized_root.clone(),
+        total_scanned: 1,
+        duplicates_count: 0,
+        conflicts_count: 0,
+        operations: vec![PlannedFileOp {
+            source_path: malicious_symlink.clone(),
+            destination_path: authorized_root.join("organized/innocent.txt"),
+            category: "Documents".to_string(),
+            reason: "Test organizing".to_string(),
+            file_size: 15,
+            file_hash: None,
+            is_duplicate: false,
+            duplicate_of: None,
+            conflict: None,
+        }],
+    };
+
+    let result = FileOrganizer::execute(&plan).unwrap();
+    assert_eq!(result.operations.len(), 1);
+    assert_eq!(result.operations[0].status, "failed");
+    assert!(result.operations[0]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("Security rejection"));
+
+    // Verify outside file was NOT moved
+    assert!(outside_secret.exists());
+
+    fs::remove_dir_all(&dir).ok();
 }

@@ -171,26 +171,236 @@ impl GoogleAdapter {
         }
     }
 
-    fn encode_rfc2822_message(
+    pub fn extract_token(&self, secret_raw: &str) -> Result<String, String> {
+        let trimmed = secret_raw.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(tok) = v.get("access_token").and_then(|t| t.as_str()) {
+                    return Ok(tok.trim().to_string());
+                }
+                if let Some(tok) = v.get("token").and_then(|t| t.as_str()) {
+                    return Ok(tok.trim().to_string());
+                }
+            }
+        }
+        if trimmed.is_empty() {
+            Err("No Google authentication token found in secure vault for this account".to_string())
+        } else {
+            Ok(trimmed.to_string())
+        }
+    }
+
+    /// Validates an individual email address (strict RFC 5322 subset).
+    /// Rejects control characters, invalid chars, missing domain/dot, multiple @ symbols.
+    pub fn validate_email_address(addr: &str) -> Result<String, String> {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() {
+            return Err("Email address cannot be empty".to_string());
+        }
+        if trimmed.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || c == '<'
+                || c == '>'
+                || c == '"'
+                || c == ':'
+                || c == ';'
+        }) {
+            return Err(format!(
+                "Email address '{}' contains invalid characters or control characters",
+                trimmed
+            ));
+        }
+        let parts: Vec<&str> = trimmed.split('@').collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "Email address '{}' must contain exactly one '@'",
+                trimmed
+            ));
+        }
+        let local = parts[0];
+        let domain = parts[1];
+        if local.is_empty() {
+            return Err(format!("Email address '{}' has empty local part", trimmed));
+        }
+        if domain.is_empty() || !domain.contains('.') {
+            return Err(format!(
+                "Email address '{}' has invalid domain part",
+                trimmed
+            ));
+        }
+        if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+            return Err(format!(
+                "Email address '{}' has malformed domain dots",
+                trimmed
+            ));
+        }
+        for c in domain.chars() {
+            if !c.is_alphanumeric() && c != '.' && c != '-' {
+                return Err(format!(
+                    "Email address domain '{}' contains invalid character '{}'",
+                    domain, c
+                ));
+            }
+        }
+        Ok(trimmed.to_string())
+    }
+
+    /// Validates and sanitizes a single recipient, which may be `user@example.com` or `Display Name <user@example.com>`.
+    /// RFC 2047 encodes display names containing non-ASCII characters or special symbols.
+    pub fn validate_and_sanitize_recipient(entry: &str) -> Result<String, String> {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine;
+
+        if entry
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == '\0' || (c.is_control() && c != '\t'))
+        {
+            return Err(
+                "Recipient contains carriage return, newline, or control characters".to_string(),
+            );
+        }
+
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err("Recipient cannot be empty".to_string());
+        }
+
+        if trimmed.contains('<') || trimmed.contains('>') {
+            let left_idx = trimmed
+                .find('<')
+                .ok_or_else(|| "Malformed recipient: missing '<'".to_string())?;
+            let right_idx = trimmed
+                .rfind('>')
+                .ok_or_else(|| "Malformed recipient: missing '>'".to_string())?;
+            if left_idx >= right_idx {
+                return Err("Malformed recipient: invalid angle brackets order".to_string());
+            }
+            if right_idx != trimmed.len() - 1 {
+                return Err("Malformed recipient: extra characters after '>'".to_string());
+            }
+            let display_name = trimmed[..left_idx].trim();
+            let raw_addr = &trimmed[left_idx + 1..right_idx];
+            let clean_addr = Self::validate_email_address(raw_addr)?;
+
+            if display_name.is_empty() {
+                Ok(clean_addr)
+            } else {
+                let sanitized_name = if !display_name.is_ascii()
+                    || display_name.contains('"')
+                    || display_name.contains(',')
+                    || display_name.contains(':')
+                {
+                    format!(
+                        "=?UTF-8?B?{}?=",
+                        BASE64_STANDARD.encode(display_name.as_bytes())
+                    )
+                } else {
+                    display_name.to_string()
+                };
+                Ok(format!("{} <{}>", sanitized_name, clean_addr))
+            }
+        } else {
+            let clean_addr = Self::validate_email_address(trimmed)?;
+            Ok(clean_addr)
+        }
+    }
+
+    /// Standards-compliant RFC 2822 MIME message construction.
+    /// Strictly rejects CRLF header injection across all untrusted inputs.
+    /// Applies RFC 2047 encoding for non-ASCII subjects and display names.
+    /// Safely structures threading headers (In-Reply-To and References).
+    pub fn encode_rfc2822_message(
         to: &str,
         subject: &str,
         body: &str,
         in_reply_to: Option<&str>,
-    ) -> String {
+    ) -> Result<String, String> {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
         use base64::Engine;
 
-        let mut raw = format!(
-            "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=UTF-8\r\n",
-            to, subject
-        );
-        if let Some(irt) = in_reply_to {
-            raw.push_str(&format!("In-Reply-To: {}\r\nReferences: {}\r\n", irt, irt));
+        // 1. Validate and sanitize recipient(s)
+        if to
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == '\0' || (c.is_control() && c != '\t'))
+        {
+            return Err("Header injection attempt: recipient field contains carriage return or newline characters".to_string());
         }
+        let recipient_parts: Vec<&str> = to.split(',').collect();
+        let mut sanitized_recipients = Vec::new();
+        for r in recipient_parts {
+            let s = r.trim();
+            if !s.is_empty() {
+                sanitized_recipients.push(Self::validate_and_sanitize_recipient(s)?);
+            }
+        }
+        if sanitized_recipients.is_empty() {
+            return Err("At least one valid recipient email address is required".to_string());
+        }
+        let clean_to = sanitized_recipients.join(", ");
+
+        // 2. Validate and RFC 2047 encode Subject
+        if subject
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == '\0' || (c.is_control() && c != '\t'))
+        {
+            return Err("Header injection attempt: subject field contains carriage return or newline characters".to_string());
+        }
+        let clean_subject = if !subject.is_ascii() {
+            format!("=?UTF-8?B?{}?=", BASE64_STANDARD.encode(subject.as_bytes()))
+        } else {
+            subject.to_string()
+        };
+
+        // 3. Construct base headers
+        let mut raw = format!(
+            "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=UTF-8\r\nMIME-Version: 1.0\r\n",
+            clean_to, clean_subject
+        );
+
+        // 4. Safely validate and append In-Reply-To / References if present
+        if let Some(irt) = in_reply_to {
+            let irt_trimmed = irt.trim();
+            if !irt_trimmed.is_empty() {
+                if irt_trimmed.chars().any(|c| {
+                    c == '\r' || c == '\n' || c == '\0' || c == ':' || (c.is_control() && c != '\t')
+                }) {
+                    return Err("Header injection attempt: in_reply_to contains invalid characters or newlines".to_string());
+                }
+                let clean_msg_id = irt_trimmed
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .trim();
+                if clean_msg_id.is_empty() {
+                    return Err("Invalid in_reply_to: empty message ID".to_string());
+                }
+                for c in clean_msg_id.chars() {
+                    if !c.is_alphanumeric()
+                        && c != '.'
+                        && c != '-'
+                        && c != '@'
+                        && c != '+'
+                        && c != '_'
+                        && c != '%'
+                    {
+                        return Err(format!(
+                            "Invalid character '{}' in in_reply_to message ID",
+                            c
+                        ));
+                    }
+                }
+                raw.push_str(&format!(
+                    "In-Reply-To: <{}>\r\nReferences: <{}>\r\n",
+                    clean_msg_id, clean_msg_id
+                ));
+            }
+        }
+
         raw.push_str("\r\n");
         raw.push_str(body);
 
-        BASE64_URL.encode(raw.as_bytes())
+        Ok(BASE64_URL.encode(raw.as_bytes()))
     }
 
     pub fn decode_base64url(s: &str) -> Result<Vec<u8>, String> {
@@ -469,7 +679,7 @@ impl NativeConnectorAdapter for GoogleAdapter {
         args: Value,
         vault: &Vault,
     ) -> Result<String, String> {
-        let token = vault
+        let secret_raw = vault
             .get_secret(&account.credential_key)
             .map_err(|e| format!("Failed to read credential from vault: {}", e))?
             .ok_or_else(|| {
@@ -478,6 +688,7 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     account.display_name
                 )
             })?;
+        let token = self.extract_token(&secret_raw)?;
 
         let (google_base, gmail_base) = self.resolve_base_urls(account);
 
@@ -627,7 +838,7 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     .ok_or("Missing required 'body' parameter")?;
                 let in_reply_to = args["in_reply_to"].as_str();
 
-                let encoded_msg = Self::encode_rfc2822_message(to, subject, body, in_reply_to);
+                let encoded_msg = Self::encode_rfc2822_message(to, subject, body, in_reply_to)?;
 
                 let url = format!("{}/gmail/v1/users/me/drafts", gmail_base);
                 let payload = json!({
@@ -664,7 +875,7 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     .as_str()
                     .ok_or("Missing required 'body' parameter")?;
 
-                let encoded_msg = Self::encode_rfc2822_message(to, subject, body, None);
+                let encoded_msg = Self::encode_rfc2822_message(to, subject, body, None)?;
 
                 let url = format!("{}/gmail/v1/users/me/messages/send", gmail_base);
                 let payload = json!({
@@ -860,20 +1071,48 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     q.append_pair("timeMax", &time_max);
                 }
 
-                let res = self
-                    .send_and_read_bounded(
-                        self.client.get(url).headers(headers),
-                        "Find meeting times",
-                    )
-                    .await?;
+                // Paginate events to ensure full coverage of the time window
+                let mut page_token: Option<String> = None;
+                let mut items: Vec<Value> = Vec::new();
+                let mut page_count = 0;
 
-                let items = res["items"].as_array().cloned().unwrap_or_default();
+                loop {
+                    let mut page_url = url.clone();
+                    if let Some(ref pt) = page_token {
+                        page_url.query_pairs_mut().append_pair("pageToken", pt);
+                    }
+                    let res = self
+                        .send_and_read_bounded(
+                            self.client.get(page_url).headers(headers.clone()),
+                            "Find meeting times",
+                        )
+                        .await?;
+
+                    if let Some(arr) = res["items"].as_array() {
+                        items.extend(arr.iter().cloned());
+                    }
+                    page_token = res["nextPageToken"].as_str().map(|s| s.to_string());
+                    page_count += 1;
+                    if page_token.is_none() || page_count >= 10 {
+                        break;
+                    }
+                }
+
                 let work_start_ts = work_start_local.timestamp_millis();
                 let work_end_ts = work_end_local.timestamp_millis();
 
                 let mut busy_intervals: Vec<(i64, i64, String)> = Vec::new();
 
                 for it in &items {
+                    // Ignore cancelled events
+                    if it["status"].as_str() == Some("cancelled") {
+                        continue;
+                    }
+                    // Ignore events marked as transparent ("Show as Free" / available)
+                    if it["transparency"].as_str() == Some("transparent") {
+                        continue;
+                    }
+
                     let summary = it["summary"].as_str().unwrap_or("Busy").to_string();
                     let start_val = &it["start"];
                     let end_val = &it["end"];
@@ -899,10 +1138,11 @@ impl NativeConnectorAdapter for GoogleAdapter {
                             .map(|d| d.timestamp_millis())
                             .ok()
                     } else if let Some(d_str) = end_val["date"].as_str() {
+                        // Google Calendar all-day event end dates are exclusive (midnight of end date)
                         chrono::NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
                             .ok()
                             .and_then(|nd| {
-                                tz.from_local_datetime(&nd.and_hms_opt(23, 59, 59)?)
+                                tz.from_local_datetime(&nd.and_hms_opt(0, 0, 0)?)
                                     .single()
                                     .map(|d| d.timestamp_millis())
                             })
@@ -948,23 +1188,28 @@ impl NativeConnectorAdapter for GoogleAdapter {
 
                 let req_duration_ms = duration_mins * 60 * 1000;
                 let mut candidate_slots: Vec<Value> = Vec::new();
+                let now_ts = chrono::Utc::now().timestamp_millis();
+                let min_notice_ms = 15 * 60 * 1000; // Require 15 mins lead time
+                let earliest_slot_ts = now_ts + min_notice_ms;
 
                 for (fs, fe) in &free_intervals {
                     let mut slot_start = *fs;
                     while slot_start + req_duration_ms <= *fe {
                         let slot_end = slot_start + req_duration_ms;
-                        let dt_s = chrono::DateTime::from_timestamp_millis(slot_start)
-                            .unwrap_or_default()
-                            .with_timezone(&tz);
-                        let dt_e = chrono::DateTime::from_timestamp_millis(slot_end)
-                            .unwrap_or_default()
-                            .with_timezone(&tz);
-                        candidate_slots.push(json!({
-                            "start": dt_s.to_rfc3339(),
-                            "end": dt_e.to_rfc3339(),
-                            "display": format!("{} – {} ({})", dt_s.format("%I:%M %p"), dt_e.format("%I:%M %p"), tz_str),
-                            "duration_minutes": duration_mins,
-                        }));
+                        if slot_start >= earliest_slot_ts {
+                            let dt_s = chrono::DateTime::from_timestamp_millis(slot_start)
+                                .unwrap_or_default()
+                                .with_timezone(&tz);
+                            let dt_e = chrono::DateTime::from_timestamp_millis(slot_end)
+                                .unwrap_or_default()
+                                .with_timezone(&tz);
+                            candidate_slots.push(json!({
+                                "start": dt_s.to_rfc3339(),
+                                "end": dt_e.to_rfc3339(),
+                                "display": format!("{} – {} ({})", dt_s.format("%I:%M %p"), dt_e.format("%I:%M %p"), tz_str),
+                                "duration_minutes": duration_mins,
+                            }));
+                        }
                         slot_start += 30 * 60 * 1000;
                     }
                 }
@@ -1003,10 +1248,11 @@ impl NativeConnectorAdapter for GoogleAdapter {
         account: &ConnectedAccountRecord,
         vault: &Vault,
     ) -> Result<String, String> {
-        let token = vault
+        let secret_raw = vault
             .get_secret(&account.credential_key)
             .map_err(|e| format!("Failed to read credential: {}", e))?
             .ok_or_else(|| "No credential found in vault for this Google account".to_string())?;
+        let token = self.extract_token(&secret_raw)?;
 
         let (google_base, _) = self.resolve_base_urls(account);
         let url = format!("{}/oauth2/v2/userinfo", google_base);

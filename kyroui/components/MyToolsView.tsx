@@ -55,6 +55,7 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
 
   // Study Tab State
   const [studyDocPath, setStudyDocPath] = useState("");
+  const [studyTopic, setStudyTopic] = useState("");
   const [studyNotes, setStudyNotes] = useState<StudyNotesResult | null>(null);
   const [isGeneratingNotes, setIsGeneratingNotes] = useState(false);
   const [revealedCardIndex, setRevealedCardIndex] = useState<number | null>(null);
@@ -163,7 +164,7 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
     try {
       const res = await invoke<StudyNotesResult>("generate_study_notes", {
         path: studyDocPath.trim(),
-        topic: null,
+        topic: studyTopic.trim() || null,
       });
       setStudyNotes(res);
     } catch (e: any) {
@@ -523,22 +524,31 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
               </button>
             </div>
 
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={studyDocPath}
-                onChange={(e) => setStudyDocPath(e.target.value)}
-                placeholder="Enter path to document or PDF file (e.g. /home/user/Documents/syllabus.pdf)..."
-                className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-200 placeholder-neutral-400 focus:outline-none"
-              />
-              <button
-                onClick={handleGenerateStudyNotes}
-                disabled={isGeneratingNotes}
-                className="px-4 py-2 bg-purple-950/50 hover:bg-purple-900/50 border border-purple-800/60 rounded-lg text-xs font-semibold text-purple-200 flex items-center gap-1.5 transition"
-              >
-                {isGeneratingNotes ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-purple-300" />}
-                Generate Notes
-              </button>
+            <div className="space-y-2">
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                <input
+                  type="text"
+                  value={studyDocPath}
+                  onChange={(e) => setStudyDocPath(e.target.value)}
+                  placeholder="Enter path to document or PDF file (e.g. /home/user/Documents/syllabus.pdf)..."
+                  className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-200 placeholder-neutral-400 focus:outline-none"
+                />
+                <input
+                  type="text"
+                  value={studyTopic}
+                  onChange={(e) => setStudyTopic(e.target.value)}
+                  placeholder="Focus topic (optional, e.g. 'Chapter 3' or 'Final Exam')..."
+                  className="w-full sm:w-64 px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-200 placeholder-neutral-400 focus:outline-none"
+                />
+                <button
+                  onClick={handleGenerateStudyNotes}
+                  disabled={isGeneratingNotes}
+                  className="px-4 py-2 bg-purple-950/50 hover:bg-purple-900/50 border border-purple-800/60 rounded-lg text-xs font-semibold text-purple-200 flex items-center justify-center gap-1.5 transition shrink-0"
+                >
+                  {isGeneratingNotes ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-purple-300" />}
+                  Generate Notes
+                </button>
+              </div>
             </div>
 
             {/* Study Notes Outcome */}

@@ -634,19 +634,32 @@ impl FileAssistant {
             }
 
             if let Ok(ft) = entry.file_type() {
-                if ft.is_symlink() {
-                    if let Ok(canon) = fs::canonicalize(&path) {
-                        if !canon.starts_with(&canonical_root) {
-                            continue; // Symlink escapes authorized root!
+                let resolved_path = if ft.is_symlink() {
+                    match fs::canonicalize(&path) {
+                        Ok(canon) => {
+                            if !canon.starts_with(&canonical_root) {
+                                continue; // Symlink escapes authorized root!
+                            }
+                            canon
                         }
-                    } else {
-                        continue;
+                        Err(_) => continue,
                     }
-                }
-                if ft.is_file() {
-                    acc.push(path);
-                } else if ft.is_dir() {
-                    Self::collect_searchable_files(root, &path, acc, depth + 1, max_depth);
+                } else {
+                    path
+                };
+
+                if let Ok(meta) = fs::metadata(&resolved_path) {
+                    if meta.is_file() {
+                        acc.push(resolved_path);
+                    } else if meta.is_dir() {
+                        Self::collect_searchable_files(
+                            root,
+                            &resolved_path,
+                            acc,
+                            depth + 1,
+                            max_depth,
+                        );
+                    }
                 }
             }
         }
