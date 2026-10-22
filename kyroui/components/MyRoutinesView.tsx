@@ -24,7 +24,7 @@ interface MyRoutinesViewProps {
   onAskPrompt?: (prompt: string) => void;
 }
 
-function formatCronDescription(cron: string): string {
+export function formatCronDescription(cron: string): string {
   const parts = cron.trim().split(/\s+/);
   if (parts.length < 5) return cron;
   const [min, hour, dom, , dow] = parts;

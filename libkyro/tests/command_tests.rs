@@ -971,3 +971,361 @@ async fn test_connect_account_token_command() {
     assert!(unsupp.is_err());
 }
 
+#[tokio::test]
+async fn test_artifact_lifecycle_and_content_export() {
+    let (_ctx, state) = setup_test_context("artifact_lifecycle");
+
+    // Create an artifact record
+    let art_id = "art_test_123".to_string();
+    let file_path = _ctx.dir.join("test_art.md");
+    std::fs::write(&file_path, "# Sample Markdown Artifact\nLine 1\nLine 2").unwrap();
+
+    let record = kyro_lib::storage::ArtifactRecord {
+        id: art_id.clone(),
+        run_id: None,
+        conversation_id: None,
+        name: "test_art.md".to_string(),
+        file_path: file_path.to_string_lossy().to_string(),
+        artifact_type: "markdown".to_string(),
+        mime_type: "text/markdown".to_string(),
+        size_bytes: 40,
+        created_at: 1000,
+        metadata_json: None,
+    };
+    state.db.create_artifact(&record).unwrap();
+
+    // Read artifact content
+    let content = read_artifact_content(state.clone(), art_id.clone()).unwrap();
+    assert!(content.contains("Sample Markdown Artifact"));
+
+    // Add artifact comment
+    add_artifact_comment(state.clone(), art_id.clone(), "Review comment".to_string(), false).unwrap();
+    let art_fetched = get_artifact(state.clone(), art_id.clone()).unwrap();
+    assert!(art_fetched.is_some());
+
+    // Export artifact to target path
+    let export_target = _ctx.dir.join("exported_art.md");
+    export_artifact(state.clone(), art_id.clone(), export_target.to_string_lossy().to_string()).unwrap();
+    assert!(export_target.exists());
+
+    // Search workspace (covers universal search over memories)
+    save_memory_fact(
+        state.clone(),
+        "workspace".to_string(),
+        "notes".to_string(),
+        "SampleKey".to_string(),
+        "Sample memory content".to_string(),
+        "user".to_string(),
+    )
+    .unwrap();
+    let search_res = search_workspace(state.clone(), "Sample".to_string()).unwrap();
+    assert!(!search_res.is_empty());
+
+    // Delete artifact
+    let deleted = delete_artifact(state.clone(), art_id.clone()).unwrap();
+    assert!(deleted);
+}
+
+#[tokio::test]
+async fn test_workspace_search_and_templates_export_import() {
+    let (_ctx, state) = setup_test_context("templates_cmd");
+
+    // Starter templates
+    let starter = get_starter_templates();
+    assert!(!starter.is_empty());
+
+    // Export workspace templates
+    let exp_res = export_workspace_templates(state.clone(), "TestPack".to_string(), "Description".to_string()).unwrap();
+    assert!(exp_res.contains("TestPack"));
+
+    // Import workspace templates
+    let imp_res = import_workspace_templates(state.clone(), exp_res);
+    assert!(imp_res.is_ok());
+}
+
+#[tokio::test]
+async fn test_routine_portable_export_and_import() {
+    let routine = kyro_lib::teach_task::portable_routine::EditableRoutine {
+        version: "kyro.routine.v1".to_string(),
+        id: "rt_editable".to_string(),
+        name: "Sync Workflows".to_string(),
+        description: "Scheduled workflow".to_string(),
+        cron_expression: Some("0 9 * * 1-5".to_string()),
+        enabled: true,
+        parameters: vec![],
+        steps: vec![],
+        created_at: 1000,
+        updated_at: 1000,
+        trusted: true,
+    };
+
+    let exported = export_routine(routine.clone()).await.unwrap();
+    assert!(exported.contains("Sync Workflows"));
+
+    let imported = import_routine(exported).await.unwrap();
+    assert_eq!(imported.name, "Sync Workflows");
+    assert_eq!(imported.cron_expression.as_deref(), Some("0 9 * * 1-5"));
+}
+
+#[tokio::test]
+async fn test_folder_suggestions_and_safe_file_ops() {
+    let (_ctx, state) = setup_test_context("safe_file_ops");
+
+    // Suggested folders
+    let suggested = get_suggested_folders();
+    assert!(suggested.is_ok());
+
+    // Authorize folder in state
+    add_authorized_folder(state.clone(), _ctx.dir.to_string_lossy().to_string(), Some("TestDir".to_string()), None).unwrap();
+
+    // Detect duplicates in temp directory
+    let dupes = detect_folder_duplicates(state.clone(), _ctx.dir.to_string_lossy().to_string()).unwrap();
+    assert_eq!(dupes.len(), 0);
+
+    // List file transactions
+    let txs = list_file_transactions(state.clone(), None).unwrap();
+    assert_eq!(txs.len(), 0);
+
+    // Safe file operation
+    let test_file = _ctx.dir.join("safe_test.txt");
+    std::fs::write(&test_file, "Safe content").unwrap();
+    let dest_file = _ctx.dir.join("safe_dest.txt");
+    let exec_res = execute_safe_file_op(
+        state.clone(),
+        "copy".to_string(),
+        test_file.to_string_lossy().to_string(),
+        Some(dest_file.to_string_lossy().to_string()),
+        false,
+    );
+    assert!(exec_res.is_ok());
+}
+
+#[tokio::test]
+async fn test_screen_capture_and_ghost_mode_commands() {
+    let (_ctx, state) = setup_test_context("screen_ghost");
+
+    // Ghost status and toggle
+    let ghost = get_ghost_status();
+    let _ = ghost;
+    let _ = toggle_ghost_mode(false);
+
+    // Open windows & screenshot commands
+    let _ = get_open_windows();
+    let _ = take_screenshot(None);
+    let _ = take_region_screenshot(0, 0, 10, 10);
+    abort_computer_use();
+
+    // Command permissions
+    let perm = check_command_permission("ls -la".to_string(), true);
+    assert!(perm.allowed);
+
+    // Explain screen capture without model fallback
+    let sample_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string();
+    let expl = explain_screen_capture(sample_png, "What is this?".to_string(), None, state.clone()).await.unwrap();
+    assert!(!expl.summary.is_empty());
+}
+
+#[tokio::test]
+async fn test_connector_policies_and_account_lifecycle() {
+    let (_ctx, state) = setup_test_context("connector_cmd_lifecycle");
+
+    // List catalog & accounts
+    let catalog = list_connector_catalog(state.clone()).unwrap();
+    assert!(!catalog.is_empty());
+    let accounts = list_connected_accounts(state.clone()).unwrap();
+    assert_eq!(accounts.len(), 0);
+
+    // Start OAuth flow for GitHub
+    let oauth_init = start_oauth_flow(
+        state.clone(),
+        "github".to_string(),
+        Some("client_id_123".to_string()),
+        Some("client_secret_xyz".to_string()),
+    )
+    .await;
+    assert!(oauth_init.is_ok());
+    let init_res = oauth_init.unwrap();
+    assert!(!init_res.session_id.is_empty());
+
+    // OAuth status
+    let status = get_oauth_status(state.clone(), init_res.session_id.clone()).await.unwrap();
+    assert_eq!(status.status, "pending");
+
+    // Complete OAuth flow (fails gracefully when code is missing/invalid)
+    let comp = complete_oauth_flow(state.clone(), init_res.session_id, None).await;
+    assert!(comp.is_err());
+
+    // Disconnect non-existent account
+    let disc = disconnect_account(state.clone(), "fake-acc".to_string()).await;
+    assert!(disc.is_err());
+
+    // Test connection on non-existent account
+    let test_c = test_connector_connection(state.clone(), "fake-acc".to_string()).await;
+    assert!(test_c.is_err());
+
+    // Connector tools before accounts are connected
+    let tools_empty = get_connector_tools(state.clone()).await.unwrap();
+    assert_eq!(tools_empty.len(), 0);
+
+    // Account tool policies for non-existent account
+    let policies = list_account_tool_policies(state.clone(), "acc-1".to_string()).unwrap();
+    assert_eq!(policies.len(), 0);
+    let acc_tools_missing = get_account_tools(state.clone(), "acc-1".to_string()).await;
+    assert!(acc_tools_missing.is_err());
+
+    // Save tool policy on non-existent account returns error
+    let save_pol_missing = save_account_tool_policy(
+        state.clone(),
+        "non-existent".to_string(),
+        "create_issue".to_string(),
+        "ask".to_string(),
+        "Risk notes".to_string(),
+    )
+    .await;
+    assert!(save_pol_missing.is_err());
+
+    // Create connected account and refresh connector tools
+    let acc_record = kyro_lib::storage::db::ConnectedAccountRecord {
+        id: "acc-1".to_string(),
+        connector_id: "github".to_string(),
+        account_identifier: "octocat".to_string(),
+        display_name: "Octocat".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[\"repo\"]".to_string(),
+        credential_key: "vault_key".to_string(),
+        config_json: "{}".to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+        last_connected_at: Some(1000),
+        last_error: None,
+        expires_at: None,
+    };
+    state.db.create_connected_account(&acc_record).unwrap();
+    let tools = get_connector_tools(state.clone()).await.unwrap();
+    assert!(!tools.is_empty());
+
+    let acc_tools = get_account_tools(state.clone(), "acc-1".to_string()).await.unwrap();
+    assert!(!acc_tools.is_empty());
+
+    let first_tool = acc_tools[0].name.clone();
+    let save_ok = save_account_tool_policy(
+        state.clone(),
+        "acc-1".to_string(),
+        first_tool,
+        "ask".to_string(),
+        "Risk notes".to_string(),
+    )
+    .await;
+    assert!(save_ok.is_ok());
+}
+
+#[tokio::test]
+async fn test_checkpoint_and_build_doctor_commands() {
+    let (_ctx, _state) = setup_test_context("checkpoint_doctor");
+
+    // Create code checkpoint
+    let cp_res = create_code_checkpoint(
+        _ctx.dir.to_string_lossy().to_string(),
+        "Test Checkpoint".to_string(),
+    )
+    .await;
+    assert!(cp_res.is_ok());
+    let cp = cp_res.unwrap();
+    assert_eq!(cp.description, "Test Checkpoint");
+
+    // Rollback code checkpoint
+    let rb_res = rollback_code_checkpoint(cp).await;
+    assert!(rb_res.is_ok());
+
+    // Diagnose build failure
+    let diag = diagnose_build_failure(
+        _ctx.dir.to_string_lossy().to_string(),
+        "npm run build".to_string(),
+        "Error: Cannot find module 'react'".to_string(),
+    )
+    .await;
+    assert!(diag.is_ok());
+    let d = diag.unwrap();
+    assert!(d.root_cause_error.contains("missing") || d.root_cause_error.contains("module") || !d.suggested_repair.is_empty());
+}
+
+#[tokio::test]
+async fn test_multiagent_workspace_and_baseline_commands() {
+    let (_ctx, _state) = setup_test_context("multiagent_baseline");
+
+    // Multi-agent workspace
+    let ws = create_multi_agent_workspace(
+        "parent_run_1".to_string(),
+        _ctx.dir.to_string_lossy().to_string(),
+        "Build feature".to_string(),
+    )
+    .await;
+    assert!(ws.is_ok());
+    let ws_record = ws.unwrap();
+    assert_eq!(ws_record.parent_run_id, "parent_run_1");
+
+    let rec = reconcile_multi_agent_workspace(
+        _ctx.dir.to_string_lossy().to_string(),
+        _ctx.dir.to_string_lossy().to_string(),
+        ws_record.workspace_id,
+    )
+    .await;
+    assert!(rec.is_ok());
+
+    // Visual baseline commands
+    let sample_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string();
+    let set_base = set_audit_baseline(
+        _ctx.dir.to_string_lossy().to_string(),
+        "/home".to_string(),
+        "1280x800".to_string(),
+        sample_png.clone(),
+        None,
+    )
+    .await;
+    assert!(set_base.is_ok());
+
+    let get_base = get_audit_baseline(
+        _ctx.dir.to_string_lossy().to_string(),
+        "/home".to_string(),
+        "1280x800".to_string(),
+    )
+    .await;
+    assert!(get_base.is_ok());
+    assert!(get_base.unwrap().is_some());
+
+    let comp_base = compare_visual_baseline(
+        sample_png.clone(),
+        sample_png,
+        "/home".to_string(),
+        "1280x800".to_string(),
+        Some(1.0),
+    )
+    .await;
+    assert!(comp_base.is_ok());
+}
+
+#[tokio::test]
+async fn test_terminal_and_timeline_commands() {
+    let (_ctx, state) = setup_test_context("term_timeline");
+
+    // Terminal commands (gracefully no-op when no active pty session)
+    let write_in = write_terminal_input(state.clone(), "echo 1\n".to_string());
+    assert!(write_in.is_ok());
+
+    let resize = resize_terminal(state.clone(), 24, 80);
+    assert!(resize.is_ok());
+
+    // Timeline steps
+    let steps = get_timeline_steps(state.clone(), None).unwrap();
+    assert_eq!(steps.len(), 0);
+
+    let clear = clear_timeline_steps(state.clone());
+    assert!(clear.is_ok());
+
+    // Installed apps
+    let apps = get_installed_apps();
+    let _ = apps;
+}
+
+

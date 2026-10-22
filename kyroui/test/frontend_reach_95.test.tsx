@@ -292,9 +292,10 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
       fireEvent.click(screen.getByLabelText("Close"));
 
       // Click Build Doctor card
-      fireEvent.click(screen.getByText("Build Doctor"));
+      const doctorCards = screen.getAllByText("Build Doctor");
+      fireEvent.click(doctorCards[0]);
       await waitFor(() => {
-        expect(screen.getByText("Build Doctor")).toBeInTheDocument();
+        expect(screen.getAllByText("Build Doctor").length).toBeGreaterThan(0);
       });
       fireEvent.click(screen.getByLabelText("Close"));
 
@@ -441,14 +442,18 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
       });
 
       // Close Policy Dialog only (not main modal)
-      const closePolicyBtn = screen.getByText(/Action Governance:/i).closest("div")!.parentElement!.querySelector("button")!;
+      const closePolicyBtn = screen.getByTitle("Close governance");
       fireEvent.click(closePolicyBtn);
+
+      await waitFor(() => {
+        expect(screen.queryByTitle("Close governance")).not.toBeInTheDocument();
+      });
 
       // Disconnect Account
       await waitFor(() => {
-        expect(screen.getByTitle("Disconnect account and revoke credentials")).toBeInTheDocument();
+        expect(screen.getByTitle("Safely remove account and purge vault credentials")).toBeInTheDocument();
       });
-      fireEvent.click(screen.getByTitle("Disconnect account and revoke credentials"));
+      fireEvent.click(screen.getByTitle("Safely remove account and purge vault credentials"));
       await waitFor(() => {
         expect(mockedInvoke).toHaveBeenCalledWith("disconnect_account", { accountId: "acc-101" });
       });
@@ -469,9 +474,10 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
         if (cmd === "remove_authorized_folder") return {};
         if (cmd === "generate_study_notes") {
           return {
-            summary: "Key exam concepts",
-            key_dates: ["2026-11-01"],
-            flashcards: [{ question: "Q1", answer: "A1" }],
+            doc_name: "syllabus.pdf",
+            overview: "Key exam concepts",
+            key_dates_and_milestones: ["2026-11-01"],
+            revision_flashcards: [{ question: "Q1", answer: "A1" }],
           };
         }
         return {};
@@ -523,7 +529,7 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
       });
 
       // Category 3: Screen Diagnostics
-      fireEvent.click(screen.getByText(/Screen & Diagnostics/i));
+      fireEvent.click(screen.getByText(/Screen & Error Help/i));
       await waitFor(() => {
         expect(screen.getByText('"Help me fix this error"')).toBeInTheDocument();
       });
@@ -532,7 +538,7 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
       expect(onAskPromptMock).toHaveBeenCalledWith("Explain the error on my screen and help me fix it");
 
       // Category 4: Web Research & Comparison
-      fireEvent.click(screen.getByText(/Web & Comparison/i));
+      fireEvent.click(screen.getByText(/Web Research & Compare/i));
       await waitFor(() => {
         expect(screen.getByPlaceholderText(/What topic or question would you like to research/i)).toBeInTheDocument();
       });
@@ -599,8 +605,12 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
         {
           source_path: "/tmp/a.pdf",
           destination_path: "/tmp/Documents/a.pdf",
+          category: "Documents",
           action: "move",
           status: "pending",
+          is_duplicate: false,
+          conflict: null,
+          size_bytes: 1024,
         },
       ],
       conflicts_count: 0,
@@ -610,7 +620,7 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
     it("toggles scan options and cancels previewed organization plan", async () => {
       mockedInvoke.mockImplementation(async (cmd: string, args: any) => {
         if (cmd === "list_authorized_folders") return [];
-        if (cmd === "plan_file_organization") return mockPlan;
+        if (cmd === "preview_file_organization") return mockPlan;
         return {};
       });
 
@@ -673,7 +683,7 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
       const continueBtn = screen.getByRole("button", { name: /Continue/i });
       fireEvent.click(continueBtn);
 
-      // Step 2: API Key -> Back
+      // Step 2: AI Model Setup -> Back
       await waitFor(() => {
         expect(screen.getByText("AI Model Setup")).toBeInTheDocument();
         expect(screen.getByRole("button", { name: /Back/i })).toBeInTheDocument();
@@ -693,17 +703,17 @@ describe("Frontend Reach 95% Coverage Test Suite", () => {
       fireEvent.click(screen.getByRole("button", { name: /Continue/i })); // to Step 3
 
       await waitFor(() => {
-        expect(screen.getByText("Authorize Folders")).toBeInTheDocument();
+        expect(screen.getByText("Choose Authorized Folders")).toBeInTheDocument();
       });
       fireEvent.click(screen.getByRole("button", { name: /Continue/i })); // to Step 4
 
       await waitFor(() => {
-        expect(screen.getByText("Everyday vs. Dev Mode")).toBeInTheDocument();
+        expect(screen.getByText("Optional Connected Services")).toBeInTheDocument();
       });
       fireEvent.click(screen.getByRole("button", { name: /Continue/i })); // to Step 5
 
       await waitFor(() => {
-        expect(screen.getByText("Local Security & Privacy")).toBeInTheDocument();
+        expect(screen.getByText("Privacy & Safety Principles")).toBeInTheDocument();
       });
       fireEvent.click(screen.getByRole("button", { name: /Continue/i })); // to Step 6
 

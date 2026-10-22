@@ -53,7 +53,6 @@ async fn prerequisites_available() -> (bool, String) {
 }
 
 #[tokio::test]
-#[ignore = "requires Firefox and Node.js; run with --ignored"]
 async fn test_ui_audit_finds_the_known_defects() {
     let (available, reason) = prerequisites_available().await;
     if !available {
@@ -284,7 +283,6 @@ async fn test_ui_audit_finds_the_known_defects() {
 }
 
 #[tokio::test]
-#[ignore = "requires Firefox and Node.js; run with --ignored"]
 async fn test_ui_audit_reports_missing_projects_honestly() {
     let (available, reason) = prerequisites_available().await;
     if !available {

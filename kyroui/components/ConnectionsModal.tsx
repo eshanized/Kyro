@@ -35,7 +35,7 @@ interface ConnectionsModalProps {
   initialTab?: "discover" | "connected" | "custom_mcp";
 }
 
-function parseArgsSafe(raw: string): string[] {
+export function parseArgsSafe(raw: string): string[] {
   const trimmed = raw.trim();
   if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
     try {
@@ -1310,7 +1310,12 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                     Configure whether specific operations execute automatically, require human approval, or are denied. Destructive actions cannot be set to auto-approve.
                   </p>
                 </div>
-                <button onClick={() => setManagingAccount(null)} className="text-neutral-400 hover:text-white">
+                <button
+                  type="button"
+                  title="Close governance"
+                  onClick={() => setManagingAccount(null)}
+                  className="text-neutral-400 hover:text-white"
+                >
                   <X className="w-4 h-4" />
                 </button>
               </div>
