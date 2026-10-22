@@ -73,13 +73,25 @@ pub struct TokenExchangeResult {
 #[derive(Clone, Default)]
 pub struct OAuthManager {
     sessions: Arc<Mutex<HashMap<String, PendingOAuthSession>>>,
+    cancellation_senders: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl OAuthManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_senders: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register a cancellation trigger for a session's background listener
+    pub async fn register_cancellation_sender(
+        &self,
+        session_id: &str,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut cancels = self.cancellation_senders.lock().await;
+        cancels.insert(session_id.to_string(), sender);
     }
 
     /// Generate cryptographically secure state and PKCE verifier/challenge (RFC 7636)
@@ -315,10 +327,27 @@ impl OAuthManager {
         }
     }
 
+    /// Mark session as finalizing for manual exchange
+    pub async fn mark_finalizing(
+        &self,
+        session_id: &str,
+        token: TokenExchangeResult,
+    ) -> Result<(), String> {
+        let mut lock = self.sessions.lock().await;
+        let session = lock
+            .get_mut(session_id)
+            .ok_or_else(|| "OAuth session not found".to_string())?;
+        session.status = OAuthSessionStatus::Finalizing { token };
+        Ok(())
+    }
+
     /// Mark finalization as successful and clean up temporary session data
     pub async fn finalize_success(&self, session_id: &str) {
         let mut lock = self.sessions.lock().await;
         lock.remove(session_id);
+        drop(lock);
+        let mut cancels = self.cancellation_senders.lock().await;
+        cancels.remove(session_id);
     }
 
     /// Mark finalization as failed
@@ -327,6 +356,9 @@ impl OAuthManager {
         if let Some(session) = lock.get_mut(session_id) {
             session.status = OAuthSessionStatus::Failed { error };
         }
+        drop(lock);
+        let mut cancels = self.cancellation_senders.lock().await;
+        cancels.remove(session_id);
     }
 
     /// Retrieve and remove completed token result
@@ -393,10 +425,55 @@ impl OAuthManager {
     }
 
     /// Cancel a session and mark status as Cancelled
-    pub async fn cancel_session(&self, session_id: &str) {
+    pub async fn cancel_session(&self, session_id: &str) -> Result<(), String> {
+        let trimmed_id = session_id.trim();
+        if trimmed_id.is_empty() {
+            return Err("Invalid OAuth session identifier: empty session id".to_string());
+        }
+
         let mut lock = self.sessions.lock().await;
-        if let Some(s) = lock.get_mut(session_id) {
-            s.status = OAuthSessionStatus::Cancelled;
+        let session = lock
+            .get_mut(trimmed_id)
+            .ok_or_else(|| format!("OAuth session '{}' not found", trimmed_id))?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        if now > session.expires_at && session.status != OAuthSessionStatus::Cancelled {
+            session.status = OAuthSessionStatus::Expired;
+            return Err(format!(
+                "OAuth session '{}' has already expired",
+                trimmed_id
+            ));
+        }
+
+        match &session.status {
+            OAuthSessionStatus::Completed { .. } | OAuthSessionStatus::Finalizing { .. } => {
+                Err(format!(
+                    "Cannot cancel OAuth session '{}': authorization already completed",
+                    trimmed_id
+                ))
+            }
+            OAuthSessionStatus::Cancelled => Err(format!(
+                "OAuth session '{}' is already cancelled",
+                trimmed_id
+            )),
+            OAuthSessionStatus::Expired => Err(format!(
+                "OAuth session '{}' has already expired",
+                trimmed_id
+            )),
+            OAuthSessionStatus::Pending
+            | OAuthSessionStatus::CallbackReceived { .. }
+            | OAuthSessionStatus::Exchanging
+            | OAuthSessionStatus::Failed { .. } => {
+                session.status = OAuthSessionStatus::Cancelled;
+                drop(lock);
+
+                let mut cancels = self.cancellation_senders.lock().await;
+                if let Some(sender) = cancels.remove(trimmed_id) {
+                    let _ = sender.send(());
+                }
+
+                Ok(())
+            }
         }
     }
 

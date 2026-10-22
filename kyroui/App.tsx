@@ -81,7 +81,26 @@ import {
   HelpCircle,
   CheckCircle2,
   ListOrdered,
+  RefreshCw,
+  Cpu,
 } from "lucide-react";
+
+export const getModelDisplayInfo = (modelId?: string | null) => {
+  const mid = typeof modelId === "string" && modelId.trim() ? modelId : "nvidia/nemotron-3-ultra-550b-a55b";
+  if (mid.includes("nemotron-3-ultra")) return { label: "Nemotron-3 Ultra", badge: "550B", isNvidia: true };
+  if (mid.includes("llama-3.3-70b")) return { label: "Llama 3.3 Instruct", badge: "70B", isNvidia: false };
+  if (mid.includes("llama-3.2-90b")) return { label: "Llama 3.2 Vision", badge: "90B", isNvidia: false };
+  if (mid.includes("claude-3-5-sonnet")) return { label: "Claude 3.5 Sonnet", badge: "Anthropic", isNvidia: false };
+  if (mid.includes("gpt-4o-mini")) return { label: "GPT-4o Mini", badge: "OpenAI", isNvidia: false };
+  if (mid.includes("gpt-4o")) return { label: "GPT-4o", badge: "OpenAI", isNvidia: false };
+  if (mid.includes("gemini-1.5-pro")) return { label: "Gemini 1.5 Pro", badge: "Google", isNvidia: false };
+  if (mid.includes("gemini-1.5-flash")) return { label: "Gemini 1.5 Flash", badge: "Google", isNvidia: false };
+  if (mid.includes("deepseek-coder")) return { label: "DeepSeek Coder", badge: "33B", isNvidia: false };
+  if (mid.includes("mistral-large")) return { label: "Mistral Large", badge: "Mistral", isNvidia: false };
+  const parts = mid.split("/");
+  const name = parts[1] || parts[0];
+  return { label: name.slice(0, 20), badge: parts[0]?.slice(0, 8) || "LLM", isNvidia: mid.startsWith("nvidia/") };
+};
 
 export const App: React.FC = () => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -110,14 +129,24 @@ export const App: React.FC = () => {
   // Structured Task Plan before consequential operations
   const [activePlan, setActivePlan] = useState<{
     id: string;
+    runId: string;
     goal: string;
     understanding: string;
     resources: string[];
-    steps: { text: string; done: boolean }[];
-    status: "planning" | "approved" | "executing" | "completed" | "cancelled";
+    steps: { id: string; text: string; done?: boolean; status: "pending" | "running" | "completed" | "failed" | "unverified"; evidence?: string }[];
+    status: "planning" | "approved" | "executing" | "completed" | "failed" | "cancelled" | "unverified";
     accomplished: string[];
     remaining: string[];
   } | null>(null);
+
+  const handleSelectModel = async (model: string) => {
+    setSelectedModel(model);
+    try {
+      await invoke("save_selected_model", { model });
+    } catch (err) {
+      console.error("Failed to persist selected model to SQLite settings:", err);
+    }
+  };
 
   const handleSetExperienceMode = (mode: "everyday" | "dev") => {
     setExperienceMode(mode);
@@ -212,6 +241,12 @@ export const App: React.FC = () => {
     loadConversations();
     loadDefaultBot();
 
+    invoke<string>("get_selected_model")
+      .then((saved) => {
+        if (typeof saved === "string" && saved.trim()) setSelectedModel(saved);
+      })
+      .catch((err) => console.warn("Failed to load persisted model from SQLite settings:", err));
+
     try {
       const onboardingDone = localStorage.getItem("kyro_onboarding_completed");
       if (!onboardingDone) {
@@ -226,7 +261,7 @@ export const App: React.FC = () => {
       Notification.requestPermission().catch(() => {});
     }
 
-    // Initialize Web Speech API for zero-cloud voice dictation
+    // Initialize Web Speech API for voice dictation (speech transcription is handled by the platform/webview provider)
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (SpeechRecognition) {
@@ -279,6 +314,73 @@ export const App: React.FC = () => {
         };
       });
 
+      // Update active plan evidence based on verifiable tool outcomes
+      setActivePlan((prev) => {
+        if (!prev || prev.runId !== payload.run_id) return prev;
+        const newAccomplished = [...prev.accomplished];
+        const newRemaining = [...prev.remaining];
+        let hasToolError = false;
+        let hasVerification = false;
+        let actionCompleted = false;
+
+        for (const res of payload.tool_results || []) {
+          if (res.is_error) {
+            hasToolError = true;
+            const errSummary = `Error in ${res.name}: ${res.output.slice(0, 80)}`;
+            if (!newRemaining.includes(errSummary)) {
+              newRemaining.push(errSummary);
+            }
+          } else {
+            const accSummary = `Executed ${res.name}`;
+            if (!newAccomplished.includes(accSummary)) {
+              newAccomplished.push(accSummary);
+            }
+            if (/verify|test|check|inspect|diff|compare|validate/i.test(res.name)) {
+              hasVerification = true;
+            } else {
+              actionCompleted = true;
+            }
+          }
+        }
+
+        const updatedSteps = prev.steps.map((st) => {
+          if (st.id === "step_inspect") {
+            return {
+              ...st,
+              status: (hasToolError ? "failed" : "completed") as any,
+              done: !hasToolError,
+              evidence: payload.thought ? "Analyzed request context" : undefined,
+            };
+          }
+          if (st.id === "step_execute") {
+            if (hasToolError) {
+              return { ...st, status: "failed" as any, done: false, evidence: "Execution error occurred" };
+            }
+            if (actionCompleted) {
+              return { ...st, status: "completed" as any, done: true, evidence: "Actions executed" };
+            }
+            return { ...st, status: "running" as any };
+          }
+          if (st.id === "step_verify") {
+            if (hasToolError) {
+              return { ...st, status: "failed" as any, done: false, evidence: "Pre-empted by execution failure" };
+            }
+            if (hasVerification) {
+              return { ...st, status: "completed" as any, done: true, evidence: "Verification check passed" };
+            }
+            return st;
+          }
+          return st;
+        });
+
+        return {
+          ...prev,
+          steps: updatedSteps,
+          accomplished: newAccomplished,
+          remaining: newRemaining.filter((r) => !newAccomplished.includes(r)),
+        };
+      });
+
       const currentConversation = activeConvIdRef.current;
       const belongsToActiveConversation =
         !payload.conversation_id || !currentConversation
@@ -297,8 +399,10 @@ export const App: React.FC = () => {
           invoke<TakeoverStatus>("get_takeover_status"),
           invoke<ApprovalRequest[]>("list_pending_approvals"),
         ]);
-        setTakeover(tStatus);
-        setPendingApprovals(approvals.filter((a) => a.status === "pending"));
+        if (tStatus) setTakeover(tStatus);
+        if (Array.isArray(approvals)) {
+          setPendingApprovals(approvals.filter((a) => a.status === "pending"));
+        }
       } catch (e) {
         // ignore
       }
@@ -493,7 +597,7 @@ export const App: React.FC = () => {
     try {
       const msgs = await invoke<Message[]>("get_messages", { conversationId: convId });
       if (activeConvIdRef.current === convId) {
-        setMessages(msgs);
+        setMessages(msgs || []);
         // The live steps of the runs of this conversation are kept, so that a
         // background run is not interrupted by reloading the history.
       }
@@ -676,25 +780,37 @@ export const App: React.FC = () => {
     setIsAgentRunning(true);
     clearRunSteps(runId);
 
-    const isConsequential = /(organize|move|clean|delete|email|draft|send|routine|schedule|compare)/i.test(fullPromptText);
+    const isConsequential = /(organize|move|clean|delete|email|draft|send|routine|schedule|compare|build|test|deploy|install)/i.test(fullPromptText);
     if (isConsequential) {
+      const activeResources = [
+        activeBot.name ? `@${activeBot.name} Workspace` : "Apex Orchestrator",
+        "SQLite Audit Ledger",
+      ];
+      if (/email|draft|send/i.test(fullPromptText)) {
+        activeResources.push("Configured Email Connector");
+      }
+      if (/file|folder|clean|organize|move/i.test(fullPromptText)) {
+        activeResources.push("Authorized Local Directories");
+      }
+
       setActivePlan({
         id: "plan_" + Date.now(),
+        runId,
         goal: fullPromptText,
-        understanding: `Kyro understood your request to: "${fullPromptText.trim()}".`,
-        resources: [
-          fullPromptText.toLowerCase().includes("email") ? "Google Workspace (Gmail)" : "Authorized Local Directories",
-          "Local SQLite Transaction Ledger",
-          "Verification Guardrails",
-        ],
+        understanding: `Kyro received request: "${fullPromptText.trim()}". Proposed execution plan:`,
+        resources: activeResources,
         steps: [
-          { text: "Verify authorized paths and user security bounds", done: true },
-          { text: "Inspect and analyze relevant contents locally", done: false },
-          { text: "Execute requested workflow safely with rollback records", done: false },
+          { id: "step_inspect", text: "Inspect and analyze relevant resources and parameters", status: "running", done: false },
+          { id: "step_execute", text: "Execute requested workflow safely with rollback records", status: "pending", done: false },
+          { id: "step_verify", text: "Verify execution results and validate state integrity", status: "pending", done: false },
         ],
         status: "executing",
-        accomplished: ["Verified intent and security bounds"],
-        remaining: ["Analyze target contents", "Execute workflow safely"],
+        accomplished: [],
+        remaining: [
+          "Inspect and analyze relevant resources and parameters",
+          "Execute requested workflow safely with rollback records",
+          "Verify execution results and validate state integrity",
+        ],
       });
     }
 
@@ -754,17 +870,40 @@ export const App: React.FC = () => {
       setMessages((prev) => [...prev, assistantMsg]);
       await invoke("add_message", { msg: assistantMsg }).catch(console.error);
       sendNotification("Kyro Task Completed", finalReply.slice(0, 80));
-      setActivePlan((prev) =>
-        prev
-          ? {
-              ...prev,
-              status: "completed",
-              steps: prev.steps.map((s) => ({ ...s, done: true })),
-              accomplished: ["Verified permissions", "Processed target data", "Task verified"],
-              remaining: [],
+      setActivePlan((prev) => {
+        if (!prev) return null;
+        const verificationStep = prev.steps.find((s) => s.id === "step_verify");
+        const isVerified = verificationStep?.status === "completed";
+        const hasFailedStep = prev.steps.some((s) => s.status === "failed");
+
+        const finalStatus = hasFailedStep
+          ? "failed"
+          : isVerified
+          ? "completed"
+          : prev.accomplished.length > 0
+          ? "unverified"
+          : "unverified";
+
+        const remainingNotes = [...prev.remaining];
+        if (!isVerified && !hasFailedStep && !remainingNotes.some((n) => n.toLowerCase().includes("verification"))) {
+          remainingNotes.push("Explicit verification check not executed");
+        }
+
+        return {
+          ...prev,
+          status: finalStatus,
+          steps: prev.steps.map((s) => {
+            if (s.id === "step_verify" && s.status !== "completed" && !hasFailedStep) {
+              return { ...s, status: "unverified" as any, done: false, evidence: "Unverified" };
             }
-          : null
-      );
+            if (s.status === "running") {
+              return { ...s, status: (hasFailedStep ? "failed" : "completed") as any, done: !hasFailedStep };
+            }
+            return s;
+          }),
+          remaining: remainingNotes,
+        };
+      });
     } catch (err: any) {
       const errorMsg: Message = {
         id: "msg_" + crypto.randomUUID(),
@@ -779,8 +918,11 @@ export const App: React.FC = () => {
         prev
           ? {
               ...prev,
-              status: "cancelled",
-              remaining: ["Encountered error during execution"],
+              status: "failed",
+              steps: prev.steps.map((s) =>
+                s.status === "running" ? { ...s, status: "failed" as any, done: false } : s
+              ),
+              remaining: [`Encountered execution failure: ${err}`],
             }
           : null
       );
@@ -795,6 +937,18 @@ export const App: React.FC = () => {
       await invoke("cancel_agent_run", { runId: activeRunId }).catch(console.error);
     }
     await invoke("abort_computer_use").catch(console.error);
+    setActivePlan((prev) =>
+      prev
+        ? {
+            ...prev,
+            status: "cancelled",
+            steps: prev.steps.map((s) =>
+              s.status === "running" ? { ...s, status: "failed" as any, done: false, evidence: "Cancelled" } : s
+            ),
+            remaining: ["Execution cancelled by user request"],
+          }
+        : null
+    );
     setIsAgentRunning(false);
     setActiveRunId(null);
   };
@@ -926,14 +1080,28 @@ export const App: React.FC = () => {
               </div>
             </div>
 
-            <div className="pt-2 border-t border-neutral-800 flex items-center justify-between text-[10px] font-mono text-neutral-400">
-              <span className="flex items-center gap-1.5">
-                <NvidiaIcon className="w-3.5 h-3.5 text-[#76B900]" /> Nemotron-3 Ultra
-              </span>
-              <span className="text-[9px] px-1 py-0.2 bg-neutral-900 rounded border border-neutral-800 text-neutral-300">
-                550B
-              </span>
-            </div>
+            {(() => {
+              const info = getModelDisplayInfo(selectedModel);
+              return (
+                <div
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="pt-2 border-t border-neutral-800 flex items-center justify-between text-[10px] font-mono text-neutral-400 cursor-pointer hover:text-neutral-200 transition"
+                  title={`Active model: ${selectedModel}. Click to configure in Settings.`}
+                >
+                  <span className="flex items-center gap-1.5 truncate">
+                    {info.isNvidia ? (
+                      <NvidiaIcon className="w-3.5 h-3.5 text-[#76B900] shrink-0" />
+                    ) : (
+                      <Cpu className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                    )}
+                    <span className="truncate">{info.label}</span>
+                  </span>
+                  <span className="text-[9px] px-1 py-0.2 bg-neutral-900 rounded border border-neutral-800 text-neutral-300 shrink-0 ml-1">
+                    {info.badge}
+                  </span>
+                </div>
+              );
+            })()}
           </div>
 
           {/* Navigation Tools */}
@@ -1327,7 +1495,7 @@ export const App: React.FC = () => {
         </div>
 
         {/* Human Takeover Alert Banner */}
-        {takeover.is_active && (
+        {takeover?.is_active && (
           <div className="px-6 py-2.5 bg-neutral-900 border-b border-neutral-800 flex items-center justify-between text-xs text-neutral-200">
             <div className="flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-amber-400 animate-bounce" />
@@ -1528,7 +1696,11 @@ export const App: React.FC = () => {
                     <span
                       className={`text-[10px] px-2 py-0.5 rounded-full font-mono uppercase font-bold ${
                         activePlan.status === "completed"
-                          ? "bg-neutral-800 text-neutral-100 border border-neutral-700"
+                          ? "bg-green-950/60 text-green-300 border border-green-800/60"
+                          : activePlan.status === "failed"
+                          ? "bg-red-950/60 text-red-300 border border-red-800/60"
+                          : activePlan.status === "unverified"
+                          ? "bg-yellow-950/60 text-yellow-300 border border-yellow-800/60"
                           : activePlan.status === "executing"
                           ? "bg-purple-950/60 text-purple-300 border border-purple-800/60 animate-pulse"
                           : "bg-neutral-800 text-neutral-300 border border-neutral-700"
@@ -1567,18 +1739,33 @@ export const App: React.FC = () => {
 
                   <div className="space-y-1.5 pt-1">
                     <span className="text-neutral-400 block font-medium text-[11px]">Planned Steps:</span>
-                    {activePlan.steps.map((st, i) => (
-                      <div key={i} className="flex items-center gap-2 text-neutral-300">
-                        {st.done ? (
-                          <CheckCircle2 className="w-3.5 h-3.5 text-neutral-300 shrink-0" />
-                        ) : (
-                          <span className="w-3.5 h-3.5 rounded-full border border-neutral-600 flex items-center justify-center text-[9px] font-mono text-neutral-400 shrink-0">
-                            {i + 1}
-                          </span>
-                        )}
-                        <span className={st.done ? "line-through text-neutral-500" : ""}>{st.text}</span>
-                      </div>
-                    ))}
+                    {activePlan.steps.map((st, i) => {
+                      const isComplete = st.status === "completed" || (!st.status && st.done);
+                      const isFailed = st.status === "failed";
+                      const isRunning = st.status === "running";
+                      const isUnverified = st.status === "unverified";
+                      return (
+                        <div key={i} className="flex items-center gap-2 text-neutral-300">
+                          {isComplete ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                          ) : isFailed ? (
+                            <X className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                          ) : isRunning ? (
+                            <RefreshCw className="w-3.5 h-3.5 text-purple-400 animate-spin shrink-0" />
+                          ) : isUnverified ? (
+                            <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 shrink-0" />
+                          ) : (
+                            <span className="w-3.5 h-3.5 rounded-full border border-neutral-600 flex items-center justify-center text-[9px] font-mono text-neutral-400 shrink-0">
+                              {i + 1}
+                            </span>
+                          )}
+                          <span className={isComplete ? "line-through text-neutral-500" : ""}>{st.text}</span>
+                          {st.evidence && (
+                            <span className="text-[10px] text-neutral-500 font-mono">({st.evidence})</span>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
 
                   {activePlan.accomplished.length > 0 && (
@@ -1610,7 +1797,7 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {messages.length === 0 && liveSteps.length === 0 ? (
+            {(!messages || messages.length === 0) && (!liveSteps || liveSteps.length === 0) ? (
             <div className="h-full flex flex-col items-center justify-center text-center max-w-lg mx-auto space-y-4">
               <div className="relative">
                 <div className="w-16 h-16 rounded-2xl bg-[#141414] border border-neutral-800 flex items-center justify-center p-3 shadow-lg">
@@ -1789,7 +1976,7 @@ export const App: React.FC = () => {
             </div>
           ) : (
             <>
-              {messages.map((m) => (
+              {(messages || []).map((m) => (
                 <div
                   key={m.id}
                   className={`flex flex-col ${
@@ -2034,7 +2221,7 @@ export const App: React.FC = () => {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         selectedModel={selectedModel}
-        onSelectModel={setSelectedModel}
+        onSelectModel={handleSelectModel}
         initialTab={settingsInitialTab}
       />
 

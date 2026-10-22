@@ -861,7 +861,7 @@ describe("Phase C Frontend Coverage to >= 95%", () => {
 
       await waitFor(() => {
         expect(screen.getByText("Execution Plan")).toBeInTheDocument();
-        expect(screen.getByText(/Kyro understood your request to: "Please organize my downloaded files/i)).toBeInTheDocument();
+        expect(screen.getByText(/Kyro received request: "Please organize my downloaded files/i)).toBeInTheDocument();
       });
 
       // Dismiss execution plan

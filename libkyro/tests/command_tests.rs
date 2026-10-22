@@ -465,6 +465,54 @@ async fn test_agent_runs_lifecycle_commands() {
 }
 
 #[tokio::test]
+async fn test_run_cancellation_race_elimination() {
+    let (_ctx, state) = setup_test_context("cancel_race");
+
+    create_conversation(
+        state.clone(),
+        "conv-race".to_string(),
+        "Cancellation Race Test".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    )
+    .unwrap();
+
+    let run_id = "run-race-1";
+    let run = AgentRun {
+        id: run_id.to_string(),
+        conversation_id: Some("conv-race".to_string()),
+        agent_id: "apex".to_string(),
+        model: "claude-3-5-sonnet".to_string(),
+        prompt: "Will be cancelled before engine registration".to_string(),
+        status: "running".to_string(),
+        created_at: 1000,
+        started_at: Some(1000),
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    state.db.create_run(&run).unwrap();
+
+    // 1. Cancel run before engine registers it
+    let res = cancel_agent_run(state.clone(), run_id.to_string()).await;
+    assert!(res.is_ok());
+    assert!(res.unwrap());
+
+    // 2. Engine recognizes run as cancelled
+    assert!(state.engine.is_run_cancelled(run_id).await);
+
+    // 3. Status in DB is updated to cancelled
+    let db_run = state.db.get_run(run_id).unwrap().unwrap();
+    assert_eq!(db_run.status, "cancelled");
+
+    // 4. Repeated cancellation returns false since run is already terminal
+    let res_repeat = cancel_agent_run(state.clone(), run_id.to_string())
+        .await
+        .unwrap();
+    assert!(!res_repeat);
+}
+
+#[tokio::test]
 async fn test_ghost_grounding_timeline_apps_commands() {
     let (_ctx, state) = setup_test_context("ghost");
 
@@ -1256,13 +1304,38 @@ async fn test_connector_policies_and_account_lifecycle() {
     let init_res = oauth_init.unwrap();
     assert!(!init_res.session_id.is_empty());
 
-    // OAuth status
+    // OAuth status initially pending
     let status = get_oauth_status(state.clone(), init_res.session_id.clone())
         .await
         .unwrap();
     assert_eq!(status.status, "pending");
 
-    // Complete OAuth flow (fails gracefully when code is missing/invalid)
+    // Invalid session id
+    assert!(cancel_oauth_flow(state.clone(), "".to_string())
+        .await
+        .is_err());
+    assert!(cancel_oauth_flow(state.clone(), "   ".to_string())
+        .await
+        .is_err());
+
+    // Cancel OAuth flow via command
+    let cancel_res = cancel_oauth_flow(state.clone(), init_res.session_id.clone()).await;
+    assert!(cancel_res.is_ok());
+
+    // Status is now cancelled
+    let status_after = get_oauth_status(state.clone(), init_res.session_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(status_after.status, "cancelled");
+
+    // Repeated cancellation fails deterministically
+    assert!(
+        cancel_oauth_flow(state.clone(), init_res.session_id.clone())
+            .await
+            .is_err()
+    );
+
+    // Complete OAuth flow on cancelled session fails
     let comp = complete_oauth_flow(state.clone(), init_res.session_id, None).await;
     assert!(comp.is_err());
 
@@ -1443,4 +1516,34 @@ async fn test_terminal_and_timeline_commands() {
     // Installed apps
     let apps = get_installed_apps();
     let _ = apps;
+}
+
+#[tokio::test]
+async fn test_selected_model_persistence_and_fallback() {
+    use kyro_lib::agent::router::DEFAULT_NEMOTRON_MODEL;
+    let (_ctx, state) = setup_test_context("model_persist");
+
+    // 1. Initial default model before setting
+    let initial = get_selected_model(state.clone()).await.unwrap();
+    assert_eq!(initial, DEFAULT_NEMOTRON_MODEL);
+
+    // 2. Save known model
+    let saved = save_selected_model(state.clone(), "meta/llama-3.3-70b-instruct".to_string())
+        .await
+        .unwrap();
+    assert_eq!(saved, "meta/llama-3.3-70b-instruct");
+
+    // 3. Retrieve saved model
+    let current = get_selected_model(state.clone()).await.unwrap();
+    assert_eq!(current, "meta/llama-3.3-70b-instruct");
+
+    // 4. Save unknown/unsupported model triggers fallback
+    let fallback = save_selected_model(state.clone(), "unknown/nonexistent-model-xyz".to_string())
+        .await
+        .unwrap();
+    assert_eq!(fallback, DEFAULT_NEMOTRON_MODEL);
+
+    // 5. Empty model identifier rejects with error
+    let empty_res = save_selected_model(state.clone(), "   ".to_string()).await;
+    assert!(empty_res.is_err());
 }

@@ -54,7 +54,9 @@ export const TerminalView: React.FC = () => {
 
     // Forward user keystrokes to Rust PTY
     term.onData((data) => {
-      invoke("write_terminal", { data }).catch(console.error);
+      invoke("write_terminal_input", { input: data }).catch((err) => {
+        term.writeln(`\r\n\x1b[31mFailed to write terminal input: ${err}\x1b[0m\r\n`);
+      });
     });
 
     // Handle window resize

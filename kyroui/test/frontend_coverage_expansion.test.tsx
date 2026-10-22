@@ -541,7 +541,7 @@ describe("TimelineDrawer & TerminalView Subsystems", () => {
       if (cmd === "get_timeline_steps") return Promise.resolve(mockTimelineSteps);
       if (cmd === "clear_timeline_steps") return Promise.resolve(true);
       if (cmd === "spawn_terminal") return Promise.resolve(true);
-      if (cmd === "write_terminal") return Promise.resolve(true);
+      if (cmd === "write_terminal_input") return Promise.resolve(true);
       if (cmd === "resize_terminal") return Promise.resolve(true);
       return Promise.resolve(null);
     });

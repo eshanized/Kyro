@@ -411,7 +411,7 @@ async fn test_oauth_manager_pkce_and_session_state_machine() {
         expires_at: now + 600_000,
     };
     oauth.register_session(session2).await;
-    oauth.cancel_session("sess_200").await;
+    assert!(oauth.cancel_session("sess_200").await.is_ok());
     let status2 = oauth.get_session_status("sess_200").await.unwrap();
     assert!(matches!(
         status2,
@@ -424,6 +424,103 @@ async fn test_oauth_manager_pkce_and_session_state_machine() {
     assert!(!safe.contains('>'));
     assert!(safe.contains("&lt;script&gt;"));
     assert!(safe.contains("&quot;quotes&quot;"));
+}
+
+#[tokio::test]
+async fn test_oauth_cancellation_lifecycle_and_races() {
+    use kyro_lib::connector::auth::{
+        OAuthManager, OAuthSessionStatus, PendingOAuthSession, TokenExchangeResult,
+    };
+
+    let oauth = OAuthManager::new();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // 1. Invalid IDs (empty or whitespace)
+    assert!(oauth.cancel_session("").await.is_err());
+    assert!(oauth.cancel_session("   ").await.is_err());
+
+    // 2. Unknown ID
+    let unknown_res = oauth.cancel_session("nonexistent_session").await;
+    assert!(unknown_res.is_err());
+    assert!(unknown_res.unwrap_err().contains("not found"));
+
+    // 3. Successful cancellation
+    let session_id = "test_sess_cancel_1";
+    let pending_sess = PendingOAuthSession {
+        session_id: session_id.to_string(),
+        provider_id: "github".to_string(),
+        client_id: "client123".to_string(),
+        client_secret: None,
+        code_verifier: "verifier123".to_string(),
+        state: "state123".to_string(),
+        redirect_uri: "http://127.0.0.1:9090/callback".to_string(),
+        token_endpoint: "https://github.com/login/oauth/access_token".to_string(),
+        status: OAuthSessionStatus::Pending,
+        created_at: now,
+        expires_at: now + 60_000,
+    };
+    oauth.register_session(pending_sess).await;
+
+    // First cancellation succeeds
+    let cancel_res = oauth.cancel_session(session_id).await;
+    assert!(cancel_res.is_ok());
+    assert_eq!(
+        oauth.get_session_status(session_id).await,
+        Some(OAuthSessionStatus::Cancelled)
+    );
+
+    // 4. Repeated cancellation returns deterministic error
+    let repeat_res = oauth.cancel_session(session_id).await;
+    assert!(repeat_res.is_err());
+    assert!(repeat_res.unwrap_err().contains("already cancelled"));
+
+    // 5. Expired session cancellation fails deterministically
+    let expired_id = "test_sess_expired";
+    let expired_sess = PendingOAuthSession {
+        session_id: expired_id.to_string(),
+        provider_id: "google".to_string(),
+        client_id: "google_cid".to_string(),
+        client_secret: None,
+        code_verifier: "verifier_exp".to_string(),
+        state: "state_exp".to_string(),
+        redirect_uri: "http://127.0.0.1:9091/callback".to_string(),
+        token_endpoint: "https://oauth2.googleapis.com/token".to_string(),
+        status: OAuthSessionStatus::Pending,
+        created_at: now - 120_000,
+        expires_at: now - 1000, // Expired
+    };
+    oauth.register_session(expired_sess).await;
+    let exp_cancel = oauth.cancel_session(expired_id).await;
+    assert!(exp_cancel.is_err());
+    assert!(exp_cancel.unwrap_err().contains("expired"));
+
+    // 6. Completion vs cancellation race: completed session cannot be cancelled
+    let completed_id = "test_sess_completed";
+    let completed_sess = PendingOAuthSession {
+        session_id: completed_id.to_string(),
+        provider_id: "github".to_string(),
+        client_id: "cid_comp".to_string(),
+        client_secret: None,
+        code_verifier: "verifier_comp".to_string(),
+        state: "state_comp".to_string(),
+        redirect_uri: "http://127.0.0.1:9092/callback".to_string(),
+        token_endpoint: "https://github.com/login/oauth/access_token".to_string(),
+        status: OAuthSessionStatus::Completed {
+            token: TokenExchangeResult {
+                access_token: "gho_token123".to_string(),
+                refresh_token: None,
+                token_type: "Bearer".to_string(),
+                granted_scopes: vec!["repo".to_string()],
+                expires_in_seconds: None,
+            },
+        },
+        created_at: now,
+        expires_at: now + 60_000,
+    };
+    oauth.register_session(completed_sess).await;
+    let race_cancel = oauth.cancel_session(completed_id).await;
+    assert!(race_cancel.is_err());
+    assert!(race_cancel.unwrap_err().contains("already completed"));
 }
 
 #[test]

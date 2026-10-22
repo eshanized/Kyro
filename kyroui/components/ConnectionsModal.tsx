@@ -257,13 +257,20 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
     if (oauthSession) {
       try {
         await invoke("cancel_oauth_flow", { sessionId: oauthSession.sessionId });
-      } catch (e) {
+        setOauthPolling(false);
+        setOauthSession(null);
+        setIsSubmittingConnect(false);
+        showMessage("OAuth authorization cancelled.", "error");
+      } catch (e: any) {
         console.warn("Cancel OAuth error:", e);
+        const errDetail = e?.message || String(e);
+        showMessage(`Failed to cancel OAuth flow: ${errDetail}`, "error");
       }
+    } else {
+      setOauthPolling(false);
+      setOauthSession(null);
+      setIsSubmittingConnect(false);
     }
-    setOauthPolling(false);
-    setOauthSession(null);
-    setIsSubmittingConnect(false);
   };
 
   const handleConnectTokenSubmit = async (e: React.FormEvent) => {

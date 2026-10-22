@@ -384,6 +384,7 @@ impl ModelRouter {
         vec![
             Self::resolve_capabilities(DEFAULT_NEMOTRON_MODEL),
             Self::resolve_capabilities(DEFAULT_VISION_MODEL),
+            Self::resolve_capabilities("meta/llama-3.3-70b-instruct"),
             Self::resolve_capabilities("meta/llama-3.2-90b-vision-instruct"),
             Self::resolve_capabilities("openai/gpt-4o"),
             Self::resolve_capabilities("openai/gpt-4o-mini"),

@@ -2280,7 +2280,7 @@ async fn test_oauth_state_machine_pkce_and_callback_security() {
         status: OAuthSessionStatus::Pending,
     };
     oauth.register_session(session2).await;
-    oauth.cancel_session("sess_2").await;
+    assert!(oauth.cancel_session("sess_2").await.is_ok());
     let cancelled_status = oauth.get_session_status("sess_2").await;
     assert_eq!(cancelled_status, Some(OAuthSessionStatus::Cancelled));
 }

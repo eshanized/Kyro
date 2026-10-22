@@ -140,3 +140,84 @@ fn test_browser_operation_result_structure() {
     assert_eq!(deserialized.duration_ms, 120);
     assert_eq!(deserialized.status, "success");
 }
+
+#[tokio::test]
+async fn test_navigation_policy_comprehensive_matrix() {
+    use kyro_lib::browser::safety::{NavigationPolicy, UrlRejection};
+
+    let policy = NavigationPolicy::default()
+        .with_blocked_domains(&["evil.com".to_string(), "*.phishing.net".to_string()]);
+
+    // 1. Missing / Malformed URLs
+    assert!(matches!(
+        policy.check("").unwrap_err(),
+        UrlRejection::Malformed(_)
+    ));
+    assert!(matches!(
+        policy.check("   ").unwrap_err(),
+        UrlRejection::Malformed(_)
+    ));
+    assert!(matches!(
+        policy.check("http://example.com/\nattack").unwrap_err(),
+        UrlRejection::Malformed(_)
+    ));
+    assert!(matches!(
+        policy.check("http://example.com/\0null").unwrap_err(),
+        UrlRejection::Malformed(_)
+    ));
+    assert!(matches!(
+        policy.check("just-a-string").unwrap_err(),
+        UrlRejection::Malformed(_)
+    ));
+
+    // 2. Disallowed schemes
+    for forbidden in [
+        "javascript:alert(1)",
+        "blob:http://localhost/uuid",
+        "chrome://settings",
+        "file:///etc/shadow",
+        "data:text/html,<h1>XSS</h1>",
+        "view-source:http://localhost",
+    ] {
+        assert!(
+            matches!(
+                policy.check(forbidden).unwrap_err(),
+                UrlRejection::SchemeNotAllowed { .. }
+            ),
+            "Expected SchemeNotAllowed for {}",
+            forbidden
+        );
+    }
+
+    // 3. Blocked domains & subdomains
+    assert!(matches!(
+        policy.check("https://evil.com/login").unwrap_err(),
+        UrlRejection::BlockedDomain { .. }
+    ));
+    assert!(matches!(
+        policy.check("https://sub.evil.com/login").unwrap_err(),
+        UrlRejection::BlockedDomain { .. }
+    ));
+    assert!(matches!(
+        policy
+            .check("http://tracker.phishing.net:8080/path")
+            .unwrap_err(),
+        UrlRejection::BlockedDomain { .. }
+    ));
+
+    // 4. Allowed URLs
+    assert!(policy.check("http://localhost:3000").is_ok());
+    assert!(policy.check("https://github.com/org/repo").is_ok());
+
+    // 5. Origin Scope
+    let scoped_policy = policy.with_origin_scope(Some("http://127.0.0.1:8000".to_string()));
+    assert!(scoped_policy.check("http://127.0.0.1:8000/api/v1").is_ok());
+    // Port 80 default normalization check
+    let port80_scoped =
+        NavigationPolicy::default().with_origin_scope(Some("http://example.com".to_string()));
+    assert!(port80_scoped.check("http://example.com:80/home").is_ok());
+
+    // Cross origin rejected
+    let rejection = scoped_policy.check("https://github.com").unwrap_err();
+    assert!(matches!(rejection, UrlRejection::OutsideOriginScope { .. }));
+}

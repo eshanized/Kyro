@@ -78,7 +78,7 @@ This log chronicles the engineering remediation, feature completion, and verific
   - Added "Templates" tab: 1-click starter pack installation, export workspace pack, import JSON.
   - Added "Diagnostics" tab: live status grid of SQLite WAL, display server, Docker engine, Ghost Xvfb virtual display, and CLI tools.
 - **Voice Dictation & Text-to-Speech** (`kyroui/App.tsx`):
-  - Zero-cloud speech recognition via standard Web Speech API with active microphone waveform indicator.
+  - Voice dictation via standard Web Speech API (delegating transcription to underlying OS/webview speech service) with active microphone indicator.
   - Local speech synthesis audio playback for assistant responses with speak/stop controls.
 - **File Attachments in Prompt** (`kyroui/App.tsx`):
   - Paperclip file picker supporting text and image files.

@@ -149,6 +149,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
       const sb = await invoke<SandboxStatus>("get_sandbox_status");
       setSandbox(sb);
+      const savedModel = await invoke<string>("get_selected_model").catch(() => null);
+      if (savedModel) {
+        setModelChoice(savedModel);
+      }
       await loadBrowserInfo();
       await loadAuthorizedFolders();
     } catch (err) {
@@ -223,6 +227,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
       await invoke("save_api_keys", { keys: keysToSave });
       await invoke("save_governance_policy", { policy });
+      await invoke("save_selected_model", { model: modelChoice }).catch(console.error);
       onSelectModel(modelChoice);
 
       setIsSaved(true);

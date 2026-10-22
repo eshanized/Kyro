@@ -669,6 +669,26 @@ impl BrowserAutomationManager {
             }
         };
 
+        // When external navigation is not allowed and origin scope is not yet set,
+        // lock the session to this validated destination's origin.
+        if !allow_external && policy.origin_scope.is_none() {
+            if let Some(ref orig) = validated.origin {
+                policy.origin_scope = Some(orig.clone());
+                let mut pol_lock = self.policies.lock().await;
+                if let Some(p) = pol_lock.get_mut(session_id) {
+                    if p.origin_scope.is_none() {
+                        p.origin_scope = Some(orig.clone());
+                    }
+                }
+                let mut sess_lock = self.sessions.lock().await;
+                if let Some(s) = sess_lock.get_mut(session_id) {
+                    if s.origin_scope.is_none() {
+                        s.origin_scope = Some(orig.clone());
+                    }
+                }
+            }
+        }
+
         let started = std::time::Instant::now();
         let raw = self
             .raw_call(
@@ -701,6 +721,26 @@ impl BrowserAutomationManager {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 result.data = raw;
+
+                // Enforce that redirects do not escape the policy or origin bounds
+                if !allow_external {
+                    if let Some(ref landed_url) = result.url {
+                        if let Err(rejection) = policy.check(landed_url) {
+                            let mut blocked_res = BrowserOperationResult::failed(
+                                session_id,
+                                session.run_id.as_deref(),
+                                "navigate",
+                                "navigation_blocked",
+                                &format!(
+                                    "Redirect to '{}' blocked by navigation policy: {}",
+                                    landed_url, rejection
+                                ),
+                            );
+                            blocked_res.url = Some(landed_url.clone());
+                            return Ok(blocked_res);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 result.status = "failed".to_string();

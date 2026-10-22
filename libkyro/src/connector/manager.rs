@@ -563,44 +563,55 @@ impl ConnectorManager {
 
         self.oauth_manager.register_session(session).await;
 
+        // Register cancellation sender for early abort
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        self.oauth_manager
+            .register_cancellation_sender(&session_id, cancel_tx)
+            .await;
+
         // Spawn background task to wait for loopback callback with timeout
         let oauth_mgr = self.oauth_manager.clone();
         let sid = session_id.clone();
         let expected_st = state;
         tokio::spawn(async move {
-            match OAuthManager::listen_for_callback(listener, expected_st, Duration::from_secs(120))
-                .await
-            {
-                Ok(code) => {
-                    log::info!("Captured OAuth callback code for session {}", sid);
-                    if let Ok(()) = oauth_mgr.record_callback(&sid, code).await {
-                        if let Ok((
-                            endpoint,
-                            client_id,
-                            client_secret,
-                            code,
-                            redirect_uri,
-                            verifier,
-                        )) = oauth_mgr.claim_exchange(&sid).await
-                        {
-                            let http = reqwest::Client::new();
-                            let res = OAuthManager::exchange_code(
-                                &http,
-                                &endpoint,
-                                &client_id,
-                                client_secret.as_deref(),
-                                &code,
-                                &redirect_uri,
-                                &verifier,
-                            )
-                            .await;
-                            oauth_mgr.finish_exchange(&sid, res).await;
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    log::info!("OAuth loopback listener cancelled for session {}", sid);
+                }
+                callback_res = OAuthManager::listen_for_callback(listener, expected_st, Duration::from_secs(120)) => {
+                    match callback_res {
+                        Ok(code) => {
+                            log::info!("Captured OAuth callback code for session {}", sid);
+                            if let Ok(()) = oauth_mgr.record_callback(&sid, code).await {
+                                if let Ok((
+                                    endpoint,
+                                    client_id,
+                                    client_secret,
+                                    code,
+                                    redirect_uri,
+                                    verifier,
+                                )) = oauth_mgr.claim_exchange(&sid).await
+                                {
+                                    let http = reqwest::Client::new();
+                                    let res = OAuthManager::exchange_code(
+                                        &http,
+                                        &endpoint,
+                                        &client_id,
+                                        client_secret.as_deref(),
+                                        &code,
+                                        &redirect_uri,
+                                        &verifier,
+                                    )
+                                    .await;
+                                    oauth_mgr.finish_exchange(&sid, res).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("OAuth loopback error for session {}: {}", sid, e);
+                            oauth_mgr.finish_exchange(&sid, Err(e)).await;
                         }
                     }
-                }
-                Err(e) => {
-                    log::warn!("OAuth loopback error for session {}: {}", sid, e);
-                    oauth_mgr.finish_exchange(&sid, Err(e)).await;
                 }
             }
         });
@@ -611,6 +622,11 @@ impl ConnectorManager {
             redirect_uri,
             expires_at,
         })
+    }
+
+    /// Cancel a pending or active OAuth flow
+    pub async fn cancel_oauth_flow(&self, session_id: &str) -> Result<(), String> {
+        self.oauth_manager.cancel_session(session_id).await
     }
 
     /// Retrieve current OAuth session status non-destructively
@@ -947,7 +963,10 @@ impl ConnectorManager {
                 &sess.code_verifier,
             )
             .await?;
-            self.oauth_manager.cancel_session(session_id).await;
+            let _ = self
+                .oauth_manager
+                .mark_finalizing(session_id, res.clone())
+                .await;
             (sess.provider_id, res, sess.client_id, sess.client_secret)
         } else {
             self.oauth_manager.claim_finalizing(session_id).await?

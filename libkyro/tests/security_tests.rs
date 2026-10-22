@@ -604,3 +604,45 @@ fn an_unrelated_task_cannot_clear_another_tasks_emergency_stop() {
     InputController::reset_abort_for(&scope_a);
     assert!(!InputController::is_aborted_scope(&scope_a));
 }
+
+// ---------------------------------------------------------------------
+// Content Security Policy
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_tauri_csp_hardening_verification() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let conf_path = manifest_dir.join("tauri.conf.json");
+    let content = std::fs::read_to_string(&conf_path).expect("read tauri.conf.json");
+    let val: serde_json::Value = serde_json::from_str(&content).expect("parse tauri.conf.json");
+
+    let csp = val["app"]["security"]["csp"]
+        .as_str()
+        .expect("app.security.csp should be configured as a string");
+
+    // Must not allow unsafe-eval
+    assert!(
+        !csp.contains("'unsafe-eval'"),
+        "CSP must NOT permit 'unsafe-eval'"
+    );
+
+    // Must enforce restrictive frame-src and object-src
+    assert!(
+        csp.contains("frame-src 'none'"),
+        "CSP must set frame-src 'none'"
+    );
+    assert!(
+        csp.contains("object-src 'none'"),
+        "CSP must set object-src 'none'"
+    );
+
+    // Must restrict default-src and script-src to 'self'
+    assert!(
+        csp.contains("default-src 'self'"),
+        "CSP must set default-src 'self'"
+    );
+    assert!(
+        csp.contains("script-src 'self'"),
+        "CSP must set script-src 'self'"
+    );
+}

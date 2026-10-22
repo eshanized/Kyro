@@ -248,9 +248,9 @@ describe("App Ultimate Coverage & Edge Cases", () => {
     // Plan should be rendered
     await waitFor(() => {
       expect(screen.getByText("Execution Plan")).toBeInTheDocument();
-      expect(screen.getByText(/Kyro understood your request to/i)).toBeInTheDocument();
+      expect(screen.getByText(/Kyro received request/i)).toBeInTheDocument();
       expect(screen.getByText("Authorized Local Directories")).toBeInTheDocument();
-      expect(screen.getByText("Verify authorized paths and user security bounds")).toBeInTheDocument();
+      expect(screen.getAllByText("Inspect and analyze relevant resources and parameters").length).toBeGreaterThan(0);
     });
 
     // Dismiss plan

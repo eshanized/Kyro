@@ -67,6 +67,7 @@ pub struct ActiveRunContext {
 pub struct AgentLoopEngine {
     router: ModelRouter,
     active_runs: Arc<TokioMutex<HashMap<String, ActiveRunContext>>>,
+    cancelled_runs: Arc<TokioMutex<std::collections::HashSet<String>>>,
     /// The managed browser automation subsystem.
     pub browser: Arc<BrowserAutomationManager>,
     /// The managed development-server subsystem.
@@ -97,6 +98,7 @@ impl AgentLoopEngine {
         Self {
             router: ModelRouter::new(),
             active_runs: Arc::new(TokioMutex::new(HashMap::new())),
+            cancelled_runs: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
             browser,
             dev_servers,
         }
@@ -116,6 +118,13 @@ impl AgentLoopEngine {
         api_key: &str,
         base_url: Option<&str>,
     ) {
+        let is_already_cancelled = {
+            let cancelled = self.cancelled_runs.lock().await;
+            cancelled.contains(run_id)
+        };
+        if is_already_cancelled {
+            token.cancel();
+        }
         let mut map = self.active_runs.lock().await;
         map.insert(
             run_id.to_string(),
@@ -149,6 +158,10 @@ impl AgentLoopEngine {
 
     /// Cancel a specific run by its run_id and terminate its active process tree
     pub async fn cancel_run(&self, run_id: &str) -> bool {
+        {
+            let mut cancelled = self.cancelled_runs.lock().await;
+            cancelled.insert(run_id.to_string());
+        }
         let mut map = self.active_runs.lock().await;
         if let Some(ctx) = map.remove(run_id) {
             ctx.token.cancel();
@@ -165,8 +178,14 @@ impl AgentLoopEngine {
             }
             true
         } else {
-            false
+            true
         }
+    }
+
+    /// Returns whether a run has been requested to be cancelled
+    pub async fn is_run_cancelled(&self, run_id: &str) -> bool {
+        let cancelled = self.cancelled_runs.lock().await;
+        cancelled.contains(run_id)
     }
 
     pub fn standard_tools() -> Vec<ToolDefinition> {
@@ -370,6 +389,16 @@ The program is started as an explicit executable plus argument vector; free-form
         let token = cancel_token.unwrap_or_default();
         self.register_run(run_id, token.clone(), model, api_key, base_url)
             .await;
+
+        if token.is_cancelled() || self.is_run_cancelled(run_id).await {
+            return Err("Agent run was cancelled by user before execution started".to_string());
+        }
+
+        if let Ok(Some(r)) = db.get_run(run_id) {
+            if r.status == "cancelled" {
+                return Err("Agent run was cancelled by user before execution started".to_string());
+            }
+        }
 
         let mut tools = Self::standard_tools();
         if let Some(ref conn_mgr) = connector_manager {

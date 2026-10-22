@@ -34,7 +34,7 @@ This matrix tracks the authoritative implementation and verification status of a
 | **Durable Artifacts Registry** | P1 | `verified` | `test_artifacts_lifecycle_and_path_security`, `ArtifactsModal.tsx` |
 | **Universal Workspace Search** | P2 | `verified` | `test_universal_search`, `CommandPalette.tsx` |
 | **Command Palette (`Ctrl+K`)** | P2 | `verified` | `CommandPalette.tsx` keyboard navigation & quick actions |
-| **Zero-Cloud Voice Dictation** | P2 | `verified` | Web Speech API integration in `App.tsx` |
+| **Platform Voice Dictation** | P2 | `verified` | Web Speech API integration in `App.tsx` (delegates transcription to underlying OS/webview speech service) |
 | **Local Text-to-Speech (TTS)** | P2 | `verified` | `window.speechSynthesis` audio playback on assistant messages |
 | **Prompt File & Image Attachments** | P2 | `verified` | Full binary/base64 attachment preserved and dispatched as `MessageContent::Parts` |
 | **Desktop Notifications** | P2 | `verified` | Web Notification API dispatched on task finish and approvals |

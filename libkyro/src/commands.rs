@@ -638,11 +638,16 @@ pub fn get_run_events(
 
 #[tauri::command]
 pub async fn cancel_agent_run(state: State<'_, AppState>, run_id: String) -> Result<bool, String> {
+    let trimmed = run_id.trim();
+    if trimmed.is_empty() {
+        return Err("Run ID cannot be empty".to_string());
+    }
+
     let run = state
         .db
-        .get_run(&run_id)
+        .get_run(trimmed)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Run '{}' does not exist", run_id))?;
+        .ok_or_else(|| format!("Run '{}' does not exist", trimmed))?;
 
     // If run has already reached terminal state, do not overwrite or falsely report cancelling active run
     if matches!(
@@ -652,16 +657,19 @@ pub async fn cancel_agent_run(state: State<'_, AppState>, run_id: String) -> Res
         return Ok(false);
     }
 
-    let cancelled = state.engine.cancel_run(&run_id).await;
+    // Always mark run cancelled in the engine so even if engine.run_step hasn't started yet,
+    // or is between registration steps, it will abort immediately.
+    let _ = state.engine.cancel_run(trimmed).await;
+
     let now = chrono::Utc::now().timestamp_millis();
     let _ = state.db.update_run_status(
-        &run_id,
+        trimmed,
         "cancelled",
         None,
         Some(now),
         Some("Cancelled by user request"),
     );
-    Ok(cancelled)
+    Ok(true)
 }
 
 // Autonomous Agent Turn (Durable Lifecycle, Authorization Gate, Cancellation)
@@ -718,6 +726,18 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .create_run(&run_record)
         .map_err(|e| e.to_string())?;
 
+    // Early abort if cancellation arrived before or during run record creation
+    if state.engine.is_run_cancelled(&effective_run_id).await {
+        let _ = state.db.update_run_status(
+            &effective_run_id,
+            "cancelled",
+            None,
+            Some(now),
+            Some("Cancelled before execution started"),
+        );
+        return Err("Run was cancelled by user request".to_string());
+    }
+
     let app_handle = app.clone();
     // Do NOT wipe out abort state unconditionally on each turn!
 
@@ -741,6 +761,27 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .await;
 
     let completed_time = chrono::Utc::now().timestamp_millis();
+
+    // Verify whether the run was cancelled in engine or DB before saving final status
+    let is_cancelled = state.engine.is_run_cancelled(&effective_run_id).await
+        || state
+            .db
+            .get_run(&effective_run_id)
+            .ok()
+            .flatten()
+            .map(|r| r.status == "cancelled")
+            .unwrap_or(false);
+
+    if is_cancelled {
+        let _ = state.db.update_run_status(
+            &effective_run_id,
+            "cancelled",
+            None,
+            Some(completed_time),
+            Some("Cancelled by user request"),
+        );
+        return Err("Run was cancelled by user request".to_string());
+    }
     match result {
         Ok(ref reply) => {
             let _ = state.db.update_run_status(
@@ -1330,6 +1371,17 @@ pub async fn get_oauth_status(
 }
 
 #[tauri::command]
+pub async fn cancel_oauth_flow(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Err("Invalid OAuth session identifier: empty session id".to_string());
+    }
+    state.connector_manager.cancel_oauth_flow(&session_id).await
+}
+
+#[tauri::command]
 pub async fn complete_oauth_flow(
     state: State<'_, AppState>,
     session_id: String,
@@ -1723,6 +1775,47 @@ pub async fn get_model_capabilities(model: String) -> Result<ModelCapabilities, 
 #[tauri::command]
 pub async fn list_available_models() -> Result<Vec<ModelCapabilities>, String> {
     Ok(ModelRouter::list_known_models())
+}
+
+#[tauri::command]
+pub async fn get_selected_model(state: State<'_, AppState>) -> Result<String, String> {
+    let saved = state
+        .db
+        .get_setting("selected_model")
+        .map_err(|e| e.to_string())?;
+
+    if let Some(m) = saved {
+        let known = ModelRouter::list_known_models();
+        if known.iter().any(|k| k.model_id == m) {
+            return Ok(m);
+        }
+    }
+    Ok(DEFAULT_NEMOTRON_MODEL.to_string())
+}
+
+#[tauri::command]
+pub async fn save_selected_model(
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<String, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err("Model identifier cannot be empty".to_string());
+    }
+
+    let known = ModelRouter::list_known_models();
+    let effective_model = if known.iter().any(|k| k.model_id == trimmed) {
+        trimmed.to_string()
+    } else {
+        DEFAULT_NEMOTRON_MODEL.to_string()
+    };
+
+    state
+        .db
+        .set_setting("selected_model", &effective_model)
+        .map_err(|e| e.to_string())?;
+
+    Ok(effective_model)
 }
 
 // -----------------------------------------------------------------------------

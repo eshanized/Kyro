@@ -45,7 +45,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: http: ws: data: blob:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:* https://api.github.com https://accounts.google.com https://oauth2.googleapis.com https://www.googleapis.com; frame-src 'none'; object-src 'none'; base-uri 'self';"
     }
   },
   "bundle": {
