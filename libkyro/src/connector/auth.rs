@@ -534,7 +534,7 @@ impl OAuthManager {
         let resp = client
             .post(token_endpoint)
             .header("Accept", "application/json")
-            .header("User-Agent", "Kyro-Desktop-Agent/0.1.0")
+            .header("User-Agent", "Kyro-Desktop-Agent/0.1.1")
             .form(&form_params)
             .timeout(Duration::from_secs(20))
             .send()
@@ -665,7 +665,7 @@ impl OAuthManager {
         let resp = client
             .post(token_endpoint)
             .header("Accept", "application/json")
-            .header("User-Agent", "Kyro-Desktop-Agent/0.1.0")
+            .header("User-Agent", "Kyro-Desktop-Agent/0.1.1")
             .form(&form_params)
             .timeout(Duration::from_secs(20))
             .send()

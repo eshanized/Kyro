@@ -490,13 +490,19 @@ async fn test_agent_loop_project_discovery_and_devserver() {
     create_test_run(&db, run_id, ws_dir.path());
 
     // Allow tools via governance settings
-    db.set_setting("mcp_perm:discover_project", "allow").unwrap();
+    db.set_setting("mcp_perm:discover_project", "allow")
+        .unwrap();
     db.set_setting("mcp_perm:inspect_project", "allow").unwrap();
-    db.set_setting("mcp_perm:dev_server_status", "allow").unwrap();
+    db.set_setting("mcp_perm:dev_server_status", "allow")
+        .unwrap();
 
     // Create a mock package.json
     let pkg_json = ws_dir.path().join("package.json");
-    std::fs::write(&pkg_json, r#"{"name":"test-app","scripts":{"dev":"node server.js"}}"#).unwrap();
+    std::fs::write(
+        &pkg_json,
+        r#"{"name":"test-app","scripts":{"dev":"node server.js"}}"#,
+    )
+    .unwrap();
 
     // Step 1: Discover project
     server
@@ -614,8 +620,10 @@ async fn test_agent_loop_checkpoints_and_file_organizer() {
     create_test_run(&db, run_id, ws_dir.path());
 
     // Allow tools via governance settings
-    db.set_setting("mcp_perm:create_code_checkpoint", "allow").unwrap();
-    db.set_setting("mcp_perm:organize_files_preview", "allow").unwrap();
+    db.set_setting("mcp_perm:create_code_checkpoint", "allow")
+        .unwrap();
+    db.set_setting("mcp_perm:organize_files_preview", "allow")
+        .unwrap();
 
     let test_file = ws_dir.path().join("code.rs");
     std::fs::write(&test_file, "fn main() {}").unwrap();
@@ -717,7 +725,8 @@ async fn test_agent_loop_approval_flow_approved() {
     create_test_run(&db, run_id, ws_dir.path());
 
     // Explicitly configure custom tool to require approval
-    db.set_setting("mcp_perm:custom_sensitive_op", "ask").unwrap();
+    db.set_setting("mcp_perm:custom_sensitive_op", "ask")
+        .unwrap();
 
     // Step 1: LLM calls tool requiring approval
     server
@@ -791,10 +800,7 @@ async fn test_agent_loop_approval_flow_approved() {
         .await;
 
     assert!(res.is_ok());
-    assert_eq!(
-        res.unwrap(),
-        "Sensitive operation completed with approval."
-    );
+    assert_eq!(res.unwrap(), "Sensitive operation completed with approval.");
 }
 
 #[tokio::test]
@@ -805,7 +811,8 @@ async fn test_agent_loop_approval_flow_denied() {
     let run_id = "run_appr_deny";
     create_test_run(&db, run_id, ws_dir.path());
 
-    db.set_setting("mcp_perm:custom_destructive_op", "ask").unwrap();
+    db.set_setting("mcp_perm:custom_destructive_op", "ask")
+        .unwrap();
 
     // Step 1: LLM calls tool requiring approval
     server
@@ -1009,10 +1016,7 @@ async fn test_agent_loop_human_takeover_pause_and_resume() {
         .await;
 
     assert!(res.is_ok());
-    assert_eq!(
-        res.unwrap(),
-        "Resumed successfully after human takeover."
-    );
+    assert_eq!(res.unwrap(), "Resumed successfully after human takeover.");
     assert!(!TakeoverController::is_active());
 }
 
@@ -1107,7 +1111,6 @@ async fn test_agent_loop_model_error_handling() {
     );
 }
 
-
 #[tokio::test]
 async fn test_agent_loop_browser_tools() {
     let server = MockLlmServer::start().await;
@@ -1116,7 +1119,8 @@ async fn test_agent_loop_browser_tools() {
     let run_id = "run_browser_test";
     create_test_run(&db, run_id, ws_dir.path());
 
-    db.set_setting("mcp_perm:browser_capabilities", "allow").unwrap();
+    db.set_setting("mcp_perm:browser_capabilities", "allow")
+        .unwrap();
     db.set_setting("mcp_perm:browser_tabs", "allow").unwrap();
 
     // Step 1: LLM calls browser_capabilities
@@ -1209,9 +1213,12 @@ async fn test_agent_loop_document_tools_and_build_diagnostics() {
     let run_id = "run_doc_test";
     create_test_run(&db, run_id, ws_dir.path());
 
-    db.set_setting("mcp_perm:analyze_document", "allow").unwrap();
-    db.set_setting("mcp_perm:compare_documents", "allow").unwrap();
-    db.set_setting("mcp_perm:diagnose_build_failure", "allow").unwrap();
+    db.set_setting("mcp_perm:analyze_document", "allow")
+        .unwrap();
+    db.set_setting("mcp_perm:compare_documents", "allow")
+        .unwrap();
+    db.set_setting("mcp_perm:diagnose_build_failure", "allow")
+        .unwrap();
 
     let doc_a = ws_dir.path().join("doc_a.txt");
     let doc_b = ws_dir.path().join("doc_b.txt");
@@ -1326,10 +1333,7 @@ async fn test_agent_loop_document_tools_and_build_diagnostics() {
         .await;
 
     assert!(res.is_ok());
-    assert_eq!(
-        res.unwrap(),
-        "Documents and build diagnostics completed."
-    );
+    assert_eq!(res.unwrap(), "Documents and build diagnostics completed.");
 }
 
 #[tokio::test]
@@ -1483,7 +1487,11 @@ async fn test_agent_loop_approval_flow_expired_and_cancelled() {
                         let _ = db_clone.resolve_approval_request(&req.id, "expired", "timeout");
                         handled_first = true;
                     } else {
-                        let _ = db_clone.resolve_approval_request(&req.id, "cancelled", "user_cancellation");
+                        let _ = db_clone.resolve_approval_request(
+                            &req.id,
+                            "cancelled",
+                            "user_cancellation",
+                        );
                         break;
                     }
                 }
@@ -1515,7 +1523,10 @@ async fn test_agent_loop_approval_flow_expired_and_cancelled() {
         .await;
 
     assert!(res.is_ok());
-    assert_eq!(res.unwrap(), "Handled expirations and cancellations gracefully.");
+    assert_eq!(
+        res.unwrap(),
+        "Handled expirations and cancellations gracefully."
+    );
 }
 
 #[tokio::test]
@@ -1796,16 +1807,15 @@ async fn test_agent_loop_launch_ghost_app_and_skill() {
         id: "skill_test_1".to_string(),
         name: "Test Skill".to_string(),
         description: "Replays a test delay".to_string(),
-        steps_json: serde_json::to_string(&vec![
-            kyro_lib::teach_task::skill::SkillStep {
-                action_type: "delay".to_string(),
-                x: None,
-                y: None,
-                text: None,
-                key: None,
-                delay_ms: 5,
-            }
-        ]).unwrap(),
+        steps_json: serde_json::to_string(&vec![kyro_lib::teach_task::skill::SkillStep {
+            action_type: "delay".to_string(),
+            x: None,
+            y: None,
+            text: None,
+            key: None,
+            delay_ms: 5,
+        }])
+        .unwrap(),
         created_at: 1000,
     };
     db.create_skill(&skill_rec).unwrap();
@@ -2000,7 +2010,8 @@ async fn test_agent_loop_run_step_with_connectors_and_custom_tools() {
     let run_id = "run_conn_loop_1";
     create_test_run(&db, run_id, ws_dir.path());
 
-    db.set_setting("mcp_perm:unknown_custom_tool", "allow").unwrap();
+    db.set_setting("mcp_perm:unknown_custom_tool", "allow")
+        .unwrap();
 
     let vault = kyro_lib::storage::Vault::new_encrypted_fallback(db.clone());
     let mcp_mgr = kyro_lib::mcp::McpManager::new(db.clone(), vault.clone());

@@ -62,7 +62,7 @@ pub trait NativeConnectorAdapter: Send + Sync {
 }
 ```
 
-#### Reference Implementation: `GitHubAdapter`
+#### Reference Implementation 1: `GitHubAdapter`
 - **Read Tools (Safe, Scoped)**:
   - `github_get_user`: Retrieve authenticated user profile.
   - `github_list_repositories`: List repositories accessible to account.
@@ -81,6 +81,21 @@ pub trait NativeConnectorAdapter: Send + Sync {
   - Bounded timeouts (15 seconds) and retry-after header handling.
   - Informative status code mapping (401 Unauthorized, 403 Forbidden, 404 Not Found, 429 Rate Limited).
   - Secret credentials loaded ephemerally from Vault only for the request.
+
+#### Reference Implementation 2: `GoogleAdapter`
+- **Gmail Tools**:
+  - `gmail_list_messages`: Search and list messages with query filters (`q`, `max_results`).
+  - `gmail_get_message`: Retrieve email body, headers, and parsed payload.
+  - `gmail_create_draft`: Create an email draft with RFC 2822 header validation.
+  - `gmail_send_email`: Send an email (requires human approval gate).
+- **Google Calendar Tools**:
+  - `calendar_list_events`: List events within a time window (`time_min`, `time_max`).
+  - `calendar_find_meeting_times`: Identify open calendar slots matching working hours, filtering cancelled/transparent events, handling exclusive all-day end bounds, and enforcing strict IANA timezone validation.
+- **Security & RFC Compliance Controls**:
+  - **RFC 2822 Header Injection Defense**: Strictly scans `to`, `subject`, and `in_reply_to` fields for `\r`, `\n`, `\0`, and control characters, failing closed on any header injection attempt.
+  - **RFC 2047 Word Encoding**: Automatically encodes Unicode subjects and non-ASCII display names into ` =?UTF-8?B?...?=` format using base64.
+  - **Single-Flight OAuth Refresh**: Dynamically refreshes tokens against `https://oauth2.googleapis.com/token` with 15-second re-check lock to avoid redundant concurrent token refreshes.
+  - **Lifecycle Classification**: Distinguishes permanent (`invalid_grant`, HTTP 4xx -> `needs_reauth`) from transient (`error`) failures.
 
 ### 2.2 Type B: Remote MCP Connectors
 The `RemoteMcpClient` provides communication with HTTP-based Model Context Protocol servers under current and legacy specifications:

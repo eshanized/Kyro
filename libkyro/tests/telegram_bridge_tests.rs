@@ -79,6 +79,7 @@ fn spawn_mock_telegram_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_telegram_bridge_api_base_and_direct_send() {
     let _guard = ENV_LOCK.lock().unwrap();
     let (url, running, server_handle) = spawn_mock_telegram_server();
@@ -132,6 +133,7 @@ async fn test_telegram_bridge_fail_closed_unauthorized() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_telegram_bridge_commands_lifecycle() {
     let _guard = ENV_LOCK.lock().unwrap();
     let (url, running, server_handle) = spawn_mock_telegram_server();

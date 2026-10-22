@@ -33,7 +33,10 @@ fn setup_test_context(tag: &str) -> (TestContext, tauri::State<'static, AppState
     let vault = Vault::new_encrypted_fallback(db.clone());
     let browser = Arc::new(BrowserAutomationManager::new().with_database(db.clone()));
     let dev_servers = Arc::new(DevServerManager::new());
-    let engine = Arc::new(AgentLoopEngine::with_resources(browser.clone(), dev_servers.clone()));
+    let engine = Arc::new(AgentLoopEngine::with_resources(
+        browser.clone(),
+        dev_servers.clone(),
+    ));
     let mcp_manager = McpManager::new(db.clone(), vault.clone());
     let connector_manager = Arc::new(ConnectorManager::new(
         db.clone(),
@@ -179,7 +182,8 @@ async fn test_approvals_and_takeover_commands() {
         "appr-fake".to_string(),
         "approved".to_string(),
         Some("tester".to_string()),
-    ).unwrap();
+    )
+    .unwrap();
     assert!(!res);
 
     let res_inv = resolve_approval(
@@ -187,7 +191,8 @@ async fn test_approvals_and_takeover_commands() {
         "appr-fake".to_string(),
         "invalid_choice".to_string(),
         None,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(!res_inv);
 
     assert!(!get_takeover_status().is_active);
@@ -258,10 +263,20 @@ async fn test_teach_task_and_skills_commands() {
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "TestSkill");
 
-    let replay_res = replay_skill(ctx.app.handle().clone(), state.clone(), skills[0].id.clone()).await;
+    let replay_res = replay_skill(
+        ctx.app.handle().clone(),
+        state.clone(),
+        skills[0].id.clone(),
+    )
+    .await;
     assert!(replay_res.is_ok() || replay_res.is_err());
 
-    let replay_fake = replay_skill(ctx.app.handle().clone(), state.clone(), "fake-skill-id".to_string()).await;
+    let replay_fake = replay_skill(
+        ctx.app.handle().clone(),
+        state.clone(),
+        "fake-skill-id".to_string(),
+    )
+    .await;
     assert!(replay_fake.is_err());
 
     let del_res = delete_skill(state.clone(), skills[0].id.clone()).unwrap();
@@ -305,7 +320,9 @@ async fn test_routines_commands() {
     let del_fake = delete_routine(state.clone(), "rt-fake".to_string()).unwrap();
     assert!(!del_fake);
 
-    let parsed = natural_language_to_routine("Clean desktop downloads every day at 9am".to_string()).unwrap();
+    let parsed =
+        natural_language_to_routine("Clean desktop downloads every day at 9am".to_string())
+            .unwrap();
     assert!(!parsed.cron_expression.is_empty());
 
     let editable = kyro_lib::teach_task::portable_routine::EditableRoutine {
@@ -377,7 +394,9 @@ async fn test_mcp_servers_commands() {
     let statuses = get_mcp_server_statuses(state.clone()).await.unwrap();
     assert_eq!(statuses.len(), 1);
 
-    delete_mcp_server(state.clone(), "mcp-test".to_string()).await.unwrap();
+    delete_mcp_server(state.clone(), "mcp-test".to_string())
+        .await
+        .unwrap();
     let servers_empty = list_mcp_servers(state.clone()).unwrap();
     assert_eq!(servers_empty.len(), 0);
 }
@@ -423,12 +442,22 @@ async fn test_agent_runs_lifecycle_commands() {
     assert_eq!(events.len(), 0);
 
     // Register run in engine so cancel_agent_run finds active token
-    state.engine.register_run_token("run-test-1", kyro_lib::agent::cancellation::CancellationToken::new()).await;
+    state
+        .engine
+        .register_run_token(
+            "run-test-1",
+            kyro_lib::agent::cancellation::CancellationToken::new(),
+        )
+        .await;
 
-    let cancelled = cancel_agent_run(state.clone(), "run-test-1".to_string()).await.unwrap();
+    let cancelled = cancel_agent_run(state.clone(), "run-test-1".to_string())
+        .await
+        .unwrap();
     assert!(cancelled);
 
-    let cancelled_again = cancel_agent_run(state.clone(), "run-test-1".to_string()).await.unwrap();
+    let cancelled_again = cancel_agent_run(state.clone(), "run-test-1".to_string())
+        .await
+        .unwrap();
     assert!(!cancelled_again);
 
     let cancelled_fake = cancel_agent_run(state.clone(), "run-fake".to_string()).await;
@@ -505,13 +534,22 @@ async fn test_memory_and_artifacts_commands() {
     let content = read_artifact_content(state.clone(), art_rec.id.clone()).unwrap();
     assert_eq!(content, "Report contents here");
 
-    let comment_res = add_artifact_comment(state.clone(), art_rec.id.clone(), "Good summary".to_string(), false);
+    let comment_res = add_artifact_comment(
+        state.clone(),
+        art_rec.id.clone(),
+        "Good summary".to_string(),
+        false,
+    );
     assert!(comment_res.is_ok());
 
     let export_dir = std::env::temp_dir().join(format!("art_export_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&export_dir).unwrap();
     let target_export = export_dir.join("exported_report.txt");
-    let export_res = export_artifact(state.clone(), art_rec.id.clone(), target_export.to_string_lossy().to_string());
+    let export_res = export_artifact(
+        state.clone(),
+        art_rec.id.clone(),
+        target_export.to_string_lossy().to_string(),
+    );
     assert!(export_res.is_ok());
     assert!(target_export.exists());
 
@@ -528,7 +566,12 @@ async fn test_templates_and_system_health_commands() {
     let starters = get_starter_templates();
     assert!(!starters.is_empty());
 
-    let exported = export_workspace_templates(state.clone(), "My Workspace".to_string(), "Description".to_string()).unwrap();
+    let exported = export_workspace_templates(
+        state.clone(),
+        "My Workspace".to_string(),
+        "Description".to_string(),
+    )
+    .unwrap();
     assert!(exported.contains("My Workspace"));
 
     let imported = import_workspace_templates(state.clone(), exported).unwrap();
@@ -663,13 +706,7 @@ async fn test_authorized_folders_and_documents_commands() {
     let folders_after = list_authorized_folders(state.clone()).unwrap();
     assert_eq!(folders_after.len(), 1);
 
-    let docs = search_authorized_documents(
-        state.clone(),
-        "notes".to_string(),
-        None,
-        None,
-    )
-    .unwrap();
+    let docs = search_authorized_documents(state.clone(), "notes".to_string(), None, None).unwrap();
     assert_eq!(docs.len(), 0);
 
     let rem_res = remove_authorized_folder(state.clone(), Some(folders_after[0].id.clone()), None);
@@ -710,7 +747,8 @@ async fn test_file_assistant_operations_commands() {
     assert!(copy_res.success);
     assert!(dst_file.exists());
 
-    let dups = detect_folder_duplicates(state.clone(), work_dir.to_string_lossy().to_string()).unwrap();
+    let dups =
+        detect_folder_duplicates(state.clone(), work_dir.to_string_lossy().to_string()).unwrap();
     assert!(dups.is_empty() || !dups.is_empty());
 
     let txs = list_file_transactions(state.clone(), Some(10)).unwrap();
@@ -761,7 +799,9 @@ async fn test_model_capabilities_and_today_dashboard_commands() {
     let models = list_available_models().await.unwrap();
     assert!(!models.is_empty());
 
-    let cap = get_model_capabilities("nvidia/nemotron-4-340b-instruct".to_string()).await.unwrap();
+    let cap = get_model_capabilities("nvidia/nemotron-4-340b-instruct".to_string())
+        .await
+        .unwrap();
     assert_eq!(cap.model_id, "nvidia/nemotron-4-340b-instruct");
 
     let dash = get_today_dashboard_data(state.clone()).await.unwrap();
@@ -775,12 +815,25 @@ async fn test_project_checkpoints_and_discovery_commands() {
 
     let proj_dir = ctx.dir.join("sample_proj");
     std::fs::create_dir_all(&proj_dir).unwrap();
-    std::fs::write(proj_dir.join("package.json"), r#"{"name": "test-app", "scripts": {"build": "exit 1"}}"#).unwrap();
+    std::fs::write(
+        proj_dir.join("package.json"),
+        r#"{"name": "test-app", "scripts": {"build": "exit 1"}}"#,
+    )
+    .unwrap();
 
-    let disc = discover_projects("test-app".to_string(), Some(ctx.dir.to_string_lossy().to_string())).unwrap();
+    let disc = discover_projects(
+        "test-app".to_string(),
+        Some(ctx.dir.to_string_lossy().to_string()),
+    )
+    .unwrap();
     let _ = disc.candidates.len();
 
-    let chk = create_code_checkpoint(proj_dir.to_string_lossy().to_string(), "Init checkpoint".to_string()).await.unwrap();
+    let chk = create_code_checkpoint(
+        proj_dir.to_string_lossy().to_string(),
+        "Init checkpoint".to_string(),
+    )
+    .await
+    .unwrap();
     assert_eq!(chk.description, "Init checkpoint");
 
     let rollback = rollback_code_checkpoint(chk).await.unwrap();
@@ -872,12 +925,22 @@ async fn test_document_assistant_and_file_organization_commands() {
     .unwrap();
 
     let doc_a = safe_folder.join("doc_a.txt");
-    std::fs::write(&doc_a, "Meeting Notes\nAction: Submit Q3 budget by Friday Oct 24.\nKey Fact: Revenue grew 20%.").unwrap();
+    std::fs::write(
+        &doc_a,
+        "Meeting Notes\nAction: Submit Q3 budget by Friday Oct 24.\nKey Fact: Revenue grew 20%.",
+    )
+    .unwrap();
 
     let doc_b = safe_folder.join("doc_b.txt");
-    std::fs::write(&doc_b, "Meeting Notes\nAction: Submit Q3 budget by Monday Oct 27.\nKey Fact: Revenue grew 25%.").unwrap();
+    std::fs::write(
+        &doc_b,
+        "Meeting Notes\nAction: Submit Q3 budget by Monday Oct 27.\nKey Fact: Revenue grew 25%.",
+    )
+    .unwrap();
 
-    let analysis = analyze_document(doc_a.to_string_lossy().to_string(), None, state.clone()).await.unwrap();
+    let analysis = analyze_document(doc_a.to_string_lossy().to_string(), None, state.clone())
+        .await
+        .unwrap();
     assert_eq!(analysis.metadata.file_name, "doc_a.txt");
 
     let comp_docs = compare_documents(
@@ -889,17 +952,38 @@ async fn test_document_assistant_and_file_organization_commands() {
     .unwrap();
     assert!(!comp_docs.markdown_report.is_empty());
 
-    let notes = generate_study_notes(state.clone(), doc_a.to_string_lossy().to_string(), Some("budget".to_string())).unwrap();
+    let notes = generate_study_notes(
+        state.clone(),
+        doc_a.to_string_lossy().to_string(),
+        Some("budget".to_string()),
+    )
+    .unwrap();
     assert!(!notes.overview.is_empty());
 
-    let expl = explain_document_passage(state.clone(), doc_a.to_string_lossy().to_string(), "Revenue grew 20%".to_string()).unwrap();
+    let expl = explain_document_passage(
+        state.clone(),
+        doc_a.to_string_lossy().to_string(),
+        "Revenue grew 20%".to_string(),
+    )
+    .unwrap();
     assert!(!expl.is_empty());
 
     // File organization preview, execute, undo
-    let preview = preview_file_organization(state.clone(), safe_folder.to_string_lossy().to_string(), None).await.unwrap();
-    assert_eq!(preview.target_directory, safe_folder.canonicalize().unwrap());
+    let preview = preview_file_organization(
+        state.clone(),
+        safe_folder.to_string_lossy().to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        preview.target_directory,
+        safe_folder.canonicalize().unwrap()
+    );
 
-    let trx = execute_file_organization(preview, state.clone()).await.unwrap();
+    let trx = execute_file_organization(preview, state.clone())
+        .await
+        .unwrap();
     let undo_count = undo_file_organization(state.clone(), trx).await.unwrap();
     let _ = undo_count;
 }
@@ -999,13 +1083,24 @@ async fn test_artifact_lifecycle_and_content_export() {
     assert!(content.contains("Sample Markdown Artifact"));
 
     // Add artifact comment
-    add_artifact_comment(state.clone(), art_id.clone(), "Review comment".to_string(), false).unwrap();
+    add_artifact_comment(
+        state.clone(),
+        art_id.clone(),
+        "Review comment".to_string(),
+        false,
+    )
+    .unwrap();
     let art_fetched = get_artifact(state.clone(), art_id.clone()).unwrap();
     assert!(art_fetched.is_some());
 
     // Export artifact to target path
     let export_target = _ctx.dir.join("exported_art.md");
-    export_artifact(state.clone(), art_id.clone(), export_target.to_string_lossy().to_string()).unwrap();
+    export_artifact(
+        state.clone(),
+        art_id.clone(),
+        export_target.to_string_lossy().to_string(),
+    )
+    .unwrap();
     assert!(export_target.exists());
 
     // Search workspace (covers universal search over memories)
@@ -1035,7 +1130,12 @@ async fn test_workspace_search_and_templates_export_import() {
     assert!(!starter.is_empty());
 
     // Export workspace templates
-    let exp_res = export_workspace_templates(state.clone(), "TestPack".to_string(), "Description".to_string()).unwrap();
+    let exp_res = export_workspace_templates(
+        state.clone(),
+        "TestPack".to_string(),
+        "Description".to_string(),
+    )
+    .unwrap();
     assert!(exp_res.contains("TestPack"));
 
     // Import workspace templates
@@ -1076,10 +1176,17 @@ async fn test_folder_suggestions_and_safe_file_ops() {
     assert!(suggested.is_ok());
 
     // Authorize folder in state
-    add_authorized_folder(state.clone(), _ctx.dir.to_string_lossy().to_string(), Some("TestDir".to_string()), None).unwrap();
+    add_authorized_folder(
+        state.clone(),
+        _ctx.dir.to_string_lossy().to_string(),
+        Some("TestDir".to_string()),
+        None,
+    )
+    .unwrap();
 
     // Detect duplicates in temp directory
-    let dupes = detect_folder_duplicates(state.clone(), _ctx.dir.to_string_lossy().to_string()).unwrap();
+    let dupes =
+        detect_folder_duplicates(state.clone(), _ctx.dir.to_string_lossy().to_string()).unwrap();
     assert_eq!(dupes.len(), 0);
 
     // List file transactions
@@ -1121,7 +1228,9 @@ async fn test_screen_capture_and_ghost_mode_commands() {
 
     // Explain screen capture without model fallback
     let sample_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string();
-    let expl = explain_screen_capture(sample_png, "What is this?".to_string(), None, state.clone()).await.unwrap();
+    let expl = explain_screen_capture(sample_png, "What is this?".to_string(), None, state.clone())
+        .await
+        .unwrap();
     assert!(!expl.summary.is_empty());
 }
 
@@ -1148,7 +1257,9 @@ async fn test_connector_policies_and_account_lifecycle() {
     assert!(!init_res.session_id.is_empty());
 
     // OAuth status
-    let status = get_oauth_status(state.clone(), init_res.session_id.clone()).await.unwrap();
+    let status = get_oauth_status(state.clone(), init_res.session_id.clone())
+        .await
+        .unwrap();
     assert_eq!(status.status, "pending");
 
     // Complete OAuth flow (fails gracefully when code is missing/invalid)
@@ -1205,7 +1316,9 @@ async fn test_connector_policies_and_account_lifecycle() {
     let tools = get_connector_tools(state.clone()).await.unwrap();
     assert!(!tools.is_empty());
 
-    let acc_tools = get_account_tools(state.clone(), "acc-1".to_string()).await.unwrap();
+    let acc_tools = get_account_tools(state.clone(), "acc-1".to_string())
+        .await
+        .unwrap();
     assert!(!acc_tools.is_empty());
 
     let first_tool = acc_tools[0].name.clone();
@@ -1247,7 +1360,11 @@ async fn test_checkpoint_and_build_doctor_commands() {
     .await;
     assert!(diag.is_ok());
     let d = diag.unwrap();
-    assert!(d.root_cause_error.contains("missing") || d.root_cause_error.contains("module") || !d.suggested_repair.is_empty());
+    assert!(
+        d.root_cause_error.contains("missing")
+            || d.root_cause_error.contains("module")
+            || !d.suggested_repair.is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1327,5 +1444,3 @@ async fn test_terminal_and_timeline_commands() {
     let apps = get_installed_apps();
     let _ = apps;
 }
-
-

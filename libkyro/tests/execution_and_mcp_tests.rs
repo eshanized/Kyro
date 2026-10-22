@@ -67,7 +67,9 @@ fn test_launch_error_display_and_validation() {
         executable: "mybin".to_string(),
         searched: vec!["/usr/bin".to_string(), "/bin".to_string()],
     };
-    assert!(err1.to_string().contains("Executable 'mybin' was not found"));
+    assert!(err1
+        .to_string()
+        .contains("Executable 'mybin' was not found"));
 
     let err2 = LaunchError::NotExecutable {
         path: PathBuf::from("/tmp/doc.txt"),
@@ -295,8 +297,7 @@ fn test_routine_scheduler_parsing_and_timezones() {
     assert!(invalid.is_err());
 
     // Extract timezone prefix
-    let (c1, tz1) =
-        RoutineScheduler::extract_timezone("CRON_TZ=America/New_York 0 9 * * 1-5");
+    let (c1, tz1) = RoutineScheduler::extract_timezone("CRON_TZ=America/New_York 0 9 * * 1-5");
     assert_eq!(c1, "0 9 * * 1-5");
     assert_eq!(tz1, Some("America/New_York".to_string()));
 
@@ -309,10 +310,8 @@ fn test_routine_scheduler_parsing_and_timezones() {
     assert_eq!(tz3, None);
 
     // Compute next run with explicit timezone
-    let next_tz = RoutineScheduler::compute_next_run_with_tz(
-        "CRON_TZ=Europe/London 0 12 * * *",
-        None,
-    );
+    let next_tz =
+        RoutineScheduler::compute_next_run_with_tz("CRON_TZ=Europe/London 0 12 * * *", None);
     assert!(next_tz.is_some());
 
     // Running state and concurrency lock

@@ -21,5 +21,6 @@
     }
   },
   "include": ["kyroui"],
+  "exclude": ["kyroui/test", "**/*.test.ts", "**/*.test.tsx"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

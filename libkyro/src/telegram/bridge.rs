@@ -92,6 +92,7 @@ impl TelegramBridge {
     }
 
     /// Processes an individual incoming Telegram update with strict authorization enforcement.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_update(
         u: &serde_json::Value,
         token: &str,
@@ -108,9 +109,7 @@ impl TelegramBridge {
 
         // FAIL CLOSED: Verify authorization before processing any instruction
         if chat_id != allowed_chat_id {
-            log::warn!(
-                "Telegram bridge: rejected unauthorized message from unknown chat_id"
-            );
+            log::warn!("Telegram bridge: rejected unauthorized message from unknown chat_id");
             return Err(format!("Unauthorized chat_id: {}", chat_id));
         }
 
@@ -133,10 +132,8 @@ impl TelegramBridge {
 
             if let Ok(pending) = db.list_pending_approvals() {
                 if !pending.is_empty() {
-                    status_text.push_str(&format!(
-                        "\n⏳ *Pending Approvals ({})*:\n",
-                        pending.len()
-                    ));
+                    status_text
+                        .push_str(&format!("\n⏳ *Pending Approvals ({})*:\n", pending.len()));
                     for p in pending.iter().take(3) {
                         status_text.push_str(&format!(
                             "• `{}`: {}\n  `/approve {}` | `/deny {}`\n",
@@ -149,17 +146,12 @@ impl TelegramBridge {
             let _ = Self::send_message(client, token, &chat_id, &status_text).await;
             Ok(true)
         } else if text == "/screenshot" {
-            let _ = Self::send_message(
-                client,
-                token,
-                &chat_id,
-                "📸 Capturing desktop screen...",
-            )
-            .await;
+            let _ =
+                Self::send_message(client, token, &chat_id, "📸 Capturing desktop screen...").await;
             if let Ok(shot) = capture_screen(0) {
                 use base64::Engine;
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD
-                    .decode(&shot.base64_png)
+                if let Ok(bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(&shot.base64_png)
                 {
                     let _ = Self::send_photo(client, token, &chat_id, bytes).await;
                 }
@@ -188,11 +180,7 @@ impl TelegramBridge {
             Ok(true)
         } else if text.starts_with("/approve ") {
             let app_id = text.trim_start_matches("/approve ").trim();
-            match db.resolve_approval_request(
-                app_id,
-                "approved",
-                "telegram_user",
-            ) {
+            match db.resolve_approval_request(app_id, "approved", "telegram_user") {
                 Ok(true) => {
                     let _ = Self::send_message(
                         client,
@@ -207,7 +195,10 @@ impl TelegramBridge {
                         client,
                         token,
                         &chat_id,
-                        &format!("⚠️ Approval `{}` not found, expired, or already resolved.", app_id),
+                        &format!(
+                            "⚠️ Approval `{}` not found, expired, or already resolved.",
+                            app_id
+                        ),
                     )
                     .await;
                 }
@@ -224,8 +215,7 @@ impl TelegramBridge {
             Ok(true)
         } else if text.starts_with("/deny ") {
             let app_id = text.trim_start_matches("/deny ").trim();
-            match db.resolve_approval_request(app_id, "denied", "telegram_user")
-            {
+            match db.resolve_approval_request(app_id, "denied", "telegram_user") {
                 Ok(true) => {
                     let _ = Self::send_message(
                         client,
@@ -240,7 +230,10 @@ impl TelegramBridge {
                         client,
                         token,
                         &chat_id,
-                        &format!("⚠️ Approval `{}` not found, expired, or already resolved.", app_id),
+                        &format!(
+                            "⚠️ Approval `{}` not found, expired, or already resolved.",
+                            app_id
+                        ),
                     )
                     .await;
                 }
@@ -302,8 +295,12 @@ impl TelegramBridge {
                 client,
                 token,
                 &chat_id,
-                &format!("⚡ Task received: \"{}\". Executing on desktop with NVIDIA Nemotron...", text),
-            ).await;
+                &format!(
+                    "⚡ Task received: \"{}\". Executing on desktop with NVIDIA Nemotron...",
+                    text
+                ),
+            )
+            .await;
 
             let engine_cloned = engine.clone();
             let db_cloned = db.clone();

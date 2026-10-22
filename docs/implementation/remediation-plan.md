@@ -77,6 +77,17 @@ This document records the implemented remediation phases that evolved the Kyro d
 - [x] Strictly enforce context budget (`MAX_MEMORY_CHARS = 2500`) with deterministic truncation.
 
 ### Phase 12 & 13: Automated Regression Testing
-- [x] Add comprehensive unit and integration tests covering security, workspace confinement, shell injection, credential vault, approval CAS consumption, pixel diffs, MCP schemas, timezones, and memory ranking (31 passing tests in `libkyro/tests/engine_tests.rs`).
+- [x] Add comprehensive unit and integration tests covering security, workspace confinement, shell injection, credential vault, approval CAS consumption, pixel diffs, MCP schemas, timezones, and memory ranking.
 - [x] Verify zero warnings under `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] Verify complete frontend build with `npx tsc --noEmit && npm run build`.
+
+### Phase 14: Comprehensive Test Expansion (≥95% Coverage)
+- [x] Expand frontend test coverage to &ge;95% with 31 Vitest test suites and 259 passing tests covering components, modals, HUD, settings, and workflows.
+- [x] Expand backend Rust test suite to 251 passing tests across unit, integration, browser automation, connector, and security suites.
+- [x] Resolve clippy linter warnings across all test targets (`-D warnings`).
+- [x] Exclude test files from production `tsc` emit in `tsconfig.json` to ensure clean release builds.
+
+### Phase 15: v0.1.1 Release & Documentation Refactoring
+- [x] Bump version to `0.1.1` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, and templates.
+- [x] Refactor repository documentation (`README.md`, `runtime-overview.md`, `security-boundaries.md`, `connector-system.md`, `feature-matrix.md`, `implementation-log.md`).
+- [x] Multi-distribution release pipeline validation and GitHub release publishing.

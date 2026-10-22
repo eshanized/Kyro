@@ -123,20 +123,20 @@ graph TD
   - `portable_routine.rs`: Portable routine serialization format `kyro.routine.v1` with secret redaction on export and untrusted capability validation on import.
 - `sandbox/`:
   - `docker.rs`: Container isolation detection and CLI execution.
+- `connector/`:
+  - `manager.rs`: `ConnectorManager` coordinating native adapters, remote HTTP MCP endpoints, local stdio MCP servers, OAuth lifecycle transitions, and per-action governance policy enforcement.
+  - `auth.rs`: PKCE OAuth 2.0 flow coordinator with ephemeral loopback callback listener, single-flight token refresh, and Vault integration.
+  - `native/github.rs`: Native GitHub adapter providing 11 repository, issue, PR, and GitHub Actions workflow inspection/management tools.
+  - `native/google.rs`: Native Google adapter providing Gmail message/draft operations with RFC 2822 header injection protection & RFC 2047 MIME encoding, and Google Calendar timezone-correct availability analysis.
+  - `remote_mcp.rs`: HTTP JSON-RPC 2.0 client supporting streamable MCP (`2026-07-28`) and legacy stateful (`2024-11-05`) protocols with SSRF protection.
+- `telegram/`:
+  - `bridge.rs`: Fail-closed remote mobile bridge with update polling, allowed chat ID gating, mobile approval resolution (`/approve <id>`, `/deny <id>`), desktop screenshot capture, and token sanitization.
 - `browser/`:
   - `mod.rs`: `BrowserAutomationManager`, authoritative browser capability registry, browser preferences persistence in SQLite, session lifecycle and state tracking.
   - `worker.rs`: Subprocess lifecycle manager for `worker.mjs` over JSON-lines stdio protocol.
   - `safety.rs`: Navigation safety policy, origin scope confinement, blocked domain enforcement.
   - `types.rs`: Semantic locators, element targets, page snapshots, observation payloads.
   - `worker.mjs`: Provider-neutral browser worker supporting Firefox family (via native WebDriver BiDi) and Chromium family (Google Chrome, Chromium, Microsoft Edge, Brave, Vivaldi, Opera via Chrome DevTools Protocol over WebSocket) using Node 20+ built-ins.
-- `project/`:
-  - `discovery.rs`: Dynamic project root resolution, candidate ranking, bounded search traversal, exclusion filters (`node_modules`, `.git`, `dist`, `build`, etc.), OS Desktop path resolution via `dirs::desktop_dir()`.
-  - `devserver.rs`: Development server process lifecycle, ready line detection, port extraction, framework recognition.
-- `audit/`:
-  - `workflow.rs`: Autonomous UI audit orchestrator: plan generation, server boot, multi-viewport responsive checks, route discovery, interaction exploration, finding aggregation, markdown report synthesis.
-  - `routes.rs`: Static file and router config route extraction.
-  - `findings.rs`: Categorized finding models (Bug, Accessibility, DesignInconsistency, Performance, Warning) and deduplication.
-  - `report.rs`: Markdown report generator with summary metrics and reproducible evidence attachments.
 
 ---
 

@@ -52,7 +52,7 @@ The policy engine automatically halts automation, records a high-risk approval/t
 
 ---
 
-## 4. Credential Storage & Migration
+## 5. Credential Storage & Migration
 
 - **Mechanism**: Dedicated operating system credential store (via OS Keyring / Secret Service / Windows Credential Manager / macOS Keychain), or authenticated platform encryption (AES-256-GCM with PBKDF2/Argon2 key derivation protected by machine/user identity when OS keyring daemon is unconfigured).
 - **Migration**: Existing `secret:*` records in SQLite `settings` are read, imported into the secure store, verified, and purged from SQLite.
@@ -60,15 +60,47 @@ The policy engine automatically halts automation, records a high-risk approval/t
 
 ---
 
-## 5. Subprocess & Resource Limits
+## 6. Subprocess & Resource Limits
 
 - Subprocesses spawned by shell execution or MCP transport have bounded timeouts, output byte limits (e.g., 512KB max output), and are monitored with kill-on-drop / asynchronous task cancellation tokens.
 - Child process trees are tracked and terminated cleanly upon agent run cancellation or application exit.
 
 ---
 
-## 6. Artifact & Template Export Security
+## 7. Artifact & Template Export Security
 
 - **Path Traversal Protection**: All artifact operations strictly enforce filename sanitization, rejecting directory traversal sequences (`..`), forward slashes (`/`), and backslashes (`\`). Files are stored exclusively in the designated `<app_data_dir>/artifacts/` directory.
 - **Secret Redaction on Export**: Workspace template exports inspect all MCP environment variables and settings. Keys matching sensitive patterns (`KEY`, `TOKEN`, `SECRET`, `PASS`, `AUTH`) are automatically replaced with `<REDACTED_ON_EXPORT>`.
 - **Validation on Import**: Incoming template packs validate schema version 1, confirm valid JSON structures, and verify safe alphanumeric identifiers before writing to SQLite.
+
+---
+
+## 8. Email Injection Defense & RFC 2822 Header Sanitization
+
+- **Header Injection Scanner**: Outgoing email headers (`to`, `subject`, `in_reply_to`) are strictly inspected for `\r`, `\n`, `\0`, or ASCII control characters. Any attempted delimiter injection is rejected immediately before network dispatch.
+- **Recipient Address Format**: Strictly validates single `@`, non-empty local parts, valid domain syntax, and RFC 5322 display-name formats (`User <user@example.com>`).
+- **RFC 2047 Word Encoding**: Unicode subjects and non-ASCII display names are encoded into base64 MIME words (`=?UTF-8?B?...?=`) to preserve standards compliance across mail transfer agents.
+
+---
+
+## 9. POSIX TOCTOU Hardening & Filesystem Collision Safeguards
+
+- **Immediate Re-Canonicalization**: Prior to moving, copying, or undoing filesystem operations, source and target paths are re-canonicalized and verified against authorized canonical workspace roots to prevent Time-of-Check to Time-of-Use (TOCTOU) symlink substitution attacks.
+- **Destination Collision Guards**: Existing destination targets are inspected with `symlink_metadata()` to prevent writing through symlinks or clobbering existing files without explicit human confirmation (`confirm_destructive: true`).
+- **Safe Pre-Removal**: When overwrite is explicitly confirmed, existing files are safely unlinked before recreation, preventing write-through symlink escapes.
+
+---
+
+## 10. Revoked-Folder Pruning & Fail-Closed Document Access
+
+- **Atomic Pruning on Revocation**: When an authorized folder is removed via UI or API, `remove_authorized_folder_and_prune` executes an atomic SQLite transaction deleting the folder authorization and purging all indexed document records, cached text, and metadata located outside remaining authorized paths.
+- **Startup Reconciliation**: App initialization actively audits all indexed documents against currently configured authorized folders, cleaning any stale records left by external changes.
+- **Fail-Closed Access**: In-memory and IPC lookups (`get_indexed_document`) verify path confinement before returning document contents, returning `Ok(None)` if access is unauthorized.
+
+---
+
+## 11. OAuth Token Lifecycle & Single-Flight Synchronization
+
+- **Single-Flight Refresh Mutex**: Concurrent tool invocations requiring refreshed OAuth tokens share an asynchronous mutex with a 15-second grace re-check, preventing duplicate token refresh requests against upstream providers.
+- **Error Classification**: Distinguishes permanent authentication failures (`invalid_grant`, `invalid_client`, HTTP 4xx -> transitioning account status to `needs_reauth`) from transient network failures (DNS, timeout, HTTP 5xx -> transitioning account status to `error`).
+- **Secret Scrubbing**: Client secrets and refresh tokens are scrubbed from user-facing error messages, application logs, and database records.

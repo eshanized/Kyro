@@ -2,16 +2,14 @@ use kyro_lib::connector::auth::{
     html_escape, OAuthManager, PendingOAuthSession, TokenExchangeResult,
 };
 use kyro_lib::connector::manager::{
-    canonicalize_json_value, classify_external_tool, compute_schema_fingerprint,
-    ConnectorManager, InvocationAuthProof,
+    canonicalize_json_value, classify_external_tool, compute_schema_fingerprint, ConnectorManager,
+    InvocationAuthProof,
 };
 use kyro_lib::connector::remote_mcp::{RemoteMcpClient, ValidatedRemoteEndpoint};
 use kyro_lib::execution::permissions::RiskLevel;
 use kyro_lib::governance::auth::AuthDecision;
 use kyro_lib::mcp::{validate_schema, McpManager};
-use kyro_lib::storage::{
-    ConnectedAccountRecord, ConnectorToolPolicyRecord, Database, Vault,
-};
+use kyro_lib::storage::{ConnectedAccountRecord, ConnectorToolPolicyRecord, Database, Vault};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,8 +63,15 @@ fn test_connector_canonicalize_and_hash() {
     // 2. compute_args_hash determinism
     let hash1 = InvocationAuthProof::compute_args_hash(&json!({"b": 2, "a": 1}));
     let hash2 = InvocationAuthProof::compute_args_hash(&json!({"a": 1, "b": 2}));
-    assert_eq!(hash1, hash2, "Hashes must be identical regardless of key order");
-    assert_eq!(hash1.len(), 64, "SHA-256 hex string should be 64 characters");
+    assert_eq!(
+        hash1, hash2,
+        "Hashes must be identical regardless of key order"
+    );
+    assert_eq!(
+        hash1.len(),
+        64,
+        "SHA-256 hex string should be 64 characters"
+    );
 
     // 3. compute_schema_fingerprint
     let schema1 = json!({
@@ -93,43 +98,65 @@ fn test_connector_canonicalize_and_hash() {
 fn test_connector_tool_classification() {
     let empty_schema = json!({"type": "object"});
 
-    let (risk, is_ro, _auto) = classify_external_tool("delete_database", "Destroys a database", &empty_schema);
+    let (risk, is_ro, _auto) =
+        classify_external_tool("delete_database", "Destroys a database", &empty_schema);
     assert_eq!(risk, RiskLevel::Destructive);
     assert!(!is_ro);
 
-    let (risk, is_ro, _auto) = classify_external_tool("destroy_cluster", "Deletes cluster", &empty_schema);
+    let (risk, is_ro, _auto) =
+        classify_external_tool("destroy_cluster", "Deletes cluster", &empty_schema);
     assert_eq!(risk, RiskLevel::Destructive);
     assert!(!is_ro);
 
-    let (risk, is_ro, _auto) = classify_external_tool("drop_table", "Drops SQL table", &empty_schema);
+    let (risk, is_ro, _auto) =
+        classify_external_tool("drop_table", "Drops SQL table", &empty_schema);
     assert_eq!(risk, RiskLevel::Destructive);
     assert!(!is_ro);
 
-    let (risk, is_ro, _auto) = classify_external_tool("list_repositories", "Lists GitHub repos", &empty_schema);
+    let (risk, is_ro, _auto) =
+        classify_external_tool("list_repositories", "Lists GitHub repos", &empty_schema);
     assert_eq!(risk, RiskLevel::Safe);
     assert!(is_ro);
 
-    let (risk, is_ro, _auto) = classify_external_tool("get_user_profile", "Fetches user info", &empty_schema);
+    let (risk, is_ro, _auto) =
+        classify_external_tool("get_user_profile", "Fetches user info", &empty_schema);
     assert_eq!(risk, RiskLevel::Safe);
     assert!(is_ro);
 
-    let (risk, is_ro, _auto) = classify_external_tool("create_issue", "Creates a new issue", &empty_schema);
+    let (risk, is_ro, _auto) =
+        classify_external_tool("create_issue", "Creates a new issue", &empty_schema);
     assert_eq!(risk, RiskLevel::Moderate);
     assert!(!is_ro);
 }
 
 #[test]
 fn test_connector_permanent_vs_transient_refresh_errors() {
-    assert!(ConnectorManager::is_permanent_refresh_error("invalid_grant: refresh token expired"));
-    assert!(ConnectorManager::is_permanent_refresh_error("unauthorized_client"));
-    assert!(ConnectorManager::is_permanent_refresh_error("token has been revoked by user"));
-    assert!(ConnectorManager::is_permanent_refresh_error("status: 401 unauthorized"));
-    assert!(ConnectorManager::is_permanent_refresh_error("status: 403 forbidden"));
+    assert!(ConnectorManager::is_permanent_refresh_error(
+        "invalid_grant: refresh token expired"
+    ));
+    assert!(ConnectorManager::is_permanent_refresh_error(
+        "unauthorized_client"
+    ));
+    assert!(ConnectorManager::is_permanent_refresh_error(
+        "token has been revoked by user"
+    ));
+    assert!(ConnectorManager::is_permanent_refresh_error(
+        "status: 401 unauthorized"
+    ));
+    assert!(ConnectorManager::is_permanent_refresh_error(
+        "status: 403 forbidden"
+    ));
 
-    assert!(!ConnectorManager::is_permanent_refresh_error("503 Service Unavailable"));
+    assert!(!ConnectorManager::is_permanent_refresh_error(
+        "503 Service Unavailable"
+    ));
     assert!(!ConnectorManager::is_permanent_refresh_error("timed out"));
-    assert!(!ConnectorManager::is_permanent_refresh_error("connection reset by peer"));
-    assert!(!ConnectorManager::is_permanent_refresh_error("Network is unreachable"));
+    assert!(!ConnectorManager::is_permanent_refresh_error(
+        "connection reset by peer"
+    ));
+    assert!(!ConnectorManager::is_permanent_refresh_error(
+        "Network is unreachable"
+    ));
 }
 
 #[tokio::test]
@@ -164,10 +191,12 @@ async fn test_connector_catalog_and_account_management() {
         updated_at: 1000,
         last_connected_at: Some(1000),
         last_error: None,
-        expires_at: Some(chrono::Utc::now().timestamp_millis() + 3600_000),
+        expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
     };
     db.create_connected_account(&acc).unwrap();
-    vault.store_account_secret("acc_gh_1", "gho_test_token_12345").unwrap();
+    vault
+        .store_account_secret("acc_gh_1", "gho_test_token_12345")
+        .unwrap();
 
     let accounts = conn_mgr.list_connected_accounts().unwrap();
     assert_eq!(accounts.len(), 1);
@@ -192,8 +221,13 @@ async fn test_connector_catalog_and_account_management() {
 
     let updated_tools = conn_mgr.get_tools_for_account("acc_gh_1").await;
     assert!(!updated_tools.is_empty());
-    let tool_names: Vec<_> = updated_tools.iter().map(|t| t.original_name.clone()).collect();
-    assert!(tool_names.iter().any(|n| n.contains("repository") || n.contains("user")));
+    let tool_names: Vec<_> = updated_tools
+        .iter()
+        .map(|t| t.original_name.clone())
+        .collect();
+    assert!(tool_names
+        .iter()
+        .any(|n| n.contains("repository") || n.contains("user")));
 
     // 6. Disconnect account
     conn_mgr.disconnect_account("acc_gh_1").await.unwrap();
@@ -201,7 +235,10 @@ async fn test_connector_catalog_and_account_management() {
     // Verify record was deleted from DB and secret was cleared
     assert!(db.get_connected_account("acc_gh_1").unwrap().is_none());
     let secret = vault.get_account_secret("acc_gh_1").unwrap();
-    assert!(secret.is_none(), "Token secret must be deleted on disconnect");
+    assert!(
+        secret.is_none(),
+        "Token secret must be deleted on disconnect"
+    );
 }
 
 #[tokio::test]
@@ -240,7 +277,10 @@ async fn test_connector_tool_authorization_evaluation() {
     let tools = conn_mgr.get_all_connector_tools().await;
     assert!(!tools.is_empty());
 
-    let target_tool = tools.iter().find(|t| t.name.contains("acc_conn_1__")).unwrap();
+    let target_tool = tools
+        .iter()
+        .find(|t| t.name.contains("acc_conn_1__"))
+        .unwrap();
     let scoped_name = &target_tool.name;
 
     // Default policy for github read tool is allow
@@ -315,12 +355,21 @@ async fn test_oauth_manager_pkce_and_session_state_machine() {
     oauth.register_session(session).await;
 
     let status = oauth.get_session_status("sess_100").await.unwrap();
-    assert!(matches!(status, kyro_lib::connector::auth::OAuthSessionStatus::Pending));
+    assert!(matches!(
+        status,
+        kyro_lib::connector::auth::OAuthSessionStatus::Pending
+    ));
 
     // 3. Record callback code
-    oauth.record_callback("sess_100", "auth_code_xyz123".to_string()).await.unwrap();
+    oauth
+        .record_callback("sess_100", "auth_code_xyz123".to_string())
+        .await
+        .unwrap();
     let status = oauth.get_session_status("sess_100").await.unwrap();
-    assert!(matches!(status, kyro_lib::connector::auth::OAuthSessionStatus::CallbackReceived { .. }));
+    assert!(matches!(
+        status,
+        kyro_lib::connector::auth::OAuthSessionStatus::CallbackReceived { .. }
+    ));
 
     // 4. Claim and finish exchange
     let claimed = oauth.claim_exchange("sess_100").await.unwrap();
@@ -336,7 +385,10 @@ async fn test_oauth_manager_pkce_and_session_state_machine() {
 
     oauth.finish_exchange("sess_100", Ok(token_res)).await;
     let status = oauth.get_session_status("sess_100").await.unwrap();
-    assert!(matches!(status, kyro_lib::connector::auth::OAuthSessionStatus::Completed { .. }));
+    assert!(matches!(
+        status,
+        kyro_lib::connector::auth::OAuthSessionStatus::Completed { .. }
+    ));
 
     // 5. Take completed session
     let (provider, completed_token) = oauth.take_completed_session("sess_100").await.unwrap();
@@ -361,7 +413,10 @@ async fn test_oauth_manager_pkce_and_session_state_machine() {
     oauth.register_session(session2).await;
     oauth.cancel_session("sess_200").await;
     let status2 = oauth.get_session_status("sess_200").await.unwrap();
-    assert!(matches!(status2, kyro_lib::connector::auth::OAuthSessionStatus::Cancelled));
+    assert!(matches!(
+        status2,
+        kyro_lib::connector::auth::OAuthSessionStatus::Cancelled
+    ));
 
     // 7. HTML escape
     let safe = html_escape("<script>alert('xss & attack');</script> \"quotes\"");
@@ -374,28 +429,79 @@ async fn test_oauth_manager_pkce_and_session_state_machine() {
 #[test]
 fn test_remote_mcp_validated_endpoint_ssrf_protection() {
     // 1. Private IPv4 ranges rejected when allow_private is false
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("http://10.0.0.1:3000/mcp", false, false, false).is_err());
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("http://192.168.1.100/mcp", false, false, false).is_err());
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("http://172.16.0.1/mcp", false, false, false).is_err());
+    assert!(ValidatedRemoteEndpoint::parse_and_validate(
+        "http://10.0.0.1:3000/mcp",
+        false,
+        false,
+        false
+    )
+    .is_err());
+    assert!(ValidatedRemoteEndpoint::parse_and_validate(
+        "http://192.168.1.100/mcp",
+        false,
+        false,
+        false
+    )
+    .is_err());
+    assert!(ValidatedRemoteEndpoint::parse_and_validate(
+        "http://172.16.0.1/mcp",
+        false,
+        false,
+        false
+    )
+    .is_err());
 
     // 2. Link-local cloud metadata rejected unconditionally
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("http://169.254.169.254/latest/meta-data", false, false, false).is_err());
+    assert!(ValidatedRemoteEndpoint::parse_and_validate(
+        "http://169.254.169.254/latest/meta-data",
+        false,
+        false,
+        false
+    )
+    .is_err());
 
     // 3. Plain HTTP rejected for public remote hosts
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("http://api.github.com/mcp", false, false, false).is_err());
+    assert!(ValidatedRemoteEndpoint::parse_and_validate(
+        "http://api.github.com/mcp",
+        false,
+        false,
+        false
+    )
+    .is_err());
 
     // 4. Invalid protocols rejected
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("ftp://example.com/mcp", false, false, false).is_err());
-    assert!(ValidatedRemoteEndpoint::parse_and_validate("file:///etc/passwd", false, false, false).is_err());
+    assert!(ValidatedRemoteEndpoint::parse_and_validate(
+        "ftp://example.com/mcp",
+        false,
+        false,
+        false
+    )
+    .is_err());
+    assert!(
+        ValidatedRemoteEndpoint::parse_and_validate("file:///etc/passwd", false, false, false)
+            .is_err()
+    );
 
     // 5. Public HTTPS endpoint allowed
-    let ep = ValidatedRemoteEndpoint::parse_and_validate("https://api.github.com/mcp", false, false, false).unwrap();
+    let ep = ValidatedRemoteEndpoint::parse_and_validate(
+        "https://api.github.com/mcp",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
     assert_eq!(ep.url(), "https://api.github.com/mcp");
     assert!(!ep.is_loopback());
     assert!(!ep.is_private_network());
 
     // 6. Loopback allowed for local sidecars
-    let local_ep = ValidatedRemoteEndpoint::parse_and_validate("http://127.0.0.1:9090/mcp", false, false, false).unwrap();
+    let local_ep = ValidatedRemoteEndpoint::parse_and_validate(
+        "http://127.0.0.1:9090/mcp",
+        false,
+        false,
+        false,
+    )
+    .unwrap();
     assert!(local_ep.is_loopback());
 }
 
@@ -417,7 +523,9 @@ async fn test_remote_mcp_client_rpc_protocol() {
                 let mut total_read = 0;
                 loop {
                     let n = socket.read(&mut buf[total_read..]).await.unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     total_read += n;
                     if buf[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
                         break;
@@ -491,7 +599,11 @@ async fn test_remote_mcp_client_rpc_protocol() {
 
     // 1. Connect or verify
     let verify_res = client.connect_or_verify().await;
-    assert!(verify_res.is_ok(), "connect_or_verify failed: {:?}", verify_res);
+    assert!(
+        verify_res.is_ok(),
+        "connect_or_verify failed: {:?}",
+        verify_res
+    );
 
     // 2. List tools
     let tools = client.list_tools().await.unwrap();
@@ -612,13 +724,19 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
     db.create_connected_account(&acc_google).unwrap();
 
     // Invalid secret JSON in vault
-    vault.store_account_secret("acc_goog_1", "invalid_json").unwrap();
+    vault
+        .store_account_secret("acc_goog_1", "invalid_json")
+        .unwrap();
     let ref_invalid_json = conn_mgr.refresh_account_token("acc_goog_1").await;
     assert!(ref_invalid_json.is_err());
-    assert!(ref_invalid_json.unwrap_err().contains("Invalid secret JSON"));
+    assert!(ref_invalid_json
+        .unwrap_err()
+        .contains("Invalid secret JSON"));
 
     // Secret missing refresh_token
-    vault.store_account_secret("acc_goog_1", "{\"access_token\": \"dummy\"}").unwrap();
+    vault
+        .store_account_secret("acc_goog_1", "{\"access_token\": \"dummy\"}")
+        .unwrap();
     let ref_no_refresh = conn_mgr.refresh_account_token("acc_goog_1").await;
     assert!(ref_no_refresh.is_err());
     assert!(ref_no_refresh.unwrap_err().contains("refresh token"));
@@ -630,7 +748,9 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
         "refresh_token": "refresh_tok_xyz",
         "updated_at": now - 2000
     });
-    vault.store_account_secret("acc_goog_1", &recent_secret.to_string()).unwrap();
+    vault
+        .store_account_secret("acc_goog_1", &recent_secret.to_string())
+        .unwrap();
     let ref_cached = conn_mgr.refresh_account_token("acc_goog_1").await;
     assert!(ref_cached.is_ok());
     assert_eq!(ref_cached.unwrap(), "cached_access_token_123");
@@ -675,12 +795,16 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
     db.create_connected_account(&acc_unsupported).unwrap();
     let test_unsupp = conn_mgr.test_connection("acc_other_1").await;
     assert!(test_unsupp.is_err());
-    assert!(test_unsupp.unwrap_err().contains("No connection tester available"));
+    assert!(test_unsupp
+        .unwrap_err()
+        .contains("No connection tester available"));
 
     // 5. get_tools_for_account for google and google_calendar
     let goog_tools = conn_mgr.get_tools_for_account("acc_goog_1").await;
     assert!(!goog_tools.is_empty());
-    assert!(goog_tools.iter().any(|t| t.original_name.contains("gmail") || t.original_name.contains("calendar")));
+    assert!(goog_tools
+        .iter()
+        .any(|t| t.original_name.contains("gmail") || t.original_name.contains("calendar")));
 
     let acc_cal = ConnectedAccountRecord {
         id: "acc_cal_1".to_string(),
@@ -703,7 +827,10 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
     assert!(!cal_tools.is_empty());
 
     // 6. resolve_tool
-    assert!(conn_mgr.resolve_tool("nonexistent_scoped_tool").await.is_none());
+    assert!(conn_mgr
+        .resolve_tool("nonexistent_scoped_tool")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -711,10 +838,16 @@ async fn test_oauth_manager_error_paths_and_finalize() {
     let oauth = OAuthManager::new();
 
     // 1. Error paths for missing sessions
-    assert!(oauth.record_callback("missing", "code".to_string()).await.is_err());
+    assert!(oauth
+        .record_callback("missing", "code".to_string())
+        .await
+        .is_err());
     assert!(oauth.claim_exchange("missing").await.is_err());
     assert!(oauth.claim_finalizing("missing").await.is_err());
-    assert!(oauth.get_session_for_manual_exchange("missing").await.is_err());
+    assert!(oauth
+        .get_session_for_manual_exchange("missing")
+        .await
+        .is_err());
 
     // 2. Register session and fail exchange
     let now = chrono::Utc::now().timestamp_millis();
@@ -734,10 +867,15 @@ async fn test_oauth_manager_error_paths_and_finalize() {
     oauth.register_session(session).await;
 
     // Finish exchange with error
-    oauth.finish_exchange("sess_fail", Err("Handshake network error".to_string())).await;
+    oauth
+        .finish_exchange("sess_fail", Err("Handshake network error".to_string()))
+        .await;
     let status_view = oauth.get_session_status_view("sess_fail").await.unwrap();
     assert_eq!(status_view.status, "failed");
-    assert!(status_view.error.unwrap().contains("Handshake network error"));
+    assert!(status_view
+        .error
+        .unwrap()
+        .contains("Handshake network error"));
 
     // 3. Finalize success and finalize failure
     let tok_dummy = TokenExchangeResult {
@@ -756,7 +894,9 @@ async fn test_oauth_manager_error_paths_and_finalize() {
         state: "state".to_string(),
         redirect_uri: "http://localhost/callback".to_string(),
         token_endpoint: "https://example.com/token".to_string(),
-        status: kyro_lib::connector::auth::OAuthSessionStatus::Finalizing { token: tok_dummy.clone() },
+        status: kyro_lib::connector::auth::OAuthSessionStatus::Finalizing {
+            token: tok_dummy.clone(),
+        },
         created_at: now,
         expires_at: now + 60_000,
     };
@@ -773,12 +913,19 @@ async fn test_oauth_manager_error_paths_and_finalize() {
         state: "state".to_string(),
         redirect_uri: "http://localhost/callback".to_string(),
         token_endpoint: "https://example.com/token".to_string(),
-        status: kyro_lib::connector::auth::OAuthSessionStatus::Finalizing { token: tok_dummy.clone() },
+        status: kyro_lib::connector::auth::OAuthSessionStatus::Finalizing {
+            token: tok_dummy.clone(),
+        },
         created_at: now,
         expires_at: now + 60_000,
     };
     oauth.register_session(session3).await;
-    oauth.finalize_failure("sess_fin2", "Database write error".to_string()).await;
+    oauth
+        .finalize_failure("sess_fin2", "Database write error".to_string())
+        .await;
     let s2_fail = oauth.get_session_status("sess_fin2").await.unwrap();
-    assert!(matches!(s2_fail, kyro_lib::connector::auth::OAuthSessionStatus::Failed { .. }));
+    assert!(matches!(
+        s2_fail,
+        kyro_lib::connector::auth::OAuthSessionStatus::Failed { .. }
+    ));
 }

@@ -325,7 +325,10 @@ pub fn execute_in_sandbox(image: String, cmd: String) -> Result<ContainerExecRes
 
 // Interactive PTY Terminal
 #[tauri::command]
-pub fn spawn_terminal<R: tauri::Runtime>(app: AppHandle<R>, state: State<AppState>) -> Result<(), String> {
+pub fn spawn_terminal<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+) -> Result<(), String> {
     let app_clone = app.clone();
     let session = PtySession::spawn(move |output| {
         let _ = app_clone.emit("terminal:output", output);
@@ -369,7 +372,10 @@ pub fn toggle_hud_window<R: tauri::Runtime>(app: AppHandle<R>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn toggle_overlay_window<R: tauri::Runtime>(app: AppHandle<R>, show: bool) -> Result<(), String> {
+pub fn toggle_overlay_window<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    show: bool,
+) -> Result<(), String> {
     if let Some(overlay) = app.get_webview_window("overlay") {
         if show {
             overlay.show().map_err(|e| e.to_string())?;

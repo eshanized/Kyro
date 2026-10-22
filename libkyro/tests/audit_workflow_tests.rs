@@ -66,7 +66,7 @@ fn test_audit_route_normalization_and_extraction() {
     assert_eq!(r4.path, "/");
 
     let outside_file = Path::new("/outside/components/Button.tsx");
-    assert!(route_from_file(&outside_file, root).is_none());
+    assert!(route_from_file(outside_file, root).is_none());
 
     // 3. extract_routes_from_source (React Router JSX)
     let source_code = r#"
@@ -87,17 +87,35 @@ fn test_audit_route_normalization_and_extraction() {
     assert!(extracted.iter().any(|r| r.path == "/auth/login"));
 
     // 4. merge_routes with static precedence
-    let g1 = vec![
-        DiscoveredRoute::new("/items/:id".into(), RouteKind::Dynamic, RouteSource::RouteFile),
-    ];
+    let g1 = vec![DiscoveredRoute::new(
+        "/items/:id".into(),
+        RouteKind::Dynamic,
+        RouteSource::RouteFile,
+    )];
     let g2 = vec![
-        DiscoveredRoute::new("/items/:id".into(), RouteKind::Static, RouteSource::RouteFile),
-        DiscoveredRoute::new("/profile".into(), RouteKind::Static, RouteSource::RouterConfig),
+        DiscoveredRoute::new(
+            "/items/:id".into(),
+            RouteKind::Static,
+            RouteSource::RouteFile,
+        ),
+        DiscoveredRoute::new(
+            "/profile".into(),
+            RouteKind::Static,
+            RouteSource::RouterConfig,
+        ),
     ];
     let merged = merge_routes(vec![g1, g2]);
     assert_eq!(merged.routes.len(), 2);
-    let item_route = merged.routes.iter().find(|r| r.path == "/items/:id").unwrap();
-    assert_eq!(item_route.kind, RouteKind::Static, "Static should take precedence over dynamic");
+    let item_route = merged
+        .routes
+        .iter()
+        .find(|r| r.path == "/items/:id")
+        .unwrap();
+    assert_eq!(
+        item_route.kind,
+        RouteKind::Static,
+        "Static should take precedence over dynamic"
+    );
 }
 
 #[test]
@@ -117,12 +135,10 @@ fn test_audit_findings_detection_and_deduplication() {
                 text: "User session initialized".into(),
             },
         ],
-        failed_requests: vec![
-            FailedRequestObservation {
-                url: "http://localhost:3000/api/cart/items".into(),
-                error: "net::ERR_CONNECTION_REFUSED".into(),
-            },
-        ],
+        failed_requests: vec![FailedRequestObservation {
+            url: "http://localhost:3000/api/cart/items".into(),
+            error: "net::ERR_CONNECTION_REFUSED".into(),
+        }],
         http_error_responses: vec![
             HttpErrorObservation {
                 url: "http://localhost:3000/api/promotions".into(),
@@ -161,22 +177,32 @@ fn test_audit_findings_detection_and_deduplication() {
     assert!(findings.len() >= 4);
 
     // Verify console error bug
-    assert!(findings.iter().any(|f| f.category == FindingCategory::Bug && f.title.contains("TypeError")));
+    assert!(findings
+        .iter()
+        .any(|f| f.category == FindingCategory::Bug && f.title.contains("TypeError")));
 
     // Verify network error bug
-    assert!(findings.iter().any(|f| f.category == FindingCategory::Bug && f.title.contains("Network request failed")));
+    assert!(findings
+        .iter()
+        .any(|f| f.category == FindingCategory::Bug && f.title.contains("Network request failed")));
 
     // Verify HTTP 500 bug
-    assert!(findings.iter().any(|f| f.category == FindingCategory::Bug && f.title.contains("HTTP 500")));
+    assert!(findings
+        .iter()
+        .any(|f| f.category == FindingCategory::Bug && f.title.contains("HTTP 500")));
 
     // Verify 401 was omitted
     assert!(!findings.iter().any(|f| f.title.contains("HTTP 401")));
 
     // Verify horizontal overflow design inconsistency
-    assert!(findings.iter().any(|f| f.category == FindingCategory::DesignInconsistency));
+    assert!(findings
+        .iter()
+        .any(|f| f.category == FindingCategory::DesignInconsistency));
 
     // Verify accessibility findings
-    assert!(findings.iter().any(|f| f.category == FindingCategory::Accessibility));
+    assert!(findings
+        .iter()
+        .any(|f| f.category == FindingCategory::Accessibility));
 
     // 2. Dead control detection
     let dead_finding = detect_dead_control(
@@ -259,7 +285,10 @@ fn test_audit_visual_regression_baseline() {
     let project_dir = td.path();
 
     // 1. Sanitize component
-    assert_eq!(VisualRegressionEngine::sanitize_component("header/nav:main"), "header_nav_main");
+    assert_eq!(
+        VisualRegressionEngine::sanitize_component("header/nav:main"),
+        "header_nav_main"
+    );
 
     // 2. Baselines directory
     let b_dir = VisualRegressionEngine::baselines_dir(project_dir);
@@ -308,7 +337,11 @@ async fn test_audit_workflow_planning() {
 
     // Create a recognized project manifest
     let pkg = proj_dir.join("package.json");
-    std::fs::write(&pkg, r#"{"name":"audit-test-app","scripts":{"dev":"vite"}}"#).unwrap();
+    std::fs::write(
+        &pkg,
+        r#"{"name":"audit-test-app","scripts":{"dev":"vite"}}"#,
+    )
+    .unwrap();
 
     // Case 1: Plan with explicit project path
     let options = AuditOptions {
@@ -320,8 +353,15 @@ async fn test_audit_workflow_planning() {
     let plan = workflow.plan(&options).await;
     assert!(plan.is_ok(), "Expected plan ok, got: {:?}", plan);
     let p = plan.unwrap();
-    assert_eq!(p.project.name, proj_dir.file_name().unwrap().to_str().unwrap());
-    assert!(p.command.executable.contains("npm") || p.command.executable.contains("npx") || p.command.executable.contains("vite"));
+    assert_eq!(
+        p.project.name,
+        proj_dir.file_name().unwrap().to_str().unwrap()
+    );
+    assert!(
+        p.command.executable.contains("npm")
+            || p.command.executable.contains("npx")
+            || p.command.executable.contains("vite")
+    );
 
     // Case 2: Plan with empty name and path -> Err
     let bad_options = AuditOptions {

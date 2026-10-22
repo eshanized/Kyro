@@ -254,7 +254,7 @@ impl RemoteMcpClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("Kyro-Desktop-RemoteMCP/0.1.0"),
+            HeaderValue::from_static("Kyro-Desktop-RemoteMCP/0.1.1"),
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -385,7 +385,7 @@ impl RemoteMcpClient {
                             "io.modelcontextprotocol/clientInfo".to_string(),
                             json!({
                                 "name": "kyro-desktop",
-                                "version": "0.1.0"
+                                "version": "0.1.1"
                             }),
                         );
                     }
@@ -655,7 +655,7 @@ impl RemoteMcpClient {
                 },
                 "clientInfo": {
                     "name": "kyro-desktop",
-                    "version": "0.1.0"
+                    "version": "0.1.1"
                 }
             });
 

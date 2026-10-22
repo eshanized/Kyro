@@ -40,7 +40,8 @@ fn test_database_lifecycle_and_reconciliation() {
     let (db, _td) = create_test_db();
 
     // Create conversation and running run
-    db.create_conversation("conv_rec", "Reconcile Test", "test-model").unwrap();
+    db.create_conversation("conv_rec", "Reconcile Test", "test-model")
+        .unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     let run = AgentRun {
         id: "run_reconcile_1".to_string(),
@@ -87,10 +88,15 @@ fn test_database_conversations_and_messages_foreign_key() {
         created_at: 1000,
     };
     let err = db.add_message(&orphan_msg);
-    assert!(err.is_err(), "Foreign key constraint must reject orphan message");
+    assert!(
+        err.is_err(),
+        "Foreign key constraint must reject orphan message"
+    );
 
     // 2. Create conversation
-    let conv = db.create_conversation("conv_100", "Chat Title", "nemotron").unwrap();
+    let conv = db
+        .create_conversation("conv_100", "Chat Title", "nemotron")
+        .unwrap();
     assert_eq!(conv.id, "conv_100");
     assert_eq!(conv.title, "Chat Title");
 
@@ -120,7 +126,8 @@ fn test_database_conversations_and_messages_foreign_key() {
 fn test_database_run_events_atomicity_and_sequencing() {
     let (db, _td) = create_test_db();
 
-    db.create_conversation("c_seq", "Seq Test", "model").unwrap();
+    db.create_conversation("c_seq", "Seq Test", "model")
+        .unwrap();
     let run = AgentRun {
         id: "r_seq_1".to_string(),
         conversation_id: Some("c_seq".to_string()),
@@ -322,7 +329,9 @@ fn test_database_timeline_and_memory_store() {
     };
     db.save_memory(&mem).unwrap();
 
-    let user_mems = db.get_memories_for_scope("preference", "user_default").unwrap();
+    let user_mems = db
+        .get_memories_for_scope("preference", "user_default")
+        .unwrap();
     assert_eq!(user_mems.len(), 1);
     assert_eq!(user_mems[0].value, "dark");
 
@@ -370,8 +379,14 @@ fn test_organizer_preview_execute_undo() {
 
     // 1. Categorize extension helper
     let custom = HashMap::new();
-    assert_eq!(FileOrganizer::categorize_extension("png", &custom), "Images");
-    assert_eq!(FileOrganizer::categorize_extension("pdf", &custom), "Documents");
+    assert_eq!(
+        FileOrganizer::categorize_extension("png", &custom),
+        "Images"
+    );
+    assert_eq!(
+        FileOrganizer::categorize_extension("pdf", &custom),
+        "Documents"
+    );
     assert_eq!(FileOrganizer::categorize_extension("rs", &custom), "Code");
 
     // 2. Setup files to organize
@@ -409,7 +424,9 @@ fn test_vault_encryption_fallback_and_tamper_detection() {
     let vault = Vault::new_encrypted_fallback(db.clone());
 
     // 1. Store secret
-    vault.set_secret("test_api_key", "secret-value-12345").unwrap();
+    vault
+        .set_secret("test_api_key", "secret-value-12345")
+        .unwrap();
 
     // 2. Retrieve secret
     let retrieved = vault.get_secret("test_api_key").unwrap();

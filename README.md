@@ -94,12 +94,12 @@ Kyro is built with a **Zero-Trust Security Model**: all conversations, embedding
 ### 👁️ Computer-Use & Visual Grounding
 - **Set-of-Marks (SoM) Grounding**: Precise visual tagging and coordinate targeting.
 - **Native Input Synthesis**: Low-level mouse and keyboard emulation via `enigo`.
-- **Browser Automation**: High-fidelity Firefox WebDriver BiDi automation with element inspection and origin-scoped navigation.
+- **Browser Automation**: High-fidelity, provider-neutral browser automation supporting Firefox (native WebDriver BiDi) and Chromium-family browsers (Google Chrome, Chromium, Brave, Microsoft Edge, Vivaldi, Opera via CDP) with origin-scoping and strict non-substitution hierarchy.
 - **Interactive Heads-Up Display (HUD)**: Compact floating snipping window (`Ctrl+K` instant search, region selector).
 
 ### 🧩 Connectors & Model Context Protocol (MCP)
-- Full client implementation of the **Model Context Protocol (MCP)**.
-- Native **GitHub Connector** with secure PKCE OAuth 2.0 and single-flight token refresh.
+- Full client implementation of the **Model Context Protocol (MCP)** (stdio, HTTP JSON-RPC 2.0, and SSE transports).
+- Native **GitHub Connector** and **Google Connector** (Gmail & Google Calendar) with secure PKCE OAuth 2.0, single-flight token refresh, RFC 2822 header injection defenses, and RFC 2047 MIME encoding.
 - Support for custom local stdio tools and remote SSE/HTTP MCP endpoints.
 - Per-action governance policy management (Allow, Ask Always, Deny).
 
@@ -197,12 +197,12 @@ Prebuilt packages for every major Linux distribution family are published under 
 
 | Distribution / Environment | Package Format | Quick Install Command |
 |:---|:---:|:---|
-| **Ubuntu, Debian, Pop!_OS, Linux Mint, Kali** | `.deb` | `sudo apt install ./Kyro_0.1.0_amd64.deb` |
-| **Fedora, RHEL, CentOS Stream, Rocky, Alma** | `.rpm` | `sudo dnf install ./Kyro-0.1.0-1.x86_64.rpm` |
-| **openSUSE (Leap / Tumbleweed)** | `.rpm` | `sudo zypper install ./Kyro-0.1.0-1.x86_64.rpm` |
-| **Arch Linux, Manjaro, EndeavourOS, SteamOS** | `.pkg.tar.zst` | `sudo pacman -U kyro-0.1.0-1-x86_64.pkg.tar.zst` |
-| **Universal Linux (Standalone / Zero Install)** | `.AppImage` | `chmod +x Kyro_0.1.0_amd64.AppImage && ./Kyro_0.1.0_amd64.AppImage` |
-| **Portable Linux Archive (Custom Prefix)** | `.tar.gz` | `tar -xzf kyro-0.1.0-linux-x86_64.tar.gz && ./kyro-0.1.0-linux-x86_64/install.sh` |
+| **Ubuntu, Debian, Pop!_OS, Linux Mint, Kali** | `.deb` | `sudo apt install ./Kyro_0.1.1_amd64.deb` |
+| **Fedora, RHEL, CentOS Stream, Rocky, Alma** | `.rpm` | `sudo dnf install ./Kyro-0.1.1-1.x86_64.rpm` |
+| **openSUSE (Leap / Tumbleweed)** | `.rpm` | `sudo zypper install ./Kyro-0.1.1-1.x86_64.rpm` |
+| **Arch Linux, Manjaro, EndeavourOS, SteamOS** | `.pkg.tar.zst` | `sudo pacman -U kyro-0.1.1-1-x86_64.pkg.tar.zst` |
+| **Universal Linux (Standalone / Zero Install)** | `.AppImage` | `chmod +x Kyro_0.1.1_amd64.AppImage && ./Kyro_0.1.1_amd64.AppImage` |
+| **Portable Linux Archive (Custom Prefix)** | `.tar.gz` | `tar -xzf kyro-0.1.1-linux-x86_64.tar.gz && ./kyro-0.1.1-linux-x86_64/install.sh` |
 
 Verify asset integrity with `sha256sum -c SHA256SUMS.txt`.
 
@@ -281,7 +281,7 @@ Keys configured in UI Settings are encrypted inside your OS Keyring and will nev
 
 ## 🛠️ Verification & Testing
 
-Kyro has strict test coverage across unit, integration, and security layers (over 230 backend Rust tests and 60+ frontend tests):
+Kyro has strict test coverage across unit, integration, and security layers (over 250 backend Rust tests and 250+ frontend Vitest tests across 31 test suites, achieving &ge; 95% frontend coverage and 510+ total automated tests):
 
 ```bash
 # Run the complete end-to-end verification pipeline:
