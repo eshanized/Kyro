@@ -90,12 +90,20 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
     setRunningRoutineId(routineId);
     setActionNotice(null);
     try {
-      await invoke<RoutineRunRecord>("execute_routine_now", { routineId });
-      setActionNotice(`Routine '${routineName}' executed successfully.`);
-      await loadDashboard();
+      const res = await invoke<RoutineRunRecord>("execute_routine_now", { routineId });
+      if (res.status === "succeeded") {
+        setActionNotice(`Routine '${routineName}' executed successfully.`);
+      } else {
+        setActionNotice(
+          `Routine '${routineName}' finished with status '${res.status}': ${
+            res.error || res.summary || "No error details"
+          }`
+        );
+      }
     } catch (e: any) {
       setActionNotice(`Failed to run routine: ${e?.toString() || "Unknown error"}`);
     } finally {
+      await loadDashboard();
       setRunningRoutineId(null);
     }
   };
@@ -155,6 +163,85 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
           <button onClick={() => setActionNotice(null)} className="text-sky-400 hover:text-sky-200 text-xs">
             Dismiss
           </button>
+        </div>
+      )}
+
+      {/* Pending Authorizations Section */}
+      {data?.pending_approvals && data.pending_approvals.length > 0 && (
+        <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-800/60 space-y-3 shadow-sm">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Shield className="w-4 h-4 text-amber-400" />
+              <h3 className="text-xs font-bold text-amber-200 uppercase tracking-wider">
+                Pending Authorizations ({data.pending_approvals.length})
+              </h3>
+            </div>
+            <button
+              onClick={() => onOpenSettings("governance")}
+              className="text-xs text-amber-300 hover:text-amber-100 underline"
+            >
+              Manage Governance
+            </button>
+          </div>
+          <div className="space-y-2">
+            {data.pending_approvals.map((req) => (
+              <div
+                key={req.id}
+                className="p-3 rounded-lg bg-[#141414] border border-amber-800/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+              >
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-neutral-200 font-mono">
+                      {req.tool_name}
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded font-medium bg-amber-900/50 text-amber-300 border border-amber-800">
+                      {req.risk_level}
+                    </span>
+                  </div>
+                  <p className="text-xs text-neutral-300 mt-1">{req.summary}</p>
+                  <p className="text-[11px] text-neutral-400">{req.reason}</p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={async () => {
+                      try {
+                        await invoke("resolve_approval", {
+                          requestId: req.id,
+                          approved: true,
+                          note: "Approved from Today dashboard",
+                        });
+                        setActionNotice(`Approved action for '${req.tool_name}'.`);
+                        await loadDashboard();
+                      } catch (e: any) {
+                        setActionNotice(`Failed to approve: ${e?.toString() || "Unknown error"}`);
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-neutral-100 hover:bg-white text-neutral-950 font-semibold rounded-lg text-xs transition shadow-sm"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await invoke("resolve_approval", {
+                          requestId: req.id,
+                          approved: false,
+                          note: "Rejected from Today dashboard",
+                        });
+                        setActionNotice(`Rejected action for '${req.tool_name}'.`);
+                        await loadDashboard();
+                      } catch (e: any) {
+                        setActionNotice(`Failed to reject: ${e?.toString() || "Unknown error"}`);
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-neutral-900 hover:bg-neutral-800 text-rose-300 border border-neutral-800 rounded-lg text-xs transition"
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -330,6 +417,22 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
                       : "Your inbox is completely caught up! No unread messages."}
                   </p>
                 </div>
+
+                {data.email_summary.recent_subjects && data.email_summary.recent_subjects.length > 0 && (
+                  <div className="space-y-1.5 pt-1">
+                    <span className="text-[11px] font-semibold text-neutral-300 block">Recent Unread:</span>
+                    {data.email_summary.recent_subjects.map((sub, sIdx) => (
+                      <div
+                        key={sIdx}
+                        className="p-2 rounded-lg bg-[#181818] border border-neutral-800 text-xs text-neutral-200 flex items-center gap-1.5"
+                      >
+                        <Mail className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                        <span className="truncate">{sub}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 <button
                   onClick={() => onAskPrompt("Summarize my unread emails and draft replies")}
                   className="w-full py-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded-lg text-xs font-medium text-neutral-200 flex items-center justify-center gap-1.5 transition"

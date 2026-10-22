@@ -103,6 +103,8 @@ export const App: React.FC = () => {
 
   // Everyday Destinations: "ask" | "today" | "tools" | "routines"
   const [everydayTab, setEverydayTab] = useState<"ask" | "today" | "tools" | "routines">("ask");
+  const [toolsInitialTab, setToolsInitialTab] = useState<"files" | "study" | "screen" | "web" | "connected">("files");
+  const [routinesInitialTab, setRoutinesInitialTab] = useState<"routines" | "history">("routines");
   const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
 
   // Structured Task Plan before consequential operations
@@ -1461,7 +1463,21 @@ export const App: React.FC = () => {
         {experienceMode === "everyday" && everydayTab === "today" ? (
           <div className="flex-1 overflow-y-auto">
             <TodayDashboardView
-              onOpenTool={(_toolId) => setEverydayTab("tools")}
+              onOpenTool={(toolId, initialTab) => {
+                if (toolId === "routines") {
+                  if (initialTab === "history") {
+                    setRoutinesInitialTab("history");
+                  } else {
+                    setRoutinesInitialTab("routines");
+                  }
+                  setEverydayTab("routines");
+                } else {
+                  if (toolId === "files" || toolId === "study" || toolId === "screen" || toolId === "web" || toolId === "connected") {
+                    setToolsInitialTab(toolId);
+                  }
+                  setEverydayTab("tools");
+                }
+              }}
               onAskPrompt={(p) => {
                 setPrompt(p);
                 setEverydayTab("ask");
@@ -1476,6 +1492,7 @@ export const App: React.FC = () => {
         ) : experienceMode === "everyday" && everydayTab === "tools" ? (
           <div className="flex-1 overflow-y-auto">
             <MyToolsView
+              initialTab={toolsInitialTab}
               onAskPrompt={(p) => {
                 setPrompt(p);
                 setEverydayTab("ask");
@@ -1489,6 +1506,7 @@ export const App: React.FC = () => {
         ) : experienceMode === "everyday" && everydayTab === "routines" ? (
           <div className="flex-1 overflow-y-auto">
             <MyRoutinesView
+              initialTab={routinesInitialTab}
               onAskPrompt={(p) => {
                 setPrompt(p);
                 setEverydayTab("ask");

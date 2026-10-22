@@ -10,6 +10,8 @@ import {
   RefreshCw,
   Pause,
   History,
+  Edit3,
+  AlertTriangle,
 } from "lucide-react";
 import {
   RoutineRecord,
@@ -101,16 +103,24 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
     }
   };
 
+  // Routine Edit State
+  const [editingRoutine, setEditingRoutine] = useState<RoutineRecord | null>(null);
+  const [isUpdating, setIsUpdating] = useState(false);
+
   const handleRunNow = async (r: RoutineRecord) => {
     setRunningRoutineId(r.id);
     setNotice(null);
     try {
-      await invoke<RoutineRunRecord>("execute_routine_now", { routineId: r.id });
-      setNotice(`Routine '${r.name}' executed on demand.`);
-      await loadData();
+      const res = await invoke<RoutineRunRecord>("execute_routine_now", { routineId: r.id });
+      if (res.status === "succeeded") {
+        setNotice(`Routine '${r.name}' executed successfully.`);
+      } else {
+        setNotice(`Routine '${r.name}' ended with status '${res.status}': ${res.error || res.summary || "No error details"}`);
+      }
     } catch (e: any) {
       setNotice(`Execution error: ${e?.toString() || "Unknown error"}`);
     } finally {
+      await loadData();
       setRunningRoutineId(null);
     }
   };
@@ -118,10 +128,26 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
   const handleToggleEnabled = async (r: RoutineRecord) => {
     try {
       const updated = { ...r, enabled: !r.enabled };
-      await invoke("create_routine", { routine: updated });
+      await invoke("update_routine", { routine: updated });
       await loadData();
     } catch (e: any) {
       setNotice(`Update error: ${e?.toString() || "Unknown error"}`);
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingRoutine) return;
+    setIsUpdating(true);
+    setNotice(null);
+    try {
+      await invoke("update_routine", { routine: editingRoutine });
+      setNotice(`Routine '${editingRoutine.name}' updated successfully.`);
+      setEditingRoutine(null);
+      await loadData();
+    } catch (e: any) {
+      setNotice(`Failed to update routine: ${e?.toString() || "Unknown error"}`);
+    } finally {
+      setIsUpdating(false);
     }
   };
 
@@ -217,6 +243,18 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
               </span>
             </div>
 
+            {suggestion.needs_clarification && (
+              <div className="p-2.5 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold block">Schedule Clarification:</span>
+                  <p className="text-[11px] text-amber-300 mt-0.5">
+                    {suggestion.clarification_prompt || "No recurring schedule was specified. You can customize the cron schedule below before saving."}
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-2">
               <div>
                 <label className="text-[11px] text-neutral-400 block mb-0.5">Routine Name:</label>
@@ -225,6 +263,17 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
                   value={suggestion.name}
                   onChange={(e) => setSuggestion({ ...suggestion, name: e.target.value })}
                   className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs text-neutral-100 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="text-[11px] text-neutral-400 block mb-0.5">Recurring Schedule (Cron Expression):</label>
+                <input
+                  type="text"
+                  value={suggestion.cron_expression}
+                  onChange={(e) => setSuggestion({ ...suggestion, cron_expression: e.target.value })}
+                  placeholder="e.g. 0 9 * * 1-5"
+                  className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs text-neutral-100 font-mono focus:outline-none"
                 />
               </div>
 
@@ -329,6 +378,14 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
                       {runningRoutineId === r.id ? "Running..." : "Run Now"}
                     </button>
                     <button
+                      onClick={() => setEditingRoutine({ ...r })}
+                      className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 text-neutral-300 border border-neutral-800 transition"
+                      title="Edit routine"
+                      aria-label="Edit routine"
+                    >
+                      <Edit3 className="w-4 h-4" />
+                    </button>
+                    <button
                       onClick={() => handleToggleEnabled(r)}
                       className="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 text-neutral-300 border border-neutral-800 transition"
                       title={r.enabled ? "Pause routine" : "Resume routine"}
@@ -361,6 +418,83 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
                   Ask Kyro: &ldquo;Every Friday, organize my new documents&rdquo;
                 </button>
               )}
+            </div>
+          )}
+
+          {/* Edit Routine Modal */}
+          {editingRoutine && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+              <div className="bg-[#141414] border border-neutral-800 rounded-2xl p-6 max-w-lg w-full space-y-4 shadow-2xl">
+                <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
+                  <h3 className="text-sm font-bold text-neutral-100 flex items-center gap-2">
+                    <Edit3 className="w-4 h-4 text-purple-400" />
+                    Edit Routine
+                  </h3>
+                  <button
+                    onClick={() => setEditingRoutine(null)}
+                    className="text-neutral-400 hover:text-neutral-200 text-xs"
+                  >
+                    Cancel
+                  </button>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-xs font-semibold text-neutral-300 block mb-1">Name:</label>
+                    <input
+                      type="text"
+                      value={editingRoutine.name}
+                      onChange={(e) => setEditingRoutine({ ...editingRoutine, name: e.target.value })}
+                      className="w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-100 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-semibold text-neutral-300 block mb-1">
+                      Cron Schedule Expression:
+                    </label>
+                    <input
+                      type="text"
+                      value={editingRoutine.cron_expression}
+                      onChange={(e) =>
+                        setEditingRoutine({ ...editingRoutine, cron_expression: e.target.value })
+                      }
+                      placeholder="e.g. 0 9 * * 1-5"
+                      className="w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-100 font-mono focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-semibold text-neutral-300 block mb-1">
+                      Instruction / Target:
+                    </label>
+                    <textarea
+                      value={editingRoutine.target_id}
+                      onChange={(e) =>
+                        setEditingRoutine({ ...editingRoutine, target_id: e.target.value })
+                      }
+                      rows={3}
+                      className="w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-100 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-neutral-800">
+                  <button
+                    onClick={() => setEditingRoutine(null)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-neutral-400 hover:text-neutral-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSaveEdit}
+                    disabled={isUpdating}
+                    className="px-4 py-1.5 bg-neutral-100 hover:bg-white text-neutral-950 font-semibold rounded-lg text-xs transition"
+                  >
+                    {isUpdating ? "Saving..." : "Save Changes"}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </div>

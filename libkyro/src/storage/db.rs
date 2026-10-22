@@ -52,6 +52,18 @@ pub struct AuthorizedFolderRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentIndexRecord {
+    pub path: String,
+    pub file_name: String,
+    pub format: String,
+    pub size_bytes: u64,
+    pub modified_at: i64,
+    pub sha256: String,
+    pub extracted_text: Option<String>,
+    pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutineRunRecord {
     pub id: String,
     pub routine_id: String,
@@ -683,6 +695,32 @@ impl Database {
 
                 INSERT INTO schema_migrations (version, name, applied_at)
                 VALUES (8, 'everyday_assistant_schema', strftime('%s', 'now') * 1000);
+                COMMIT;",
+            )?;
+        }
+
+        // Migration 9: Document search index cache
+        let mut stmt9 = conn.prepare("SELECT 1 FROM schema_migrations WHERE version = 9")?;
+        let m9_exists = stmt9.exists([])?;
+        drop(stmt9);
+
+        if !m9_exists {
+            conn.execute_batch(
+                "BEGIN TRANSACTION;
+                CREATE TABLE IF NOT EXISTS document_index (
+                    path TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    modified_at INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    extracted_text TEXT,
+                    indexed_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_doc_index_mod ON document_index(modified_at);
+
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (9, 'document_index_schema', strftime('%s', 'now') * 1000);
                 COMMIT;",
             )?;
         }
@@ -2693,34 +2731,200 @@ impl Database {
         Ok(())
     }
 
-    pub fn remove_authorized_folder(&self, id: &str) -> Result<bool> {
+    pub fn remove_authorized_folder(&self, id_or_path: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let affected = conn.execute("DELETE FROM authorized_folders WHERE id = ?1", params![id])?;
+        let affected = conn.execute(
+            "DELETE FROM authorized_folders WHERE id = ?1 OR path = ?1",
+            params![id_or_path],
+        )?;
         Ok(affected > 0)
     }
 
     pub fn is_path_authorized(&self, path: &std::path::Path) -> Result<bool> {
         let folders = self.list_authorized_folders()?;
+        Ok(Self::check_path_authorized_in_folders(&folders, path).is_ok())
+    }
+
+    pub fn validate_authorized_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        let folders = self.list_authorized_folders().map_err(|e| e.to_string())?;
+        Self::check_path_authorized_in_folders(&folders, path)
+    }
+
+    /// Validates directory containment using canonicalization and path-component semantics.
+    /// Fails closed when authorized_folders is empty or path is outside authorized boundaries.
+    pub fn check_path_authorized_in_folders(
+        folders: &[AuthorizedFolderRecord],
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
         if folders.is_empty() {
-            // If no explicit folders authorized, fallback to true if within home or temp, or false.
-            // But per specs: users select authorized folders.
-            return Ok(false);
+            return Err("Access denied: No authorized folders configured. Please authorize a folder in Kyro Settings or Onboarding first.".to_string());
         }
-        let canonical_target = match std::fs::canonicalize(path) {
-            Ok(c) => c,
-            Err(_) => path.to_path_buf(),
+
+        let raw_str = path.to_string_lossy();
+        let trimmed = raw_str.trim();
+        if trimmed.is_empty() {
+            return Err("Access denied: Path cannot be empty.".to_string());
+        }
+        if trimmed.contains('\0') {
+            return Err("Access denied: Path contains prohibited null byte.".to_string());
+        }
+
+        // Canonicalize target if exists, or canonicalize closest existing ancestor and preserve relative suffix
+        let canonical_target = if path.exists() {
+            std::fs::canonicalize(path)
+                .map_err(|e| format!("Failed to canonicalize path '{}': {}", path.display(), e))?
+        } else {
+            let mut cur = path.to_path_buf();
+            let mut trail = Vec::new();
+            while !cur.exists() {
+                if let Some(name) = cur.file_name() {
+                    let name_str = name.to_string_lossy();
+                    if name_str == ".." || name_str == "." {
+                        return Err(
+                            "Access denied: Path traversal characters prohibited.".to_string()
+                        );
+                    }
+                    trail.push(name.to_os_string());
+                } else {
+                    break;
+                }
+                if !cur.pop() {
+                    break;
+                }
+            }
+            if !cur.exists() {
+                return Err(format!(
+                    "Access denied: Path '{}' has no accessible ancestor directory.",
+                    path.display()
+                ));
+            }
+            let canonical_ancestor = std::fs::canonicalize(&cur).map_err(|e| {
+                format!("Failed to canonicalize ancestor '{}': {}", cur.display(), e)
+            })?;
+            let mut assembled = canonical_ancestor;
+            for comp in trail.into_iter().rev() {
+                assembled.push(comp);
+            }
+            assembled
         };
+
         for f in folders {
-            let authorized_path = std::path::Path::new(&f.path);
-            let canonical_auth = match std::fs::canonicalize(authorized_path) {
-                Ok(c) => c,
-                Err(_) => authorized_path.to_path_buf(),
-            };
-            if canonical_target.starts_with(&canonical_auth) {
-                return Ok(true);
+            let auth_path = std::path::Path::new(&f.path);
+            if let Ok(canonical_auth) = std::fs::canonicalize(auth_path) {
+                if canonical_target.starts_with(&canonical_auth) {
+                    return Ok(canonical_target);
+                }
             }
         }
-        Ok(false)
+
+        Err(format!(
+            "Access denied: Path '{}' is outside authorized folder boundaries.",
+            path.display()
+        ))
+    }
+
+    // --- Document Search Index ---
+
+    pub fn get_indexed_document(&self, path: &str) -> Result<Option<DocumentIndexRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, file_name, format, size_bytes, modified_at, sha256, extracted_text, indexed_at
+             FROM document_index WHERE path = ?1",
+        )?;
+        let mut rows = stmt.query(params![path])?;
+        if let Some(row) = rows.next()? {
+            let size_int: i64 = row.get(3)?;
+            Ok(Some(DocumentIndexRecord {
+                path: row.get(0)?,
+                file_name: row.get(1)?,
+                format: row.get(2)?,
+                size_bytes: size_int as u64,
+                modified_at: row.get(4)?,
+                sha256: row.get(5)?,
+                extracted_text: row.get(6)?,
+                indexed_at: row.get(7)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_indexed_document(&self, record: &DocumentIndexRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO document_index (path, file_name, format, size_bytes, modified_at, sha256, extracted_text, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(path) DO UPDATE SET
+                file_name = excluded.file_name,
+                format = excluded.format,
+                size_bytes = excluded.size_bytes,
+                modified_at = excluded.modified_at,
+                sha256 = excluded.sha256,
+                extracted_text = excluded.extracted_text,
+                indexed_at = excluded.indexed_at",
+            params![
+                record.path,
+                record.file_name,
+                record.format,
+                record.size_bytes as i64,
+                record.modified_at,
+                record.sha256,
+                record.extracted_text,
+                record.indexed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_indexed_document(&self, path: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute("DELETE FROM document_index WHERE path = ?1", params![path])?;
+        Ok(count > 0)
+    }
+
+    pub fn list_indexed_documents(&self) -> Result<Vec<DocumentIndexRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, file_name, format, size_bytes, modified_at, sha256, extracted_text, indexed_at
+             FROM document_index ORDER BY modified_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let size_int: i64 = row.get(3)?;
+            Ok(DocumentIndexRecord {
+                path: row.get(0)?,
+                file_name: row.get(1)?,
+                format: row.get(2)?,
+                size_bytes: size_int as u64,
+                modified_at: row.get(4)?,
+                sha256: row.get(5)?,
+                extracted_text: row.get(6)?,
+                indexed_at: row.get(7)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn prune_unauthorized_indexed_documents(
+        &self,
+        authorized_folders: &[AuthorizedFolderRecord],
+    ) -> Result<usize> {
+        let all = self.list_indexed_documents()?;
+        let mut removed = 0;
+        for doc in all {
+            let p = std::path::Path::new(&doc.path);
+            let is_auth = Self::check_path_authorized_in_folders(authorized_folders, p).is_ok();
+            if (!is_auth || !p.exists()) && self.delete_indexed_document(&doc.path)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     // --- Routine Runs ---
@@ -2758,6 +2962,30 @@ impl Database {
             params![status, completed_at, summary, error, id],
         )?;
         Ok(())
+    }
+
+    pub fn get_routine_run(&self, id: &str) -> Result<Option<RoutineRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, routine_id, routine_name, status, started_at, completed_at, summary, error
+             FROM routine_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(RoutineRunRecord {
+                id: row.get(0)?,
+                routine_id: row.get(1)?,
+                routine_name: row.get(2)?,
+                status: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                summary: row.get(6)?,
+                error: row.get(7)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     }
 
     pub fn list_routine_runs(&self, limit: usize) -> Result<Vec<RoutineRunRecord>> {
@@ -2892,6 +3120,25 @@ impl Database {
             Ok(None)
         }
     }
+}
+
+/// Standalone path containment validator
+pub fn check_path_authorized_in_folders(
+    path: &std::path::Path,
+    folders: &[AuthorizedFolderRecord],
+) -> Result<std::path::PathBuf, String> {
+    Database::check_path_authorized_in_folders(folders, path)
+}
+
+pub fn is_path_authorized(path: &std::path::Path, folders: &[AuthorizedFolderRecord]) -> bool {
+    check_path_authorized_in_folders(path, folders).is_ok()
+}
+
+pub fn validate_authorized_path(
+    db: &Database,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    db.validate_authorized_path(path)
 }
 
 /// Recursively canonicalize and compare JSON values for strict semantic equivalence,

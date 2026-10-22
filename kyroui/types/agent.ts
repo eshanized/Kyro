@@ -833,6 +833,23 @@ export interface TodayServiceStatus {
   can_connect: boolean;
 }
 
+export interface SuggestedFolder {
+  id: string;
+  name: string;
+  path: string;
+  exists: boolean;
+}
+
+export interface PendingApprovalItem {
+  id: string;
+  run_id: string;
+  tool_name: string;
+  summary: string;
+  risk_level: string;
+  reason: string;
+  created_at: number;
+}
+
 export interface TodayDashboardData {
   greeting: string;
   date_display: string;
@@ -842,6 +859,8 @@ export interface TodayDashboardData {
   upcoming_routines: TodayRoutineItem[];
   recent_routine_results: RoutineRunRecord[];
   pending_tasks_count: number;
+  pending_approvals?: PendingApprovalItem[];
+  pending_approvals_count?: number;
   services: TodayServiceStatus[];
 }
 
@@ -853,6 +872,9 @@ export interface NlRoutineSuggestion {
   explanation: string;
   required_resources: string[];
   requires_confirmation: boolean;
+  needs_clarification?: boolean;
+  clarification_prompt?: string;
+  schedule_confidence?: string;
 }
 
 

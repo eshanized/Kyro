@@ -140,6 +140,71 @@ describe("Kyro Everyday Destinations & Workflows", () => {
       fireEvent.click(draftBtn);
       expect(handleAskPrompt).toHaveBeenCalledWith("Summarize my unread emails and draft replies");
     });
+
+    it("renders pending authorizations banner and allows resolving approval directly", async () => {
+      const mockApprovalsData = {
+        greeting: "Good morning",
+        date_display: "Wednesday, Oct 22",
+        upcoming_events: [],
+        email_summary: {
+          is_connected: true,
+          unread_count: 2,
+          account_email: "test@example.com",
+          recent_subjects: ["Invoice payment confirmation from vendor"],
+        },
+        recent_documents: [],
+        upcoming_routines: [],
+        recent_routine_results: [],
+        pending_tasks_count: 1,
+        pending_approvals: [
+          {
+            id: "app-urgent-1",
+            tool_name: "gmail_send_email",
+            summary: "Send Email to accountant@client.com",
+            risk_level: "high",
+            reason: "Sending external email requires explicit authorization",
+            requested_at: 1700000000,
+          },
+        ],
+        services: [],
+      };
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "get_today_dashboard_data") {
+          return Promise.resolve(mockApprovalsData);
+        }
+        if (cmd === "resolve_approval") {
+          return Promise.resolve(true);
+        }
+        return Promise.resolve(null);
+      });
+
+      render(
+        <TodayDashboardView
+          onOpenTool={vi.fn()}
+          onAskPrompt={vi.fn()}
+          onOpenConnections={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText(/Pending Authorizations/i)).toBeInTheDocument();
+        expect(screen.getByText("Send Email to accountant@client.com")).toBeInTheDocument();
+        expect(screen.getByText("Invoice payment confirmation from vendor")).toBeInTheDocument();
+      });
+
+      const approveBtn = screen.getByRole("button", { name: "Approve" });
+      fireEvent.click(approveBtn);
+
+      await waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith("resolve_approval", {
+          requestId: "app-urgent-1",
+          approved: true,
+          note: "Approved from Today dashboard",
+        });
+      });
+    });
   });
 
   describe("MyToolsView", () => {
@@ -323,9 +388,124 @@ describe("Kyro Everyday Destinations & Workflows", () => {
         expect(screen.getByText("Runs every Friday at 5:00 PM to organize downloaded files.")).toBeInTheDocument();
       });
     });
+
+    it("allows editing an existing routine name and cron schedule", async () => {
+      const mockRoutines = [
+        {
+          id: "rt-101",
+          name: "Morning Digest",
+          cron_expression: "0 8 * * *",
+          action_type: "prompt",
+          target_id: "Summarize calendar and unread emails",
+          enabled: true,
+          last_run: null,
+          next_run: null,
+        },
+      ];
+
+      (invoke as any).mockImplementation((cmd: string, args: any) => {
+        if (cmd === "list_routines") return Promise.resolve(mockRoutines);
+        if (cmd === "list_routine_runs") return Promise.resolve([]);
+        if (cmd === "update_routine") {
+          return Promise.resolve({
+            ...mockRoutines[0],
+            name: args.name,
+            cron_expression: args.cron_expression,
+          });
+        }
+        return Promise.resolve(null);
+      });
+
+      render(<MyRoutinesView onAskPrompt={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Morning Digest")).toBeInTheDocument();
+        expect(screen.getByText("0 8 * * *")).toBeInTheDocument();
+      });
+
+      const editBtn = screen.getByTitle("Edit routine");
+      fireEvent.click(editBtn);
+
+      await waitFor(() => {
+        expect(screen.getByText("Edit Routine")).toBeInTheDocument();
+      });
+
+      const nameInput = screen.getByDisplayValue("Morning Digest");
+      fireEvent.change(nameInput, { target: { value: "Morning Digest Updated" } });
+
+      const cronInput = screen.getByDisplayValue("0 8 * * *");
+      fireEvent.change(cronInput, { target: { value: "0 9 * * 1-5" } });
+
+      const saveBtn = screen.getByRole("button", { name: "Save Changes" });
+      fireEvent.click(saveBtn);
+
+      await waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith(
+          "update_routine",
+          expect.objectContaining({
+            routine: expect.objectContaining({
+              id: "rt-101",
+              name: "Morning Digest Updated",
+              cron_expression: "0 9 * * 1-5",
+            }),
+          })
+        );
+      });
+    });
   });
 
   describe("OnboardingModal", () => {
+    it("persists authorized folders upon confirmation and skips without granting access", async () => {
+      const mockSuggestions = [
+        { id: "downloads", name: "Downloads", path: "/home/user/Downloads", exists: true },
+        { id: "documents", name: "Documents", path: "/home/user/Documents", exists: true },
+      ];
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "get_suggested_folders") return Promise.resolve(mockSuggestions);
+        if (cmd === "add_authorized_folder") return Promise.resolve({ id: "f-1" });
+        return Promise.resolve(null);
+      });
+
+      render(
+        <OnboardingModal
+          isOpen={true}
+          onClose={vi.fn()}
+          onTryExample={vi.fn()}
+          onOpenConnections={vi.fn()}
+        />
+      );
+
+      // Step 1 -> 2
+      fireEvent.click(screen.getByRole("button", { name: /Continue/i }));
+      // Step 2 -> 3
+      fireEvent.click(screen.getByRole("button", { name: /Continue/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Choose Authorized Folders")).toBeInTheDocument();
+        expect(screen.getByText("Downloads")).toBeInTheDocument();
+        expect(screen.getByText("Documents")).toBeInTheDocument();
+      });
+
+      // Click Continue to authorize folders
+      const continueBtn = screen.getByRole("button", { name: /Continue/i });
+      fireEvent.click(continueBtn);
+
+      await waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith(
+          "add_authorized_folder",
+          expect.objectContaining({
+            path: "/home/user/Downloads",
+          })
+        );
+        expect(invoke).toHaveBeenCalledWith(
+          "add_authorized_folder",
+          expect.objectContaining({
+            path: "/home/user/Documents",
+          })
+        );
+      });
+    });
     it("navigates through steps and saves completion in localStorage", async () => {
       localStorage.clear();
       (invoke as any).mockImplementation((_cmd: string) => {

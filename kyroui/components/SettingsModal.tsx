@@ -114,6 +114,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       await invoke("add_authorized_folder", {
         path: newFolderPath.trim(),
+        displayName: newFolderLabel.trim() || null,
         label: newFolderLabel.trim() || null,
       });
       setNewFolderPath("");
@@ -125,9 +126,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  const handleRemoveFolder = async (path: string) => {
+  const handleRemoveFolder = async (id: string, path: string) => {
     try {
-      await invoke("remove_authorized_folder", { path });
+      await invoke("remove_authorized_folder", { id, path });
       await loadAuthorizedFolders();
       setNotice({ tone: "info", message: `Folder authorization removed for ${path}.` });
     } catch (err: any) {
@@ -538,7 +539,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           <div className="font-mono text-[11px] text-neutral-400">{folder.path}</div>
                         </div>
                         <button
-                          onClick={() => handleRemoveFolder(folder.path)}
+                          onClick={() => handleRemoveFolder(folder.id, folder.path)}
                           className="p-1.5 text-neutral-400 hover:text-red-400 rounded-lg hover:bg-neutral-800 transition"
                           title="Revoke Folder Authorization"
                         >

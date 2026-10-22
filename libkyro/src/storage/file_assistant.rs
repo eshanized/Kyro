@@ -2,14 +2,27 @@
 //! content extraction, duplicate evidence detection, safe file operations,
 //! and revision notes generation.
 
-use super::db::AuthorizedFolderRecord;
+use super::db::{AuthorizedFolderRecord, Database, DocumentIndexRecord};
 use super::documents::DocumentAssistant;
+use chrono::Datelike;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchCriteria {
+    pub raw_query: String,
+    pub query_tokens: Vec<String>,
+    pub date_start: Option<i64>,
+    pub date_end: Option<i64>,
+    pub format_hint: Option<String>,
+    pub asks_for_facts: bool,
+    pub target_fact: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSearchResult {
@@ -71,6 +84,271 @@ pub struct RevisionFlashcard {
 pub struct FileAssistant;
 
 impl FileAssistant {
+    /// Parses natural language query into structured criteria, extracting relative date
+    /// constraints, fact requests, and meaningful search tokens.
+    pub fn parse_natural_language_query(query: &str) -> SearchCriteria {
+        let lower = query.trim().to_lowercase();
+        let now = chrono::Utc::now();
+
+        // 1. Relative dates
+        let mut date_start = None;
+        let mut date_end = None;
+
+        if lower.contains("last month") {
+            let year = now.year();
+            let month = now.month();
+            let (prev_year, prev_month) = if month == 1 {
+                (year - 1, 12)
+            } else {
+                (year, month - 1)
+            };
+            if let Some(start_date) = chrono::NaiveDate::from_ymd_opt(prev_year, prev_month, 1) {
+                if let Some(start_dt) = start_date.and_hms_opt(0, 0, 0) {
+                    date_start = Some(start_dt.and_utc().timestamp_millis());
+                }
+            }
+            if let Some(cur_month_start) = chrono::NaiveDate::from_ymd_opt(year, month, 1) {
+                if let Some(end_dt) = cur_month_start.and_hms_opt(0, 0, 0) {
+                    date_end = Some(end_dt.and_utc().timestamp_millis() - 1);
+                }
+            }
+        } else if lower.contains("this month") {
+            if let Some(start_date) = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1) {
+                if let Some(start_dt) = start_date.and_hms_opt(0, 0, 0) {
+                    date_start = Some(start_dt.and_utc().timestamp_millis());
+                }
+            }
+            date_end = Some(now.timestamp_millis());
+        } else if lower.contains("yesterday") {
+            let y_date = now.date_naive() - chrono::Duration::days(1);
+            if let Some(s) = y_date.and_hms_opt(0, 0, 0) {
+                date_start = Some(s.and_utc().timestamp_millis());
+            }
+            if let Some(e) = y_date.and_hms_opt(23, 59, 59) {
+                date_end = Some(e.and_utc().timestamp_millis());
+            }
+        } else if lower.contains("today") {
+            let t_date = now.date_naive();
+            if let Some(s) = t_date.and_hms_opt(0, 0, 0) {
+                date_start = Some(s.and_utc().timestamp_millis());
+            }
+            date_end = Some(now.timestamp_millis());
+        } else if lower.contains("last week") {
+            let days_since_mon = now.weekday().num_days_from_monday();
+            let this_mon = now.date_naive() - chrono::Duration::days(days_since_mon as i64);
+            let last_mon = this_mon - chrono::Duration::days(7);
+            if let Some(s) = last_mon.and_hms_opt(0, 0, 0) {
+                date_start = Some(s.and_utc().timestamp_millis());
+            }
+            if let Some(e) = this_mon.and_hms_opt(0, 0, 0) {
+                date_end = Some(e.and_utc().timestamp_millis() - 1);
+            }
+        } else if lower.contains("this week") {
+            let days_since_mon = now.weekday().num_days_from_monday();
+            let this_mon = now.date_naive() - chrono::Duration::days(days_since_mon as i64);
+            if let Some(s) = this_mon.and_hms_opt(0, 0, 0) {
+                date_start = Some(s.and_utc().timestamp_millis());
+            }
+            date_end = Some(now.timestamp_millis());
+        } else if lower.contains("last year") {
+            if let Some(s) = chrono::NaiveDate::from_ymd_opt(now.year() - 1, 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+            {
+                date_start = Some(s.and_utc().timestamp_millis());
+            }
+            if let Some(e) = chrono::NaiveDate::from_ymd_opt(now.year(), 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+            {
+                date_end = Some(e.and_utc().timestamp_millis() - 1);
+            }
+        } else if lower.contains("this year") {
+            if let Some(s) = chrono::NaiveDate::from_ymd_opt(now.year(), 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+            {
+                date_start = Some(s.and_utc().timestamp_millis());
+            }
+            date_end = Some(now.timestamp_millis());
+        }
+
+        // 2. Fact extraction target
+        let asks_for_facts = lower.contains("extract")
+            || lower.contains("total amount")
+            || lower.contains("how much")
+            || lower.contains("deadline")
+            || lower.contains("due date")
+            || lower.contains("what is the total");
+
+        let target_fact = if lower.contains("amount")
+            || lower.contains("total")
+            || lower.contains("price")
+            || lower.contains("how much")
+        {
+            Some("total_amount".to_string())
+        } else if lower.contains("deadline")
+            || lower.contains("due date")
+            || lower.contains("when is it due")
+        {
+            Some("due_date".to_string())
+        } else {
+            None
+        };
+
+        // 3. Format hint
+        let format_hint = if lower.contains("pdf") {
+            Some("pdf".to_string())
+        } else if lower.contains("markdown") || lower.contains(".md") {
+            Some("md".to_string())
+        } else if lower.contains("docx") || lower.contains("word document") {
+            Some("docx".to_string())
+        } else if lower.contains("csv")
+            || lower.contains("spreadsheet")
+            || lower.contains("excel")
+            || lower.contains("xlsx")
+        {
+            Some("csv".to_string())
+        } else if lower.contains("invoice") || lower.contains("receipt") || lower.contains("bill") {
+            Some("invoice_or_receipt".to_string())
+        } else if lower.contains("syllabus") || lower.contains("notes") {
+            Some("document".to_string())
+        } else if lower.contains("code") || lower.contains("script") {
+            Some("code".to_string())
+        } else {
+            None
+        };
+
+        // 4. Token filtering: remove conversational phrases and stop words
+        let mut clean = lower.clone();
+        for phrase in &[
+            "find the",
+            "find my",
+            "find a",
+            "search for",
+            "search my",
+            "i downloaded",
+            "downloaded",
+            "and extract its total amount",
+            "and extract the total amount",
+            "and extract total amount",
+            "extract its total amount",
+            "extract the total amount",
+            "and extract its",
+            "and extract",
+            "extract total",
+            "total amount",
+            "last month",
+            "this month",
+            "last week",
+            "this week",
+            "last year",
+            "this year",
+            "yesterday",
+            "today",
+            "show me",
+            "where is",
+            "documents that mention",
+            "mention an",
+            "an upcoming",
+            "upcoming",
+            "documents that",
+            "mentioning",
+            "receipt for my",
+            "receipt for",
+            "invoice for",
+            "syllabus for",
+        ] {
+            clean = clean.replace(phrase, " ");
+        }
+
+        let stop_words = [
+            "the", "a", "an", "for", "my", "in", "on", "at", "to", "of", "and", "or", "is", "it",
+            "with", "from", "that", "this",
+        ];
+        let mut query_tokens = Vec::new();
+        for word in clean.split_whitespace() {
+            let stripped: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+            if !stripped.is_empty() && !stop_words.contains(&stripped.as_str()) {
+                query_tokens.push(stripped);
+            }
+        }
+
+        if query_tokens.is_empty() {
+            if lower.contains("invoice") {
+                query_tokens.push("invoice".to_string());
+            }
+            if lower.contains("receipt") {
+                query_tokens.push("receipt".to_string());
+            }
+            if lower.contains("syllabus") {
+                query_tokens.push("syllabus".to_string());
+            }
+            if lower.contains("deadline") {
+                query_tokens.push("deadline".to_string());
+            }
+        }
+
+        SearchCriteria {
+            raw_query: query.to_string(),
+            query_tokens,
+            date_start,
+            date_end,
+            format_hint,
+            asks_for_facts,
+            target_fact,
+        }
+    }
+
+    /// Extract structured facts (totals, reference numbers, due dates) from plain text.
+    pub fn extract_facts_from_text(text: &str) -> Vec<(String, String)> {
+        let mut facts = Vec::new();
+
+        if let Ok(re_amount) = Regex::new(
+            r"(?i)\b(?:total(?:\s+due)?|amount(?:\s+due)?|balance(?:\s+due)?|subtotal|total:?)[\s:]*([$€£¥]\s*[\d,]+(?:\.\d{2})?|\b[\d,]+\.\d{2}\s*(?:USD|EUR|GBP)?)",
+        ) {
+            for cap in re_amount.captures_iter(text) {
+                if let Some(m) = cap.get(1) {
+                    facts.push(("Total Amount".to_string(), m.as_str().trim().to_string()));
+                    break;
+                }
+            }
+        }
+        if facts.is_empty() {
+            if let Ok(re_curr) = Regex::new(r"([$€£¥]\s*[\d,]+(?:\.\d{2})?)") {
+                if let Some(cap) = re_curr.captures(text) {
+                    if let Some(m) = cap.get(1) {
+                        facts.push(("Amount Found".to_string(), m.as_str().trim().to_string()));
+                    }
+                }
+            }
+        }
+
+        if let Ok(re_inv) = Regex::new(
+            r"(?i)\b(?:invoice|receipt|order|account|bill|po|reference)\s*(?:#|no\.?|num\.?|number|ref\.?)?[\s:]+([A-Za-z0-9_-]{3,25})\b",
+        ) {
+            for cap in re_inv.captures_iter(text) {
+                if let Some(m) = cap.get(1) {
+                    let val = m.as_str().trim().to_string();
+                    let val_lower = val.to_lowercase();
+                    if val_lower != "details" && val_lower != "due" && val_lower != "date" {
+                        facts.push(("Reference #".to_string(), val));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Ok(re_due) = Regex::new(
+            r"(?i)\b(?:due(?:\s+date)?|deadline|pay(?:\s+before)?|by)[\s:]*(\d{4}-\d{2}-\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b",
+        ) {
+            if let Some(cap) = re_due.captures(text) {
+                if let Some(m) = cap.get(1) {
+                    facts.push(("Due Date".to_string(), m.as_str().trim().to_string()));
+                }
+            }
+        }
+
+        facts
+    }
+
     /// Recursively search authorized folders using natural language query,
     /// filenames, extensions, and content inspection.
     pub fn search(
@@ -79,11 +357,31 @@ impl FileAssistant {
         folder_filter: Option<&str>,
         format_filter: Option<&str>,
     ) -> Result<Vec<DocumentSearchResult>, String> {
+        Self::search_with_db(
+            None,
+            authorized_folders,
+            query,
+            folder_filter,
+            format_filter,
+        )
+    }
+
+    /// Natural language document search with SQLite cache acceleration.
+    pub fn search_with_db(
+        db: Option<&Database>,
+        authorized_folders: &[AuthorizedFolderRecord],
+        query: &str,
+        folder_filter: Option<&str>,
+        format_filter: Option<&str>,
+    ) -> Result<Vec<DocumentSearchResult>, String> {
+        // Fail closed: if no folders authorized, return empty
+        if authorized_folders.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let criteria = Self::parse_natural_language_query(query);
         let q_trimmed = query.trim().to_lowercase();
-        let query_tokens: Vec<&str> = q_trimmed
-            .split_whitespace()
-            .filter(|s| !s.is_empty())
-            .collect();
+        let query_tokens: Vec<&str> = criteria.query_tokens.iter().map(|s| s.as_str()).collect();
 
         let mut results = Vec::new();
 
@@ -100,7 +398,7 @@ impl FileAssistant {
             }
 
             let mut files = Vec::new();
-            Self::collect_searchable_files(root, &mut files, 0, 4);
+            Self::collect_searchable_files(root, root, &mut files, 0, 4);
 
             for file_path in files {
                 let file_name = file_path
@@ -139,24 +437,35 @@ impl FileAssistant {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
 
-                // Check matching criteria
+                // Date filtering if criteria has date range
+                if let Some(s) = criteria.date_start {
+                    if modified_at < s {
+                        continue;
+                    }
+                }
+                if let Some(e) = criteria.date_end {
+                    if modified_at > e {
+                        continue;
+                    }
+                }
+
                 let name_lower = file_name.to_lowercase();
                 let mut matched_by = None;
                 let mut snippet = None;
                 let mut score = 0.0f32;
 
-                // 1. Exact or partial filename match
+                // 1. Filename match
                 if !query_tokens.is_empty() && query_tokens.iter().all(|t| name_lower.contains(t)) {
                     matched_by = Some("filename".to_string());
-                    score += 10.0;
+                    score += 15.0;
                     if name_lower == q_trimmed {
-                        score += 15.0;
+                        score += 20.0;
                     }
                 } else if !query_tokens.is_empty()
                     && query_tokens.iter().any(|t| name_lower.contains(t))
                 {
                     matched_by = Some("filename".to_string());
-                    score += 5.0;
+                    score += 8.0;
                 }
 
                 // 2. Extension match
@@ -164,32 +473,92 @@ impl FileAssistant {
                     if matched_by.is_none() {
                         matched_by = Some("extension".to_string());
                     }
-                    score += 3.0;
+                    score += 4.0;
                 }
 
-                // 3. Content extraction match for supported document types
-                if (matched_by.is_none() || score < 15.0)
-                    && size_bytes <= 10 * 1024 * 1024
-                    && format != "unsupported"
-                {
-                    if let Ok((text, _)) = DocumentAssistant::extract_text(&file_path) {
+                // 3. Content inspection & Index caching
+                if size_bytes <= 10 * 1024 * 1024 && format != "unsupported" {
+                    let path_str = file_path.to_string_lossy().to_string();
+                    let cached_text = if let Some(d) = db {
+                        if let Ok(Some(idx_rec)) = d.get_indexed_document(&path_str) {
+                            if idx_rec.modified_at == modified_at
+                                && idx_rec.size_bytes == size_bytes
+                            {
+                                idx_rec.extracted_text
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let text_opt = if let Some(txt) = cached_text {
+                        Some(txt)
+                    } else if let Ok((txt, _)) = DocumentAssistant::extract_text(&file_path) {
+                        if let Some(d) = db {
+                            let sha = Self::compute_sha256(&file_path).unwrap_or_default();
+                            let rec = DocumentIndexRecord {
+                                path: path_str.clone(),
+                                file_name: file_name.clone(),
+                                format: format.clone(),
+                                size_bytes,
+                                modified_at,
+                                sha256: sha,
+                                extracted_text: Some(txt.clone()),
+                                indexed_at: chrono::Utc::now().timestamp_millis(),
+                            };
+                            let _ = d.upsert_indexed_document(&rec);
+                        }
+                        Some(txt)
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref text) = text_opt {
                         let text_lower = text.to_lowercase();
+                        let mut content_matches = false;
                         if !query_tokens.is_empty()
                             && query_tokens.iter().all(|t| text_lower.contains(t))
                         {
-                            matched_by = Some("content".to_string());
-                            score += 8.0;
-
-                            // Extract snippet
-                            snippet = Self::extract_snippet(&text, &query_tokens);
+                            content_matches = true;
+                            score += 12.0;
                         } else if !query_tokens.is_empty()
                             && query_tokens.iter().any(|t| text_lower.contains(t))
                         {
+                            content_matches = true;
+                            score += 6.0;
+                        }
+
+                        if content_matches {
                             if matched_by.is_none() {
                                 matched_by = Some("content".to_string());
                             }
-                            score += 4.0;
-                            snippet = Self::extract_snippet(&text, &query_tokens);
+                            snippet = Self::extract_snippet(text, &query_tokens);
+                        }
+
+                        // Fact extraction integration
+                        if criteria.asks_for_facts {
+                            let facts = Self::extract_facts_from_text(text);
+                            if !facts.is_empty() {
+                                score += 10.0;
+                                let facts_summary = facts
+                                    .iter()
+                                    .map(|(k, v)| format!("{}: {}", k, v))
+                                    .collect::<Vec<_>>()
+                                    .join(" | ");
+                                let base_snippet = snippet.unwrap_or_else(|| {
+                                    let s: String = text.chars().take(150).collect();
+                                    s
+                                });
+                                snippet =
+                                    Some(format!("[Facts: {}] {}", facts_summary, base_snippet));
+                                if matched_by.is_none() {
+                                    matched_by = Some("fact_extracted".to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -201,6 +570,9 @@ impl FileAssistant {
                 }
 
                 if let Some(mb) = matched_by {
+                    if criteria.date_start.is_some() || criteria.date_end.is_some() {
+                        score += 5.0;
+                    }
                     results.push(DocumentSearchResult {
                         path: file_path.to_string_lossy().to_string(),
                         file_name,
@@ -215,7 +587,6 @@ impl FileAssistant {
             }
         }
 
-        // Sort by relevance score desc, then by modified_at desc
         results.sort_by(|a, b| {
             b.relevance_score
                 .partial_cmp(&a.relevance_score)
@@ -223,12 +594,12 @@ impl FileAssistant {
                 .then_with(|| b.modified_at.cmp(&a.modified_at))
         });
 
-        // Limit to top 100
         results.truncate(100);
         Ok(results)
     }
 
     fn collect_searchable_files(
+        root: &Path,
         dir: &Path,
         acc: &mut Vec<PathBuf>,
         depth: usize,
@@ -239,6 +610,11 @@ impl FileAssistant {
         }
         let read_dir = match fs::read_dir(dir) {
             Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let canonical_root = match fs::canonicalize(root) {
+            Ok(c) => c,
             Err(_) => return,
         };
 
@@ -258,10 +634,19 @@ impl FileAssistant {
             }
 
             if let Ok(ft) = entry.file_type() {
+                if ft.is_symlink() {
+                    if let Ok(canon) = fs::canonicalize(&path) {
+                        if !canon.starts_with(&canonical_root) {
+                            continue; // Symlink escapes authorized root!
+                        }
+                    } else {
+                        continue;
+                    }
+                }
                 if ft.is_file() {
                     acc.push(path);
                 } else if ft.is_dir() {
-                    Self::collect_searchable_files(&path, acc, depth + 1, max_depth);
+                    Self::collect_searchable_files(root, &path, acc, depth + 1, max_depth);
                 }
             }
         }
@@ -298,7 +683,7 @@ impl FileAssistant {
         }
 
         let mut files = Vec::new();
-        Self::collect_searchable_files(dir, &mut files, 0, 3);
+        Self::collect_searchable_files(dir, dir, &mut files, 0, 3);
 
         // Group by size first
         let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
@@ -516,33 +901,62 @@ impl FileAssistant {
         }
     }
 
-    /// Generate structured study notes and flashcards from a local document.
+    /// Generate structured study notes and flashcards from a local document,
+    /// with optional topic filtering.
     pub fn generate_study_notes(
         doc_path: &Path,
-        _topic_filter: Option<&str>,
+        topic_filter: Option<&str>,
     ) -> Result<StudyNotesResult, String> {
         let (text, metadata) = DocumentAssistant::extract_text(doc_path)?;
         let analysis = DocumentAssistant::analyze(doc_path, None)?;
 
+        let topic_clean = topic_filter.map(|t| t.trim()).filter(|t| !t.is_empty());
+
         let mut core_concepts = Vec::new();
         for sec in &analysis.sections {
             if !sec.heading.is_empty() {
-                core_concepts.push(sec.heading.clone());
+                if let Some(topic) = topic_clean {
+                    let top_low = topic.to_lowercase();
+                    if sec.heading.to_lowercase().contains(&top_low)
+                        || sec.content.to_lowercase().contains(&top_low)
+                    {
+                        core_concepts.push(sec.heading.clone());
+                    }
+                } else {
+                    core_concepts.push(sec.heading.clone());
+                }
             }
         }
-        if core_concepts.is_empty() {
-            core_concepts = analysis.key_facts.clone();
+
+        let mut key_facts = Vec::new();
+        for fact in &analysis.key_facts {
+            if let Some(topic) = topic_clean {
+                let top_low = topic.to_lowercase();
+                if fact.to_lowercase().contains(&top_low) {
+                    key_facts.push(fact.clone());
+                }
+            } else {
+                key_facts.push(fact.clone());
+            }
         }
 
-        let dates_list = analysis
-            .extracted_dates
-            .iter()
-            .map(|d| format!("{}: {}", d.raw_date, d.context))
-            .collect();
+        let mut dates_list = Vec::new();
+        for d in &analysis.extracted_dates {
+            if let Some(topic) = topic_clean {
+                let top_low = topic.to_lowercase();
+                if d.context.to_lowercase().contains(&top_low)
+                    || d.raw_date.to_lowercase().contains(&top_low)
+                {
+                    dates_list.push(format!("{}: {}", d.raw_date, d.context));
+                }
+            } else {
+                dates_list.push(format!("{}: {}", d.raw_date, d.context));
+            }
+        }
 
-        // Generate revision flashcards based on sections & facts
+        // Generate revision flashcards based on filtered sections & facts
         let mut flashcards = Vec::new();
-        for (idx, fact) in analysis.key_facts.iter().enumerate() {
+        for (idx, fact) in key_facts.iter().enumerate() {
             flashcards.push(RevisionFlashcard {
                 question: format!(
                     "Key Point #{}: What is the requirement or finding?",
@@ -552,6 +966,12 @@ impl FileAssistant {
             });
         }
         for item in &analysis.action_items {
+            if let Some(topic) = topic_clean {
+                let top_low = topic.to_lowercase();
+                if !item.text.to_lowercase().contains(&top_low) {
+                    continue;
+                }
+            }
             flashcards.push(RevisionFlashcard {
                 question: format!(
                     "Action Required (Priority: {}):",
@@ -560,14 +980,19 @@ impl FileAssistant {
                 answer: item.text.clone(),
             });
         }
-        if flashcards.is_empty() {
-            flashcards.push(RevisionFlashcard {
-                question: format!("Summary of {}:", metadata.file_name),
-                answer: analysis.summary.clone(),
-            });
-        }
 
-        let overview = if analysis.summary.is_empty() {
+        let overview = if let Some(topic) = topic_clean {
+            if core_concepts.is_empty() && key_facts.is_empty() && flashcards.is_empty() {
+                return Err(format!(
+                    "The topic '{}' was not found in '{}'.",
+                    topic, metadata.file_name
+                ));
+            }
+            format!(
+                "Study notes focused on topic '{}' from {}.",
+                topic, metadata.file_name
+            )
+        } else if analysis.summary.is_empty() {
             format!(
                 "Extracted {} characters and {} words from {}.",
                 text.len(),
@@ -578,34 +1003,89 @@ impl FileAssistant {
             analysis.summary
         };
 
+        if flashcards.is_empty() {
+            flashcards.push(RevisionFlashcard {
+                question: format!("Summary of {}:", metadata.file_name),
+                answer: overview.clone(),
+            });
+        }
+
         Ok(StudyNotesResult {
             doc_name: metadata.file_name,
             doc_path: metadata.file_path,
             format: metadata.format,
             overview,
-            core_concepts,
+            core_concepts: if core_concepts.is_empty() {
+                key_facts.clone()
+            } else {
+                core_concepts
+            },
             key_dates_and_milestones: dates_list,
-            summary_points: analysis.key_facts,
+            summary_points: key_facts,
             revision_flashcards: flashcards,
         })
     }
 
-    /// Explain a specific passage in simple, ordinary language.
+    /// Explain a specific passage in simple, ordinary language grounded in document content.
     pub fn explain_passage(doc_path: &Path, passage: &str) -> Result<String, String> {
         let (text, metadata) = DocumentAssistant::extract_text(doc_path)?;
         let p_trimmed = passage.trim();
 
-        if !text.to_lowercase().contains(&p_trimmed.to_lowercase()) {
-            return Ok(format!(
-                "Passage not found verbatim in '{}'. However, here is what the passage means in simple terms:\n\n\"{}\"\n\nIn plain English: This passage explains key conditions and instructions. Review the relevant sections in {} for exact parameters.",
-                metadata.file_name, p_trimmed, metadata.file_name
+        if p_trimmed.is_empty() {
+            return Err("Passage to explain cannot be empty.".to_string());
+        }
+
+        let text_lower = text.to_lowercase();
+        let p_lower = p_trimmed.to_lowercase();
+        let found_idx = text_lower.find(&p_lower);
+
+        if found_idx.is_none() {
+            return Err(format!(
+                "Passage not found in document '{}': '{}'. Please select or provide an excerpt that actually appears in the document.",
+                metadata.file_name, p_trimmed
             ));
         }
 
-        Ok(format!(
-            "### Plain Language Explanation of Passage from {}\n\n**Quoted passage:**\n> \"{}\"\n\n**What this means:**\nThis excerpt describes the core rule or statement made in the document. It lays out the expectations, deliverables, or criteria in everyday terms without confusing jargon.",
-            metadata.file_name, p_trimmed
-        ))
+        let idx = found_idx.unwrap();
+        let ctx_start = idx.saturating_sub(100);
+        let ctx_end = (idx + p_trimmed.len() + 100).min(text.len());
+        let context_slice = text[ctx_start..ctx_end].trim();
+
+        let dates_in_passage = DocumentAssistant::extract_dates(p_trimmed);
+        let action_items_in_passage = DocumentAssistant::extract_action_items(p_trimmed);
+
+        let mut explanation = format!(
+            "### Plain Language Explanation of Passage from {}\n\n**Quoted Excerpt:**\n> \"{}\"\n\n**Surrounding Context in Source:**\n> \"...{}...\"\n\n",
+            metadata.file_name, p_trimmed, context_slice
+        );
+
+        explanation.push_str("#### Key Points & Core Meaning:\n");
+        explanation.push_str(&format!(
+            "- **Statement**: The source explicitly states: \"{}\"\n",
+            p_trimmed
+        ));
+
+        if !dates_in_passage.is_empty() {
+            explanation.push_str("- **Key Dates Mentioned**:\n");
+            for d in &dates_in_passage {
+                explanation.push_str(&format!("  - `{}` ({})\n", d.raw_date, d.context));
+            }
+        }
+
+        if !action_items_in_passage.is_empty() {
+            explanation.push_str("- **Actionable Obligations**:\n");
+            for item in &action_items_in_passage {
+                explanation.push_str(&format!(
+                    "  - {} [Priority: {}]\n",
+                    item.text, item.priority
+                ));
+            }
+        }
+
+        explanation.push_str("\n#### Plain-English Breakdown:\n");
+        explanation.push_str("This excerpt describes the core rule or statement made in the document. It lays out expectations, deliverables, or criteria in everyday terms without confusing jargon.");
+
+        Ok(explanation)
     }
 }
 

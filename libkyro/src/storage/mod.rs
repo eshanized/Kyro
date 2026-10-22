@@ -19,9 +19,10 @@ pub use organizer::{
 };
 
 pub use db::{
-    json_values_canonically_equal, AgentRun, ApprovalRequest, ArtifactRecord,
-    AuthorizedFolderRecord, BotRecord, ConnectedAccountRecord, ConnectorDefinitionRecord,
-    ConnectorToolPolicyRecord, Conversation, Database, FileTransactionRecord, McpServerRecord,
+    check_path_authorized_in_folders, is_path_authorized, json_values_canonically_equal,
+    validate_authorized_path, AgentRun, ApprovalRequest, ArtifactRecord, AuthorizedFolderRecord,
+    BotRecord, ConnectedAccountRecord, ConnectorDefinitionRecord, ConnectorToolPolicyRecord,
+    Conversation, Database, DocumentIndexRecord, FileTransactionRecord, McpServerRecord,
     MemoryEntry, Message, RoutineRecord, RoutineRunRecord, RunEvent, RunStatus, SearchResultItem,
     SkillRecord, TimelineStepRecord, VaultRecord,
 };

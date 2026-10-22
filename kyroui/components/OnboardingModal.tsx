@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Sparkles,
@@ -12,8 +12,10 @@ import {
   FileText,
   Camera,
   Key,
+  Plus,
 } from "lucide-react";
 import { KyroLogo } from "./Logo";
+import { SuggestedFolder } from "../types/agent";
 
 interface OnboardingModalProps {
   isOpen: boolean;
@@ -30,8 +32,35 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
 }) => {
   const [step, setStep] = useState(1);
   const [apiKeyInput, setApiKeyInput] = useState("");
-  const [selectedFolders, setSelectedFolders] = useState<string[]>(["Downloads", "Documents"]);
+  const [suggestedFolders, setSuggestedFolders] = useState<SuggestedFolder[]>([]);
+  const [selectedFolders, setSelectedFolders] = useState<{ path: string; name: string }[]>([]);
+  const [customPath, setCustomPath] = useState("");
+  const [customLabel, setCustomLabel] = useState("");
   const [isSavingKey, setIsSavingKey] = useState(false);
+  const [isSavingFolders, setIsSavingFolders] = useState(false);
+  const [folderNotice, setFolderNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      const fetchSuggestions = async () => {
+        try {
+          const list = await invoke<SuggestedFolder[]>("get_suggested_folders");
+          if (Array.isArray(list)) {
+            setSuggestedFolders(list);
+            const defaultSelected = list
+              .filter((f) => f && f.exists && (f.id === "downloads" || f.id === "documents"))
+              .map((f) => ({ path: f.path, name: f.name }));
+            setSelectedFolders(defaultSelected);
+          } else {
+            setSuggestedFolders([]);
+          }
+        } catch {
+          setSuggestedFolders([]);
+        }
+      };
+      fetchSuggestions();
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -64,10 +93,48 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     }
   };
 
-  const handleToggleFolder = (folderName: string) => {
+  const handleToggleFolder = (folder: { path: string; name: string }) => {
     setSelectedFolders((prev) =>
-      prev.includes(folderName) ? prev.filter((f) => f !== folderName) : [...prev, folderName]
+      prev.some((f) => f.path === folder.path)
+        ? prev.filter((f) => f.path !== folder.path)
+        : [...prev, folder]
     );
+  };
+
+  const handleAddCustomFolder = () => {
+    const trimmed = customPath.trim();
+    if (!trimmed) return;
+    if (selectedFolders.some((f) => f.path === trimmed)) {
+      setFolderNotice("Folder is already selected.");
+      return;
+    }
+    const name = customLabel.trim() || trimmed.split("/").filter(Boolean).pop() || "Custom Folder";
+    setSelectedFolders([...selectedFolders, { path: trimmed, name }]);
+    setCustomPath("");
+    setCustomLabel("");
+    setFolderNotice(null);
+  };
+
+  const handleSaveAuthorizedFolders = async () => {
+    if (selectedFolders.length === 0) {
+      setStep(4);
+      return;
+    }
+    setIsSavingFolders(true);
+    setFolderNotice(null);
+    try {
+      for (const folder of selectedFolders) {
+        await invoke("add_authorized_folder", {
+          path: folder.path,
+          displayName: folder.name,
+        });
+      }
+      setStep(4);
+    } catch (e: any) {
+      setFolderNotice(`Failed to authorize folder: ${e?.toString() || "Unknown error"}`);
+    } finally {
+      setIsSavingFolders(false);
+    }
   };
 
   return (
@@ -200,28 +267,92 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
               <div>
                 <h2 className="text-xl font-bold text-neutral-100">Choose Authorized Folders</h2>
                 <p className="text-xs text-neutral-400 mt-1 leading-relaxed">
-                  Kyro respects your privacy and only searches or organizes folders you explicitly permit.
+                  Kyro follows local-first security principles and will only search, summarize, or organize
+                  files inside the specific directories you explicitly authorize.
                 </p>
               </div>
 
-              <div className="space-y-2 pt-2">
-                <span className="text-xs font-semibold text-neutral-300">Standard Suggested Locations:</span>
-                <div className="grid grid-cols-2 gap-2">
-                  {["Downloads", "Documents", "Desktop", "College / Work"].map((fName) => (
+              {folderNotice && (
+                <div className="p-2.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-rose-200 text-xs">
+                  {folderNotice}
+                </div>
+              )}
+
+              <div className="space-y-3 pt-1">
+                <span className="text-xs font-semibold text-neutral-300">Suggested Standard Locations:</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {(suggestedFolders || []).map((f) => {
+                    const isSelected = selectedFolders.some((s) => s.path === f.path);
+                    return (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => handleToggleFolder({ path: f.path, name: f.name })}
+                        className={`p-3 rounded-xl border text-left text-xs font-medium transition flex flex-col justify-between gap-1.5 ${
+                          isSelected
+                            ? "bg-amber-950/40 border-amber-800/70 text-amber-200"
+                            : "bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between w-full">
+                          <span className="font-semibold text-neutral-200">{f.name}</span>
+                          {isSelected && <CheckCircle2 className="w-4 h-4 text-amber-400" />}
+                        </div>
+                        <code className="text-[10px] text-neutral-400 font-mono truncate max-w-full">
+                          {f.path}
+                        </code>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Add Custom Directory */}
+                <div className="pt-2 border-t border-neutral-800/80 space-y-2">
+                  <span className="text-xs font-semibold text-neutral-300">Add Custom Directory:</span>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      type="text"
+                      value={customPath}
+                      onChange={(e) => setCustomPath(e.target.value)}
+                      placeholder="Absolute directory path (e.g. /home/user/Work)..."
+                      className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-100 placeholder-neutral-400 focus:outline-none"
+                    />
+                    <input
+                      type="text"
+                      value={customLabel}
+                      onChange={(e) => setCustomLabel(e.target.value)}
+                      placeholder="Label (e.g. College / Work)"
+                      className="w-full sm:w-36 px-3 py-1.5 bg-neutral-900 border border-neutral-800 rounded-lg text-xs text-neutral-100 placeholder-neutral-400 focus:outline-none"
+                    />
                     <button
-                      key={fName}
                       type="button"
-                      onClick={() => handleToggleFolder(fName)}
-                      className={`p-3 rounded-xl border text-left text-xs font-medium transition flex items-center justify-between ${
-                        selectedFolders.includes(fName)
-                          ? "bg-amber-950/40 border-amber-800/70 text-amber-200"
-                          : "bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200"
-                      }`}
+                      onClick={handleAddCustomFolder}
+                      className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium flex items-center justify-center gap-1 transition"
                     >
-                      <span>{fName}</span>
-                      {selectedFolders.includes(fName) && <CheckCircle2 className="w-4 h-4 text-amber-400" />}
+                      <Plus className="w-3.5 h-3.5" /> Add
                     </button>
-                  ))}
+                  </div>
+                </div>
+
+                {/* Active Authorized Confirmation Box */}
+                <div className="p-3 rounded-xl bg-neutral-900/80 border border-neutral-800 text-[11px] text-neutral-400 space-y-1">
+                  <div className="font-semibold text-neutral-200 flex items-center gap-1.5">
+                    <Shield className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Exact Directories to Authorize ({selectedFolders.length}):</span>
+                  </div>
+                  {selectedFolders.length > 0 ? (
+                    <ul className="list-disc list-inside space-y-0.5 text-neutral-300 font-mono text-[10px]">
+                      {selectedFolders.map((sf, idx) => (
+                        <li key={idx} className="truncate">
+                          {sf.name}: {sf.path}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="italic text-neutral-400">
+                      No folders selected. Kyro will not access any personal files without authorization.
+                    </p>
+                  )}
                 </div>
               </div>
             </div>
@@ -412,14 +543,16 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 onClick={() => {
                   if (step === 2) {
                     handleSaveApiKey();
+                  } else if (step === 3) {
+                    handleSaveAuthorizedFolders();
                   } else {
                     setStep(step + 1);
                   }
                 }}
-                disabled={isSavingKey}
+                disabled={isSavingKey || isSavingFolders}
                 className="px-4 py-2 bg-purple-950/60 hover:bg-purple-900/60 border border-purple-700/60 rounded-lg text-xs font-semibold text-purple-200 flex items-center gap-1.5 transition shadow-sm disabled:opacity-50"
               >
-                Continue <ArrowRight className="w-3.5 h-3.5" />
+                {isSavingFolders ? "Saving Permissions..." : "Continue"} <ArrowRight className="w-3.5 h-3.5" />
               </button>
             ) : (
               <button

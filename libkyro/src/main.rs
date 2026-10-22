@@ -55,6 +55,7 @@ fn main() {
                 vault.clone(),
                 engine.clone(),
                 Some(mcp_manager.clone()),
+                Some(connector_manager.clone()),
             );
             TelegramBridge::start_worker(vault, db, engine, Some(mcp_manager));
             Ok(())
@@ -174,6 +175,7 @@ fn main() {
             export_routine,
             import_routine,
             list_authorized_folders,
+            get_suggested_folders,
             add_authorized_folder,
             remove_authorized_folder,
             search_authorized_documents,
@@ -184,6 +186,7 @@ fn main() {
             explain_document_passage,
             get_today_dashboard_data,
             list_routine_runs,
+            update_routine,
             execute_routine_now,
             natural_language_to_routine
         ])

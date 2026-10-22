@@ -192,6 +192,95 @@ impl GoogleAdapter {
 
         BASE64_URL.encode(raw.as_bytes())
     }
+
+    pub fn decode_base64url(s: &str) -> Result<Vec<u8>, String> {
+        use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+        use base64::Engine;
+
+        let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        URL_SAFE_NO_PAD
+            .decode(&clean)
+            .or_else(|_| URL_SAFE.decode(&clean))
+            .map_err(|e| format!("Base64url decode error: {}", e))
+    }
+
+    pub fn html_to_plain_text(html: &str) -> String {
+        let mut text = html.to_string();
+        if let Ok(re_script) = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>") {
+            text = re_script.replace_all(&text, "").to_string();
+        }
+        if let Ok(re_style) = regex::Regex::new(r"(?is)<style[^>]*>.*?</style>") {
+            text = re_style.replace_all(&text, "").to_string();
+        }
+        if let Ok(re_br) = regex::Regex::new(r"(?i)<br\s*/?>") {
+            text = re_br.replace_all(&text, "\n").to_string();
+        }
+        if let Ok(re_p) = regex::Regex::new(r"(?i)</(?:p|div|tr|li|h[1-6])>") {
+            text = re_p.replace_all(&text, "\n").to_string();
+        }
+        if let Ok(re_tags) = regex::Regex::new(r"<[^>]+>") {
+            text = re_tags.replace_all(&text, "").to_string();
+        }
+
+        text = text
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'");
+
+        let mut cleaned = String::new();
+        let mut prev_empty = false;
+        for line in text.lines() {
+            let tr = line.trim();
+            if tr.is_empty() {
+                if !prev_empty {
+                    cleaned.push('\n');
+                    prev_empty = true;
+                }
+            } else {
+                cleaned.push_str(tr);
+                cleaned.push('\n');
+                prev_empty = false;
+            }
+        }
+        cleaned.trim().to_string()
+    }
+
+    pub fn extract_mime_content(
+        part: &Value,
+        text_plain: &mut Option<String>,
+        text_html: &mut Option<String>,
+        attachments: &mut Vec<String>,
+    ) {
+        let mime_type = part["mimeType"].as_str().unwrap_or("").to_lowercase();
+        let filename = part["filename"].as_str().unwrap_or("");
+
+        if !filename.is_empty() {
+            let size = part["body"]["size"].as_u64().unwrap_or(0);
+            attachments.push(format!("{} ({}, {} bytes)", filename, mime_type, size));
+            return;
+        }
+
+        if let Some(data_str) = part["body"]["data"].as_str() {
+            if let Ok(bytes) = Self::decode_base64url(data_str) {
+                let decoded_str = String::from_utf8_lossy(&bytes).to_string();
+                if mime_type.starts_with("text/plain") && text_plain.is_none() {
+                    *text_plain = Some(decoded_str);
+                } else if mime_type.starts_with("text/html") && text_html.is_none() {
+                    *text_html = Some(decoded_str);
+                }
+            }
+        }
+
+        if let Some(subparts) = part["parts"].as_array() {
+            for sub in subparts {
+                Self::extract_mime_content(sub, text_plain, text_html, attachments);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -423,10 +512,14 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     .await?;
 
                 let messages = res["messages"].as_array().cloned().unwrap_or_default();
+                let result_size_estimate = res["resultSizeEstimate"].as_u64();
+                let total_found = result_size_estimate.unwrap_or(messages.len() as u64);
                 let result = json!({
-                    "total_found": messages.len(),
+                    "total_found": total_found,
+                    "messages_returned": messages.len(),
                     "messages": messages,
                     "result_size_estimate": res["resultSizeEstimate"],
+                    "next_page_token": res["nextPageToken"],
                 });
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }
@@ -449,13 +542,40 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     )
                     .await?;
 
-                // Extract friendly headers and snippet
-                let snippet = res["snippet"].as_str().unwrap_or_default();
-                let headers_list = res["payload"]["headers"].as_array();
-                let mut subject = "";
+                let payload = &res["payload"];
+                let mut text_plain = None;
+                let mut text_html = None;
+                let mut attachments = Vec::new();
+
+                Self::extract_mime_content(
+                    payload,
+                    &mut text_plain,
+                    &mut text_html,
+                    &mut attachments,
+                );
+
+                let (body_text, body_format) = if let Some(plain) = text_plain {
+                    (plain, "plain")
+                } else if let Some(html) = text_html {
+                    (Self::html_to_plain_text(&html), "html_converted")
+                } else {
+                    (
+                        res["snippet"].as_str().unwrap_or("").to_string(),
+                        "snippet_fallback",
+                    )
+                };
+
+                let bounded_body: String = body_text.chars().take(40_000).collect();
+
                 let mut from = "";
+                let mut to = "";
+                let mut cc = "";
+                let mut subject = "";
                 let mut date = "";
-                if let Some(hdrs) = headers_list {
+                let mut message_id_hdr = "";
+                let mut in_reply_to_hdr = "";
+
+                if let Some(hdrs) = payload["headers"].as_array() {
                     for h in hdrs {
                         let name = h["name"].as_str().unwrap_or_default();
                         let val = h["value"].as_str().unwrap_or_default();
@@ -463,8 +583,16 @@ impl NativeConnectorAdapter for GoogleAdapter {
                             subject = val;
                         } else if name.eq_ignore_ascii_case("from") {
                             from = val;
+                        } else if name.eq_ignore_ascii_case("to") {
+                            to = val;
+                        } else if name.eq_ignore_ascii_case("cc") {
+                            cc = val;
                         } else if name.eq_ignore_ascii_case("date") {
                             date = val;
+                        } else if name.eq_ignore_ascii_case("message-id") {
+                            message_id_hdr = val;
+                        } else if name.eq_ignore_ascii_case("in-reply-to") {
+                            in_reply_to_hdr = val;
                         }
                     }
                 }
@@ -474,9 +602,16 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     "thread_id": res["threadId"],
                     "subject": subject,
                     "from": from,
+                    "to": to,
+                    "cc": cc,
                     "date": date,
-                    "snippet": snippet,
+                    "message_id_header": message_id_hdr,
+                    "in_reply_to": in_reply_to_hdr,
+                    "snippet": res["snippet"],
+                    "body": bounded_body,
+                    "body_format": body_format,
                     "labels": res["labelIds"],
+                    "attachments": attachments,
                 });
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }
@@ -618,6 +753,27 @@ impl NativeConnectorAdapter for GoogleAdapter {
                 let description = args["description"].as_str().unwrap_or("");
                 let location = args["location"].as_str().unwrap_or("");
 
+                // Validate ISO 8601 timestamps
+                let start_dt = chrono::DateTime::parse_from_rfc3339(start_time).map_err(|e| {
+                    format!(
+                        "Invalid 'start_time' format '{}': {}. Expected RFC 3339 format.",
+                        start_time, e
+                    )
+                })?;
+                let end_dt = chrono::DateTime::parse_from_rfc3339(end_time).map_err(|e| {
+                    format!(
+                        "Invalid 'end_time' format '{}': {}. Expected RFC 3339 format.",
+                        end_time, e
+                    )
+                })?;
+
+                if start_dt >= end_dt {
+                    return Err(format!(
+                        "Validation error: 'start_time' ({}) must be earlier than 'end_time' ({}).",
+                        start_time, end_time
+                    ));
+                }
+
                 let url = format!("{}/calendar/v3/calendars/primary/events", google_base);
                 let payload = json!({
                     "summary": summary,
@@ -648,14 +804,48 @@ impl NativeConnectorAdapter for GoogleAdapter {
             "calendar_find_meeting_times" => {
                 let date_str = args["date"]
                     .as_str()
-                    .ok_or("Missing required 'date' parameter")?;
+                    .ok_or("Missing required 'date' parameter (expected YYYY-MM-DD)")?;
                 let duration_mins = args["duration_minutes"]
                     .as_i64()
                     .unwrap_or(30)
                     .clamp(15, 240);
 
-                let day_start = format!("{}T09:00:00Z", date_str);
-                let day_end = format!("{}T17:00:00Z", date_str);
+                let tz_str = args["timezone"].as_str().unwrap_or("UTC");
+                let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+
+                let start_hour: u32 =
+                    args["work_start_hour"].as_u64().unwrap_or(9).clamp(0, 23) as u32;
+                let end_hour: u32 =
+                    args["work_end_hour"].as_u64().unwrap_or(17).clamp(1, 24) as u32;
+
+                let naive_date =
+                    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").map_err(|e| {
+                        format!(
+                            "Invalid date format '{}': {}. Expected YYYY-MM-DD.",
+                            date_str, e
+                        )
+                    })?;
+
+                use chrono::TimeZone;
+                let work_start_local = tz
+                    .from_local_datetime(
+                        &naive_date
+                            .and_hms_opt(start_hour, 0, 0)
+                            .ok_or("Invalid start hour")?,
+                    )
+                    .single()
+                    .ok_or("Ambiguous or invalid local start time in specified timezone")?;
+                let work_end_local = tz
+                    .from_local_datetime(
+                        &naive_date
+                            .and_hms_opt(end_hour, 0, 0)
+                            .ok_or("Invalid end hour")?,
+                    )
+                    .single()
+                    .ok_or("Ambiguous or invalid local end time in specified timezone")?;
+
+                let time_min = work_start_local.with_timezone(&chrono::Utc).to_rfc3339();
+                let time_max = work_end_local.with_timezone(&chrono::Utc).to_rfc3339();
 
                 let mut url = Url::parse(&format!(
                     "{}/calendar/v3/calendars/primary/events",
@@ -666,8 +856,8 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     let mut q = url.query_pairs_mut();
                     q.append_pair("singleEvents", "true");
                     q.append_pair("orderBy", "startTime");
-                    q.append_pair("timeMin", &day_start);
-                    q.append_pair("timeMax", &day_end);
+                    q.append_pair("timeMin", &time_min);
+                    q.append_pair("timeMax", &time_max);
                 }
 
                 let res = self
@@ -678,27 +868,129 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     .await?;
 
                 let items = res["items"].as_array().cloned().unwrap_or_default();
-                let busy_slots: Vec<Value> = items
+                let work_start_ts = work_start_local.timestamp_millis();
+                let work_end_ts = work_end_local.timestamp_millis();
+
+                let mut busy_intervals: Vec<(i64, i64, String)> = Vec::new();
+
+                for it in &items {
+                    let summary = it["summary"].as_str().unwrap_or("Busy").to_string();
+                    let start_val = &it["start"];
+                    let end_val = &it["end"];
+
+                    let start_ts = if let Some(dt_str) = start_val["dateTime"].as_str() {
+                        chrono::DateTime::parse_from_rfc3339(dt_str)
+                            .map(|d| d.timestamp_millis())
+                            .ok()
+                    } else if let Some(d_str) = start_val["date"].as_str() {
+                        chrono::NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
+                            .ok()
+                            .and_then(|nd| {
+                                tz.from_local_datetime(&nd.and_hms_opt(0, 0, 0)?)
+                                    .single()
+                                    .map(|d| d.timestamp_millis())
+                            })
+                    } else {
+                        None
+                    };
+
+                    let end_ts = if let Some(dt_str) = end_val["dateTime"].as_str() {
+                        chrono::DateTime::parse_from_rfc3339(dt_str)
+                            .map(|d| d.timestamp_millis())
+                            .ok()
+                    } else if let Some(d_str) = end_val["date"].as_str() {
+                        chrono::NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
+                            .ok()
+                            .and_then(|nd| {
+                                tz.from_local_datetime(&nd.and_hms_opt(23, 59, 59)?)
+                                    .single()
+                                    .map(|d| d.timestamp_millis())
+                            })
+                    } else {
+                        None
+                    };
+
+                    if let (Some(s), Some(e)) = (start_ts, end_ts) {
+                        let clamped_s = s.max(work_start_ts);
+                        let clamped_e = e.min(work_end_ts);
+                        if clamped_s < clamped_e {
+                            busy_intervals.push((clamped_s, clamped_e, summary));
+                        }
+                    }
+                }
+
+                busy_intervals.sort_by_key(|i| i.0);
+
+                let mut merged_busy: Vec<(i64, i64)> = Vec::new();
+                for (s, e, _) in &busy_intervals {
+                    if let Some(last) = merged_busy.last_mut() {
+                        if *s <= last.1 {
+                            last.1 = last.1.max(*e);
+                        } else {
+                            merged_busy.push((*s, *e));
+                        }
+                    } else {
+                        merged_busy.push((*s, *e));
+                    }
+                }
+
+                let mut free_intervals: Vec<(i64, i64)> = Vec::new();
+                let mut cursor = work_start_ts;
+                for (bs, be) in &merged_busy {
+                    if *bs > cursor {
+                        free_intervals.push((cursor, *bs));
+                    }
+                    cursor = cursor.max(*be);
+                }
+                if cursor < work_end_ts {
+                    free_intervals.push((cursor, work_end_ts));
+                }
+
+                let req_duration_ms = duration_mins * 60 * 1000;
+                let mut candidate_slots: Vec<Value> = Vec::new();
+
+                for (fs, fe) in &free_intervals {
+                    let mut slot_start = *fs;
+                    while slot_start + req_duration_ms <= *fe {
+                        let slot_end = slot_start + req_duration_ms;
+                        let dt_s = chrono::DateTime::from_timestamp_millis(slot_start)
+                            .unwrap_or_default()
+                            .with_timezone(&tz);
+                        let dt_e = chrono::DateTime::from_timestamp_millis(slot_end)
+                            .unwrap_or_default()
+                            .with_timezone(&tz);
+                        candidate_slots.push(json!({
+                            "start": dt_s.to_rfc3339(),
+                            "end": dt_e.to_rfc3339(),
+                            "display": format!("{} – {} ({})", dt_s.format("%I:%M %p"), dt_e.format("%I:%M %p"), tz_str),
+                            "duration_minutes": duration_mins,
+                        }));
+                        slot_start += 30 * 60 * 1000;
+                    }
+                }
+
+                let busy_slots_display: Vec<Value> = busy_intervals
                     .iter()
-                    .map(|it| {
+                    .map(|(s, e, sum)| {
+                        let dt_s = chrono::DateTime::from_timestamp_millis(*s).unwrap_or_default().with_timezone(&tz);
+                        let dt_e = chrono::DateTime::from_timestamp_millis(*e).unwrap_or_default().with_timezone(&tz);
                         json!({
-                            "summary": it["summary"].as_str().unwrap_or("Busy"),
-                            "start": it["start"]["dateTime"],
-                            "end": it["end"]["dateTime"]
+                            "summary": sum,
+                            "start": dt_s.to_rfc3339(),
+                            "end": dt_e.to_rfc3339(),
+                            "display": format!("{} – {}", dt_s.format("%I:%M %p"), dt_e.format("%I:%M %p")),
                         })
                     })
                     .collect();
 
                 let result = json!({
                     "date": date_str,
+                    "timezone": tz_str,
                     "duration_minutes": duration_mins,
-                    "working_hours": "09:00 - 17:00",
-                    "busy_slots": busy_slots,
-                    "available_slots_suggestion": [
-                        format!("{}T10:00:00Z to {}T10:{:02}:00Z", date_str, date_str, duration_mins),
-                        format!("{}T14:00:00Z to {}T14:{:02}:00Z", date_str, date_str, duration_mins),
-                        format!("{}T15:30:00Z to {}T16:00:00Z", date_str, date_str)
-                    ]
+                    "working_hours": format!("{:02}:00 - {:02}:00", start_hour, end_hour),
+                    "busy_slots": busy_slots_display,
+                    "available_slots_suggestion": candidate_slots,
+                    "has_availability": !candidate_slots.is_empty(),
                 });
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }

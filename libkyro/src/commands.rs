@@ -33,10 +33,11 @@ use crate::storage::organizer::{
     FileOrganizer, OrganizationPlan, OrganizationRule, OrganizationTransaction,
 };
 use crate::storage::{
-    AgentRun, ApiKeys, ApiKeysMetadata, ApprovalRequest, ArtifactRecord, AuthorizedFolderRecord,
-    BotRecord, ConnectorToolPolicyRecord, Conversation, Database, ImportSummary, McpServerRecord,
-    MemoryEntry, Message, RoutineRecord, RoutineRunRecord, RunEvent, SearchResultItem, SkillRecord,
-    TemplateEngine, TemplatePack, TimelineStepRecord, Vault,
+    check_path_authorized_in_folders, AgentRun, ApiKeys, ApiKeysMetadata, ApprovalRequest,
+    ArtifactRecord, AuthorizedFolderRecord, BotRecord, ConnectorToolPolicyRecord, Conversation,
+    Database, ImportSummary, McpServerRecord, MemoryEntry, Message, RoutineRecord,
+    RoutineRunRecord, RunEvent, SearchResultItem, SkillRecord, TemplateEngine, TemplatePack,
+    TimelineStepRecord, Vault,
 };
 use crate::teach_task::portable_routine::{EditableRoutine, RoutineEngine};
 use crate::teach_task::{RoutineScheduler, Skill, SkillReplayer, TaskRecorder};
@@ -1478,10 +1479,20 @@ pub async fn save_account_tool_policy(
 
 #[tauri::command]
 pub async fn preview_file_organization(
+    state: tauri::State<'_, AppState>,
     directory: String,
     rule: Option<OrganizationRule>,
 ) -> Result<OrganizationPlan, String> {
-    FileOrganizer::preview(Path::new(&directory), rule)
+    let p = Path::new(&directory);
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured. Please authorize folders in Settings first.".to_string());
+    }
+    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
+        return Err(format!("Access denied for preview directory: {}", e));
+    }
+
+    FileOrganizer::preview(p, rule)
 }
 
 #[tauri::command]
@@ -1489,6 +1500,37 @@ pub async fn execute_file_organization(
     plan: OrganizationPlan,
     state: tauri::State<'_, AppState>,
 ) -> Result<OrganizationTransaction, String> {
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+
+    // Verify target directory
+    let target = &plan.target_directory;
+    if let Err(e) = check_path_authorized_in_folders(target, &folders) {
+        return Err(format!("Access denied for target directory: {}", e));
+    }
+
+    // Recheck permissions immediately before execution for both source and destination
+    for action in &plan.operations {
+        let src = &action.source_path;
+        if let Err(e) = check_path_authorized_in_folders(src, &folders) {
+            return Err(format!(
+                "Access denied for organization source '{}': {}",
+                action.source_path.display(),
+                e
+            ));
+        }
+        let dest = &action.destination_path;
+        if let Err(e) = check_path_authorized_in_folders(dest, &folders) {
+            return Err(format!(
+                "Access denied for organization destination '{}': {}",
+                action.destination_path.display(),
+                e
+            ));
+        }
+    }
+
     let trx = FileOrganizer::execute(&plan)?;
     if let Ok(manifest_json) = serde_json::to_string_pretty(&trx) {
         let art_id = format!("art_{}", uuid::Uuid::new_v4());
@@ -1511,8 +1553,36 @@ pub async fn execute_file_organization(
 
 #[tauri::command]
 pub async fn undo_file_organization(
+    state: tauri::State<'_, AppState>,
     mut transaction: OrganizationTransaction,
 ) -> Result<usize, String> {
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+
+    let target = Path::new(&transaction.target_directory);
+    if let Err(e) = check_path_authorized_in_folders(target, &folders) {
+        return Err(format!("Access denied for rollback directory: {}", e));
+    }
+
+    for op in &transaction.operations {
+        let src = Path::new(&op.source_path);
+        if let Err(e) = check_path_authorized_in_folders(src, &folders) {
+            return Err(format!(
+                "Access denied for rollback source '{}': {}",
+                op.source_path, e
+            ));
+        }
+        let dest = Path::new(&op.destination_path);
+        if let Err(e) = check_path_authorized_in_folders(dest, &folders) {
+            return Err(format!(
+                "Access denied for rollback destination '{}': {}",
+                op.destination_path, e
+            ));
+        }
+    }
+
     FileOrganizer::undo(&mut transaction)
 }
 
@@ -1522,7 +1592,16 @@ pub async fn analyze_document(
     model: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DocumentAnalysisResult, String> {
-    let res = DocumentAssistant::analyze(Path::new(&path), model.as_deref())?;
+    let p = Path::new(&path);
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
+        return Err(format!("Access denied for document: {}", e));
+    }
+
+    let res = DocumentAssistant::analyze(p, model.as_deref())?;
     let report_content = format!(
         "# Document Analysis Report: {}\n\n{}\n\n## Summary\n{}\n\n## Key Facts\n{}\n\n## Action Items\n{}\n\n## Dates & Deadlines\n{}\n",
         res.metadata.file_name,
@@ -1555,7 +1634,20 @@ pub async fn compare_documents(
     path_b: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<DocumentComparisonResult, String> {
-    let res = DocumentAssistant::compare(Path::new(&path_a), Path::new(&path_b))?;
+    let pa = Path::new(&path_a);
+    let pb = Path::new(&path_b);
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+    if let Err(e) = check_path_authorized_in_folders(pa, &folders) {
+        return Err(format!("Access denied for Document A: {}", e));
+    }
+    if let Err(e) = check_path_authorized_in_folders(pb, &folders) {
+        return Err(format!("Access denied for Document B: {}", e));
+    }
+
+    let res = DocumentAssistant::compare(pa, pb)?;
     let art_id = format!("art_{}", uuid::Uuid::new_v4());
     let rec = ArtifactRecord {
         id: art_id,
@@ -1749,6 +1841,71 @@ pub async fn import_routine(json_str: String) -> Result<EditableRoutine, String>
 // Everyday Assistant: Authorized Folders, Safe File Ops, and Documents
 // -----------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestedFolder {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub exists: bool,
+}
+
+#[tauri::command]
+pub fn get_suggested_folders() -> Result<Vec<SuggestedFolder>, String> {
+    let mut list = Vec::new();
+    if let Some(down) = dirs::download_dir() {
+        let exists = down.exists() && down.is_dir();
+        let path_str = if exists {
+            std::fs::canonicalize(&down)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| down.to_string_lossy().to_string())
+        } else {
+            down.to_string_lossy().to_string()
+        };
+        list.push(SuggestedFolder {
+            id: "downloads".to_string(),
+            name: "Downloads".to_string(),
+            path: path_str,
+            exists,
+        });
+    }
+
+    if let Some(doc) = dirs::document_dir() {
+        let exists = doc.exists() && doc.is_dir();
+        let path_str = if exists {
+            std::fs::canonicalize(&doc)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| doc.to_string_lossy().to_string())
+        } else {
+            doc.to_string_lossy().to_string()
+        };
+        list.push(SuggestedFolder {
+            id: "documents".to_string(),
+            name: "Documents".to_string(),
+            path: path_str,
+            exists,
+        });
+    }
+
+    if let Some(desk) = dirs::desktop_dir() {
+        let exists = desk.exists() && desk.is_dir();
+        let path_str = if exists {
+            std::fs::canonicalize(&desk)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| desk.to_string_lossy().to_string())
+        } else {
+            desk.to_string_lossy().to_string()
+        };
+        list.push(SuggestedFolder {
+            id: "desktop".to_string(),
+            name: "Desktop".to_string(),
+            path: path_str,
+            exists,
+        });
+    }
+
+    Ok(list)
+}
+
 #[tauri::command]
 pub fn list_authorized_folders(
     state: State<AppState>,
@@ -1764,6 +1921,7 @@ pub fn add_authorized_folder(
     state: State<AppState>,
     path: String,
     display_name: Option<String>,
+    label: Option<String>,
 ) -> Result<AuthorizedFolderRecord, String> {
     let p = Path::new(&path);
     if !p.exists() || !p.is_dir() {
@@ -1776,7 +1934,7 @@ pub fn add_authorized_folder(
         .map_err(|e| format!("Failed to canonicalize path '{}': {}", path, e))?;
     let canonical_str = canonical.to_string_lossy().to_string();
 
-    let name = display_name.unwrap_or_else(|| {
+    let name = display_name.or(label).unwrap_or_else(|| {
         canonical
             .file_name()
             .and_then(|n| n.to_str())
@@ -1799,10 +1957,17 @@ pub fn add_authorized_folder(
 }
 
 #[tauri::command]
-pub fn remove_authorized_folder(state: State<AppState>, id: String) -> Result<bool, String> {
+pub fn remove_authorized_folder(
+    state: State<AppState>,
+    id: Option<String>,
+    path: Option<String>,
+) -> Result<bool, String> {
+    let target = id
+        .or(path)
+        .ok_or_else(|| "Missing required parameter 'id' or 'path'".to_string())?;
     state
         .db
-        .remove_authorized_folder(&id)
+        .remove_authorized_folder(&target)
         .map_err(|e| e.to_string())
 }
 
@@ -1813,34 +1978,16 @@ pub fn search_authorized_documents(
     folder_filter: Option<String>,
     format_filter: Option<String>,
 ) -> Result<Vec<DocumentSearchResult>, String> {
-    let mut folders = state
+    let folders = state
         .db
         .list_authorized_folders()
         .map_err(|e| e.to_string())?;
     if folders.is_empty() {
-        if let Some(doc_dir) = dirs::document_dir() {
-            if doc_dir.exists() {
-                folders.push(AuthorizedFolderRecord {
-                    id: "default_docs".into(),
-                    path: doc_dir.to_string_lossy().to_string(),
-                    display_name: "Documents".into(),
-                    added_at: 0,
-                });
-            }
-        }
-        if let Some(down_dir) = dirs::download_dir() {
-            if down_dir.exists() {
-                folders.push(AuthorizedFolderRecord {
-                    id: "default_downloads".into(),
-                    path: down_dir.to_string_lossy().to_string(),
-                    display_name: "Downloads".into(),
-                    added_at: 0,
-                });
-            }
-        }
+        return Ok(Vec::new()); // Fail-closed: empty authorized folder list grants NO access
     }
 
-    FileAssistant::search(
+    FileAssistant::search_with_db(
+        Some(&state.db),
         &folders,
         &query,
         folder_filter.as_deref(),
@@ -1860,14 +2007,17 @@ pub fn execute_safe_file_op(
     let dest = destination_path.as_deref().map(Path::new);
 
     let folders = state.db.list_authorized_folders().unwrap_or_default();
-    if !folders.is_empty() {
-        let is_src_auth = folders.iter().any(|f| src.starts_with(&f.path));
-        let is_dest_auth = dest.is_none_or(|d| folders.iter().any(|f| d.starts_with(&f.path)));
-        if !is_src_auth || !is_dest_auth {
-            return Err(
-                "Access denied: File operation target must be located inside an authorized folder."
-                    .to_string(),
-            );
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured. Please authorize folders in Settings first.".to_string());
+    }
+
+    if let Err(e) = check_path_authorized_in_folders(src, &folders) {
+        return Err(format!("Access denied for source path: {}", e));
+    }
+
+    if let Some(d) = dest {
+        if let Err(e) = check_path_authorized_in_folders(d, &folders) {
+            return Err(format!("Access denied for destination path: {}", e));
         }
     }
 
@@ -1888,8 +2038,12 @@ pub fn detect_folder_duplicates(
     }
 
     let folders = state.db.list_authorized_folders().unwrap_or_default();
-    if !folders.is_empty() && !folders.iter().any(|f| p.starts_with(&f.path)) {
-        return Err("Access denied: Folder is outside authorized boundaries.".to_string());
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+
+    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
+        return Err(format!("Access denied: {}", e));
     }
 
     FileAssistant::find_duplicates(p)
@@ -1908,15 +2062,38 @@ pub fn list_file_transactions(
 
 #[tauri::command]
 pub fn generate_study_notes(
+    state: State<AppState>,
     path: String,
     topic: Option<String>,
 ) -> Result<StudyNotesResult, String> {
-    FileAssistant::generate_study_notes(Path::new(&path), topic.as_deref())
+    let p = Path::new(&path);
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
+        return Err(format!("Access denied for study notes: {}", e));
+    }
+
+    FileAssistant::generate_study_notes(p, topic.as_deref())
 }
 
 #[tauri::command]
-pub fn explain_document_passage(path: String, passage: String) -> Result<String, String> {
-    FileAssistant::explain_passage(Path::new(&path), &passage)
+pub fn explain_document_passage(
+    state: State<AppState>,
+    path: String,
+    passage: String,
+) -> Result<String, String> {
+    let p = Path::new(&path);
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Err("Access denied: No authorized folders configured.".to_string());
+    }
+    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
+        return Err(format!("Access denied for passage explainer: {}", e));
+    }
+
+    FileAssistant::explain_passage(p, &passage)
 }
 
 // -----------------------------------------------------------------------------
@@ -1966,6 +2143,17 @@ pub struct TodayServiceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApprovalItem {
+    pub id: String,
+    pub run_id: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub risk_level: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodayDashboardData {
     pub greeting: String,
     pub date_display: String,
@@ -1975,7 +2163,53 @@ pub struct TodayDashboardData {
     pub upcoming_routines: Vec<TodayRoutineItem>,
     pub recent_routine_results: Vec<RoutineRunRecord>,
     pub pending_tasks_count: usize,
+    pub pending_approvals: Vec<PendingApprovalItem>,
+    pub pending_approvals_count: usize,
     pub services: Vec<TodayServiceStatus>,
+}
+
+fn format_calendar_time_display(start_raw: &str, end_raw: Option<&str>) -> String {
+    if start_raw.len() == 10 && start_raw.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(start_raw, "%Y-%m-%d") {
+            let today = chrono::Local::now().date_naive();
+            if d == today {
+                return "Today (All day)".to_string();
+            } else if d == today + chrono::Days::new(1) {
+                return "Tomorrow (All day)".to_string();
+            } else {
+                return d.format("%a, %b %d (All day)").to_string();
+            }
+        }
+        return format!("{} (All day)", start_raw);
+    }
+
+    if let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(start_raw) {
+        let start_local = start_dt.with_timezone(&chrono::Local);
+        let today = chrono::Local::now().date_naive();
+        let day_prefix = if start_local.date_naive() == today {
+            "Today".to_string()
+        } else if start_local.date_naive() == today + chrono::Days::new(1) {
+            "Tomorrow".to_string()
+        } else {
+            start_local.format("%a, %b %d").to_string()
+        };
+
+        if let Some(end_str) = end_raw {
+            if let Ok(end_dt) = chrono::DateTime::parse_from_rfc3339(end_str) {
+                let end_local = end_dt.with_timezone(&chrono::Local);
+                return format!(
+                    "{}, {} – {}",
+                    day_prefix,
+                    start_local.format("%-I:%M %p"),
+                    end_local.format("%-I:%M %p")
+                );
+            }
+        }
+
+        return format!("{}, {}", day_prefix, start_local.format("%-I:%M %p"));
+    }
+
+    start_raw.to_string()
 }
 
 #[tauri::command]
@@ -2018,28 +2252,38 @@ pub async fn get_today_dashboard_data(
         {
             let now_iso = chrono::Utc::now().to_rfc3339();
             let end_of_day = (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339();
-            if let Ok(events_json_str) = adapter.execute_tool(
-                acc,
-                "calendar_list_events",
-                serde_json::json!({ "time_min": now_iso, "time_max": end_of_day, "max_results": 5 }),
-                &state.vault,
-            ).await {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&events_json_str) {
-                    if let Some(arr) = v["events"].as_array() {
-                        for ev in arr {
-                            upcoming_events.push(TodayEventItem {
-                                id: ev["id"].as_str().unwrap_or("").to_string(),
-                                title: ev["summary"].as_str().unwrap_or("Event").to_string(),
-                                time_display: ev["start"].as_str().unwrap_or("").to_string(),
-                                location: ev["location"].as_str().map(|s| s.to_string()),
-                                html_link: ev["html_link"].as_str().map(|s| s.to_string()),
-                            });
+            match adapter
+                .execute_tool(
+                    acc,
+                    "calendar_list_events",
+                    serde_json::json!({ "time_min": now_iso, "time_max": end_of_day, "max_results": 5 }),
+                    &state.vault,
+                )
+                .await
+            {
+                Ok(events_json_str) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&events_json_str) {
+                        if let Some(arr) = v["events"].as_array() {
+                            for ev in arr {
+                                let start = ev["start"].as_str().unwrap_or("");
+                                let end = ev["end"].as_str();
+                                upcoming_events.push(TodayEventItem {
+                                    id: ev["id"].as_str().unwrap_or("").to_string(),
+                                    title: ev["summary"].as_str().unwrap_or("Event").to_string(),
+                                    time_display: format_calendar_time_display(start, end),
+                                    location: ev["location"].as_str().map(|s| s.to_string()),
+                                    html_link: ev["html_link"].as_str().map(|s| s.to_string()),
+                                });
+                            }
                         }
                     }
                 }
+                Err(e) => {
+                    log::warn!("[Today] Calendar list error (partial degradation): {}", e);
+                }
             }
 
-            if let Ok(msgs_json_str) = adapter
+            match adapter
                 .execute_tool(
                     acc,
                     "gmail_list_messages",
@@ -2048,9 +2292,52 @@ pub async fn get_today_dashboard_data(
                 )
                 .await
             {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msgs_json_str) {
-                    let total = v["total_found"].as_u64().unwrap_or(0) as usize;
-                    email_summary.unread_count = total;
+                Ok(msgs_json_str) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msgs_json_str) {
+                        let total = v["total_found"].as_u64().unwrap_or(0) as usize;
+                        email_summary.unread_count = total;
+
+                        if let Some(msg_arr) = v["messages"].as_array() {
+                            for m in msg_arr.iter().take(3) {
+                                if let Some(msg_id) = m["id"].as_str() {
+                                    if let Ok(msg_json) = adapter
+                                        .execute_tool(
+                                            acc,
+                                            "gmail_get_message",
+                                            serde_json::json!({ "message_id": msg_id }),
+                                            &state.vault,
+                                        )
+                                        .await
+                                    {
+                                        if let Ok(msg_val) =
+                                            serde_json::from_str::<serde_json::Value>(&msg_json)
+                                        {
+                                            let subject = msg_val["subject"]
+                                                .as_str()
+                                                .unwrap_or("No Subject")
+                                                .to_string();
+                                            let from =
+                                                msg_val["from"].as_str().unwrap_or("").to_string();
+                                            let display = if !from.is_empty() {
+                                                let sender = if let Some(idx) = from.find('<') {
+                                                    from[..idx].trim()
+                                                } else {
+                                                    from.as_str()
+                                                };
+                                                format!("{}: {}", sender, subject)
+                                            } else {
+                                                subject
+                                            };
+                                            email_summary.recent_subjects.push(display);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[Today] Gmail list error (partial degradation): {}", e);
                 }
             }
         }
@@ -2058,22 +2345,27 @@ pub async fn get_today_dashboard_data(
 
     let mut recent_documents = Vec::new();
     let auth_folders = state.db.list_authorized_folders().unwrap_or_default();
-    if let Ok(searched) = FileAssistant::search(&auth_folders, "", None, None) {
-        for doc in searched.into_iter().take(5) {
-            let diff_sec = (chrono::Utc::now().timestamp_millis() - doc.modified_at).max(0) / 1000;
-            let time_str = if diff_sec < 3600 {
-                format!("{}m ago", diff_sec / 60)
-            } else if diff_sec < 86400 {
-                format!("{}h ago", diff_sec / 3600)
-            } else {
-                format!("{}d ago", diff_sec / 86400)
-            };
-            recent_documents.push(TodayDocumentItem {
-                file_name: doc.file_name,
-                path: doc.path,
-                modified_ago: time_str,
-                format: doc.format,
-            });
+    if !auth_folders.is_empty() {
+        if let Ok(searched) =
+            FileAssistant::search_with_db(Some(&state.db), &auth_folders, "", None, None)
+        {
+            for doc in searched.into_iter().take(5) {
+                let diff_sec =
+                    (chrono::Utc::now().timestamp_millis() - doc.modified_at).max(0) / 1000;
+                let time_str = if diff_sec < 3600 {
+                    format!("{}m ago", diff_sec / 60)
+                } else if diff_sec < 86400 {
+                    format!("{}h ago", diff_sec / 3600)
+                } else {
+                    format!("{}d ago", diff_sec / 86400)
+                };
+                recent_documents.push(TodayDocumentItem {
+                    file_name: doc.file_name,
+                    path: doc.path,
+                    modified_ago: time_str,
+                    format: doc.format,
+                });
+            }
         }
     }
 
@@ -2095,11 +2387,22 @@ pub async fn get_today_dashboard_data(
     }
 
     let recent_routine_results = state.db.list_routine_runs(5).unwrap_or_default();
-    let pending_tasks_count = state
-        .db
-        .list_pending_approvals()
-        .map(|l| l.len())
-        .unwrap_or(0);
+
+    let raw_approvals = state.db.list_pending_approvals().unwrap_or_default();
+    let pending_approvals: Vec<PendingApprovalItem> = raw_approvals
+        .into_iter()
+        .map(|a| PendingApprovalItem {
+            id: a.id,
+            run_id: a.run_id,
+            tool_name: a.tool_name,
+            summary: a.summary,
+            risk_level: a.risk_level,
+            reason: a.reason,
+            created_at: a.created_at,
+        })
+        .collect();
+    let pending_approvals_count = pending_approvals.len();
+    let pending_tasks_count = pending_approvals_count;
 
     let services = vec![
         TodayServiceStatus {
@@ -2133,6 +2436,8 @@ pub async fn get_today_dashboard_data(
         upcoming_routines,
         recent_routine_results,
         pending_tasks_count,
+        pending_approvals,
+        pending_approvals_count,
         services,
     })
 }
@@ -2153,6 +2458,30 @@ pub fn list_routine_runs(
 }
 
 #[tauri::command]
+pub fn update_routine(state: State<AppState>, mut routine: RoutineRecord) -> Result<(), String> {
+    let existing = state
+        .db
+        .get_routine(&routine.id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Routine '{}' not found", routine.id))?;
+
+    if RoutineScheduler::is_routine_running(&routine.id) {
+        return Err(format!(
+            "Cannot update routine '{}': routine is currently executing. Please wait for execution to complete.",
+            routine.id
+        ));
+    }
+
+    RoutineScheduler::parse_schedule(&routine.cron_expression)?;
+    routine.next_run = RoutineScheduler::compute_next_run_with_tz(&routine.cron_expression, None);
+    if routine.last_run.is_none() {
+        routine.last_run = existing.last_run;
+    }
+
+    state.db.update_routine(&routine).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn execute_routine_now(
     state: State<'_, AppState>,
     routine_id: String,
@@ -2163,30 +2492,25 @@ pub async fn execute_routine_now(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Routine '{}' not found", routine_id))?;
 
-    let run_id = format!("run_user_{}", uuid::Uuid::new_v4());
-    let start_time = chrono::Utc::now().timestamp_millis();
+    let record = RoutineScheduler::execute_routine_unified(
+        routine,
+        state.db.clone(),
+        state.vault.clone(),
+        state.engine.clone(),
+        Some(state.mcp_manager.clone()),
+        Some(state.connector_manager.clone()),
+        true,
+    )
+    .await?;
 
-    let run_record = RoutineRunRecord {
-        id: run_id.clone(),
-        routine_id: routine.id.clone(),
-        routine_name: routine.name.clone(),
-        status: "succeeded".to_string(),
-        started_at: start_time,
-        completed_at: Some(chrono::Utc::now().timestamp_millis()),
-        summary: Some(format!("Executed routine '{}' on demand.", routine.name)),
-        error: None,
-    };
+    if record.status == "failed" {
+        return Err(record
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("Routine '{}' execution failed", record.routine_name)));
+    }
 
-    state
-        .db
-        .record_routine_run(&run_record)
-        .map_err(|e| e.to_string())?;
-
-    let mut updated_routine = routine;
-    updated_routine.last_run = Some(start_time);
-    let _ = state.db.update_routine(&updated_routine);
-
-    Ok(run_record)
+    Ok(record)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2198,85 +2522,310 @@ pub struct NlRoutineSuggestion {
     pub explanation: String,
     pub required_resources: Vec<String>,
     pub requires_confirmation: bool,
+    #[serde(default)]
+    pub needs_clarification: bool,
+    #[serde(default)]
+    pub clarification_prompt: Option<String>,
+    #[serde(default)]
+    pub schedule_confidence: String,
 }
 
 #[tauri::command]
 pub fn natural_language_to_routine(prompt: String) -> Result<NlRoutineSuggestion, String> {
-    let lower = prompt.trim().to_lowercase();
-    if lower.is_empty() {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
         return Err("Please enter a description for your routine.".to_string());
     }
 
-    let (cron_expr, schedule_desc) =
-        if lower.contains("every friday") || lower.contains("each friday") {
-            ("0 9 * * 5", "Every Friday at 9:00 AM")
-        } else if lower.contains("every monday") || lower.contains("each monday") {
-            ("0 9 * * 1", "Every Monday at 9:00 AM")
-        } else if lower.contains("every weekday")
-            || lower.contains("daily at 9")
-            || lower.contains("every morning")
-        {
-            ("0 9 * * 1-5", "Every weekday (Monday to Friday) at 9:00 AM")
-        } else if lower.contains("every day") || lower.contains("daily") {
-            ("0 9 * * *", "Every day at 9:00 AM")
-        } else if lower.contains("every hour") || lower.contains("hourly") {
-            ("0 * * * *", "Every hour at minute 0")
-        } else if lower.contains("every 15 min") || lower.contains("every 15 minutes") {
-            ("*/15 * * * *", "Every 15 minutes")
-        } else {
-            ("0 9 * * *", "Every day at 9:00 AM (default schedule)")
-        };
+    let lower = trimmed.to_lowercase();
 
-    let (name, resources) = if lower.contains("receipt")
+    // 1. Extract local time of day if specified (e.g. "at 9am", "at 9:30 am", "at 14:00", "at 5pm")
+    let mut hour = 9u32;
+    let mut minute = 0u32;
+    let mut has_explicit_time = false;
+
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        if *word == "at" && i + 1 < words.len() {
+            let next_word = words[i + 1].trim_matches(|c: char| !c.is_alphanumeric() && c != ':');
+            let (time_part, ampm_part) = if next_word.ends_with("am") || next_word.ends_with("pm") {
+                let len = next_word.len();
+                (&next_word[..len - 2], Some(&next_word[len - 2..]))
+            } else {
+                let ampm = if i + 2 < words.len() && (words[i + 2] == "am" || words[i + 2] == "pm")
+                {
+                    Some(words[i + 2])
+                } else {
+                    None
+                };
+                (next_word, ampm)
+            };
+
+            let parts: Vec<&str> = time_part.split(':').collect();
+            if let Ok(h) = parts[0].parse::<u32>() {
+                let m = if parts.len() > 1 {
+                    parts[1].parse::<u32>().unwrap_or(0)
+                } else {
+                    0
+                };
+                let adjusted_hour = match ampm_part {
+                    Some("pm") if h < 12 => h + 12,
+                    Some("am") if h == 12 => 0,
+                    _ => h,
+                };
+                if adjusted_hour < 24 && m < 60 {
+                    hour = adjusted_hour;
+                    minute = m;
+                    has_explicit_time = true;
+                }
+            }
+        }
+    }
+
+    if !has_explicit_time {
+        if lower.contains("in the morning") {
+            hour = 9;
+            minute = 0;
+            has_explicit_time = true;
+        } else if lower.contains("in the evening") {
+            hour = 18;
+            minute = 0;
+            has_explicit_time = true;
+        } else if lower.contains("at night") {
+            hour = 20;
+            minute = 0;
+            has_explicit_time = true;
+        } else if lower.contains("at midnight") {
+            hour = 0;
+            minute = 0;
+            has_explicit_time = true;
+        } else if lower.contains("at noon") {
+            hour = 12;
+            minute = 0;
+            has_explicit_time = true;
+        }
+    }
+
+    // 2. Determine recurrence & cron expression
+    let (cron_expr, schedule_desc, confidence, needs_clarification, clarification_prompt) = if lower
+        .contains("every 15 min")
+        || lower.contains("every 15 minutes")
+    {
+        (
+            "*/15 * * * *".to_string(),
+            "Every 15 minutes".to_string(),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every 30 min") || lower.contains("every 30 minutes") {
+        (
+            "*/30 * * * *".to_string(),
+            "Every 30 minutes".to_string(),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every hour") || lower.contains("hourly") {
+        (
+            "0 * * * *".to_string(),
+            "Every hour at minute 0".to_string(),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every 2 hours") {
+        (
+            "0 */2 * * *".to_string(),
+            "Every 2 hours".to_string(),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every friday") || lower.contains("each friday") {
+        (
+            format!("{} {} * * 5", minute, hour),
+            format!("Every Friday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every monday") || lower.contains("each monday") {
+        (
+            format!("{} {} * * 1", minute, hour),
+            format!("Every Monday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every tuesday") || lower.contains("each tuesday") {
+        (
+            format!("{} {} * * 2", minute, hour),
+            format!("Every Tuesday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every wednesday") || lower.contains("each wednesday") {
+        (
+            format!("{} {} * * 3", minute, hour),
+            format!("Every Wednesday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every thursday") || lower.contains("each thursday") {
+        (
+            format!("{} {} * * 4", minute, hour),
+            format!("Every Thursday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every saturday") || lower.contains("each saturday") {
+        (
+            format!("{} {} * * 6", minute, hour),
+            format!("Every Saturday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every sunday") || lower.contains("each sunday") {
+        (
+            format!("{} {} * * 0", minute, hour),
+            format!("Every Sunday at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every weekday")
+        || lower.contains("each weekday")
+        || lower.contains("monday through friday")
+        || lower.contains("monday to friday")
+    {
+        (
+            format!("{} {} * * 1-5", minute, hour),
+            format!(
+                "Every weekday (Monday to Friday) at {:02}:{:02}",
+                hour, minute
+            ),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every weekend") || lower.contains("weekends") {
+        (
+            format!("{} {} * * 6,0", minute, hour),
+            format!(
+                "Every weekend (Saturday and Sunday) at {:02}:{:02}",
+                hour, minute
+            ),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("every day") || lower.contains("daily") {
+        (
+            format!("{} {} * * *", minute, hour),
+            format!("Every day at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if lower.contains("monthly")
+        || lower.contains("first day of the month")
+        || lower.contains("1st of every month")
+    {
+        (
+            format!("{} {} 1 * *", minute, hour),
+            format!("First day of every month at {:02}:{:02}", hour, minute),
+            "explicit".to_string(),
+            false,
+            None,
+        )
+    } else if has_explicit_time {
+        (
+            format!("{} {} * * *", minute, hour),
+            format!("Every day at {:02}:{:02} (Inferred schedule)", hour, minute),
+            "inferred".to_string(),
+            false,
+            None,
+        )
+    } else {
+        (
+                "0 9 * * 1-5".to_string(),
+                "Proposed: Every weekday at 9:00 AM (Schedule unconfirmed)".to_string(),
+                "needs_clarification".to_string(),
+                true,
+                Some("No recurring schedule was detected in your description. When would you like this routine to run? (e.g. 'every weekday at 9am' or 'every Friday at 5pm')".to_string()),
+            )
+    };
+
+    let (name, resources, requires_confirmation) = if lower.contains("receipt")
         || lower.contains("invoice")
         || lower.contains("expense")
     {
         (
             "Organize and summarize new receipts".to_string(),
             vec![
-                "Selected folder (e.g. Downloads)".to_string(),
+                "Authorized Folder (Documents/Downloads)".to_string(),
                 "Local document extraction".to_string(),
             ],
+            false,
         )
-    } else if lower.contains("organize") || lower.contains("clean") {
+    } else if lower.contains("organize") || lower.contains("clean") || lower.contains("sort files")
+    {
         (
             "Organize downloaded documents".to_string(),
             vec![
-                "Target folder".to_string(),
-                "File organizer transaction ledger".to_string(),
+                "Authorized Folder (e.g. Downloads)".to_string(),
+                "Safe file organizer transaction ledger".to_string(),
             ],
+            true,
         )
     } else if lower.contains("email") || lower.contains("gmail") {
         (
             "Check unread emails and draft summaries".to_string(),
             vec!["Google Workspace (Gmail)".to_string()],
+            true,
         )
     } else if lower.contains("calendar") || lower.contains("meeting") || lower.contains("schedule")
     {
         (
             "Review upcoming schedule and prepare briefing".to_string(),
             vec!["Google Calendar".to_string()],
+            false,
+        )
+    } else if lower.contains("compare") || lower.contains("research") {
+        (
+            "Autonomous web research and comparison".to_string(),
+            vec!["Kyro Web Automation".to_string()],
+            false,
         )
     } else {
-        let first_words: String = prompt.chars().take(40).collect();
+        let first_words: String = trimmed.chars().take(40).collect();
         (
             format!("Routine: {}", first_words),
             vec!["Kyro Agent Loop".to_string()],
+            false,
         )
     };
 
     let explanation = format!(
         "Runs on schedule '{}' ({}). Kyro will execute: \"{}\"",
-        cron_expr, schedule_desc, prompt
+        cron_expr, schedule_desc, trimmed
     );
 
     Ok(NlRoutineSuggestion {
         name,
-        cron_expression: cron_expr.to_string(),
+        cron_expression: cron_expr,
         action_type: "prompt".to_string(),
-        target_id: prompt,
+        target_id: trimmed.to_string(),
         explanation,
         required_resources: resources,
-        requires_confirmation: false,
+        requires_confirmation,
+        needs_clarification,
+        clarification_prompt,
+        schedule_confidence: confidence,
     })
 }

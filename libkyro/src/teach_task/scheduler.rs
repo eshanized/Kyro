@@ -2,9 +2,10 @@ use super::replay::SkillReplayer;
 use super::skill::Skill;
 use crate::agent::cancellation::CancellationToken;
 use crate::agent::loop_engine::AgentLoopEngine;
-use crate::agent::router::ChatMessage;
+use crate::agent::router::{ChatMessage, MessageContent, ModelRouter, DEFAULT_NEMOTRON_MODEL};
+use crate::connector::ConnectorManager;
 use crate::mcp::McpManager;
-use crate::storage::{AgentRun, Database, RoutineRecord, Vault};
+use crate::storage::{AgentRun, Database, RoutineRecord, RoutineRunRecord, Vault};
 use cron::Schedule;
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
@@ -120,6 +121,7 @@ impl RoutineScheduler {
         vault: Vault,
         engine: Arc<AgentLoopEngine>,
         mcp: Option<McpManager>,
+        connector_manager: Option<Arc<ConnectorManager>>,
     ) {
         if SCHEDULER_RUNNING.swap(true, Ordering::SeqCst) {
             return;
@@ -194,29 +196,24 @@ impl RoutineScheduler {
                             continue;
                         }
 
-                        // Mark active to enforce overlap prevention
-                        {
-                            let mut active = ACTIVE_ROUTINE_EXECUTIONS.lock().unwrap();
-                            // Stale snapshot guard: verify routine definition still exists before marking active
-                            match db.get_routine(&r.id) {
-                                Ok(Some(active_def)) => {
-                                    if !active_def.enabled {
-                                        continue;
-                                    }
-                                }
-                                Ok(None) => {
-                                    log::info!(
-                                        "[Scheduler] Routine '{}' was deleted; skipping from stale list snapshot",
-                                        r.id
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    log::error!("[Scheduler] Error verifying routine: {}", e);
+                        // Stale snapshot guard: verify routine definition still exists before dispatching
+                        match db.get_routine(&r.id) {
+                            Ok(Some(active_def)) => {
+                                if !active_def.enabled {
                                     continue;
                                 }
                             }
-                            active.insert(r.id.clone());
+                            Ok(None) => {
+                                log::info!(
+                                    "[Scheduler] Routine '{}' was deleted; skipping from stale list snapshot",
+                                    r.id
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                log::error!("[Scheduler] Error verifying routine: {}", e);
+                                continue;
+                            }
                         }
 
                         log::info!(
@@ -229,15 +226,18 @@ impl RoutineScheduler {
                         let vault_clone = vault.clone();
                         let engine_clone = engine.clone();
                         let mcp_clone = mcp.clone();
+                        let connector_clone = connector_manager.clone();
                         let routine_clone = r.clone();
 
                         tauri::async_runtime::spawn(async move {
-                            Self::execute_routine(
+                            let _ = Self::execute_routine_unified(
                                 routine_clone,
                                 db_clone,
                                 vault_clone,
                                 engine_clone,
                                 mcp_clone,
+                                connector_clone,
+                                false,
                             )
                             .await;
                         });
@@ -247,14 +247,28 @@ impl RoutineScheduler {
         });
     }
 
-    async fn execute_routine(
+    /// Shared execution service used by manual Run Now (Today & My Routines) and scheduled routine runs.
+    pub async fn execute_routine_unified(
         routine: RoutineRecord,
         db: Database,
         vault: Vault,
         engine: Arc<AgentLoopEngine>,
         mcp: Option<McpManager>,
-    ) {
-        let routine_id = routine.id.clone();
+        connector_manager: Option<Arc<ConnectorManager>>,
+        is_manual: bool,
+    ) -> Result<RoutineRunRecord, String> {
+        // Enforce concurrency limit: only one active execution per routine at a time
+        {
+            let mut active = ACTIVE_ROUTINE_EXECUTIONS.lock().unwrap();
+            if active.contains(&routine.id) {
+                return Err(format!(
+                    "Routine '{}' is currently executing. Concurrent executions of the same routine are prevented.",
+                    routine.name
+                ));
+            }
+            active.insert(routine.id.clone());
+        }
+
         struct Guard(String);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -262,73 +276,94 @@ impl RoutineScheduler {
                 active.remove(&self.0);
             }
         }
-        let _guard = Guard(routine_id);
+        let _guard = Guard(routine.id.clone());
 
-        // Ensure routine already selected from a stale scheduler snapshot cannot begin execution after deletion
-        match db.get_routine(&routine.id) {
-            Ok(Some(def)) if def.enabled => {}
-            _ => {
-                log::info!(
-                    "[Scheduler] Routine '{}' ({}) was deleted or disabled before execution began; skipping execution",
-                    routine.name,
-                    routine.id
-                );
-                return;
+        // Ensure routine definition still exists and is eligible to run
+        let latest_routine = match db.get_routine(&routine.id) {
+            Ok(Some(def)) => def,
+            Ok(None) => {
+                return Err(format!(
+                    "Routine '{}' ({}) was deleted or does not exist.",
+                    routine.name, routine.id
+                ));
             }
+            Err(e) => {
+                return Err(format!("Database error reading routine: {}", e));
+            }
+        };
+
+        if !latest_routine.enabled && !is_manual {
+            return Err(format!(
+                "Routine '{}' is disabled; skipping scheduled execution.",
+                latest_routine.name
+            ));
         }
 
-        if routine.action_type == "skill" {
-            // Also ensure targeted skill definition was not deleted
-            match db.get_skill(&routine.target_id) {
-                Ok(Some(_)) => {}
-                _ => {
-                    log::info!(
-                        "[Scheduler] Target skill '{}' for routine '{}' was deleted before execution began; skipping execution",
-                        routine.target_id,
-                        routine.name
-                    );
-                    return;
-                }
-            }
+        let run_id = format!(
+            "run_{}_{}",
+            if is_manual { "manual" } else { "sched" },
+            uuid::Uuid::new_v4()
+        );
+        let start_time = chrono::Utc::now().timestamp_millis();
+
+        // 1. Persist initial running state in routine_runs
+        let initial_record = RoutineRunRecord {
+            id: run_id.clone(),
+            routine_id: latest_routine.id.clone(),
+            routine_name: latest_routine.name.clone(),
+            status: "running".to_string(),
+            started_at: start_time,
+            completed_at: None,
+            summary: Some(format!("Executing routine '{}'...", latest_routine.name)),
+            error: None,
+        };
+
+        if let Err(e) = db.record_routine_run(&initial_record) {
+            log::error!("[Scheduler] Failed to record initial routine run: {}", e);
+            return Err(format!("Failed to record routine run: {}", e));
         }
 
-        let run_id = format!("run_sched_{}", uuid::Uuid::new_v4());
-        let now = chrono::Utc::now().timestamp_millis();
-
-        let run = AgentRun {
+        // 2. Persist in agent_runs for unified traceability
+        let agent_run = AgentRun {
             id: run_id.clone(),
             conversation_id: None,
-            agent_id: "scheduled-worker".to_string(),
-            model: "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
+            agent_id: if is_manual {
+                "manual-routine-worker".to_string()
+            } else {
+                "scheduled-routine-worker".to_string()
+            },
+            model: "configured".to_string(),
             prompt: format!(
-                "Scheduled routine: {} ({})",
-                routine.name, routine.action_type
+                "Routine: {} ({})",
+                latest_routine.name, latest_routine.action_type
             ),
             status: "running".to_string(),
-            created_at: now,
-            started_at: Some(now),
+            created_at: start_time,
+            started_at: Some(start_time),
             completed_at: None,
             error: None,
             config_json: Some(
                 serde_json::json!({
-                    "routine_id": routine.id,
-                    "cron_expression": routine.cron_expression,
-                    "action_type": routine.action_type,
+                    "routine_id": latest_routine.id,
+                    "routine_name": latest_routine.name,
+                    "cron_expression": latest_routine.cron_expression,
+                    "action_type": latest_routine.action_type,
+                    "is_manual": is_manual,
                 })
                 .to_string(),
             ),
             parent_run_id: None,
         };
+        let _ = db.create_run(&agent_run);
 
-        if let Err(e) = db.create_run(&run) {
-            log::error!("[Scheduler] Failed to persist run for routine: {}", e);
-            return;
-        }
-
+        // 3. Execution setup
         let cancel_token = CancellationToken::new();
+        engine
+            .register_run_token(&run_id, cancel_token.clone())
+            .await;
 
-        if routine.action_type == "skill" {
-            match db.get_skill(&routine.target_id) {
+        let exec_result: Result<String, String> = if latest_routine.action_type == "skill" {
+            match db.get_skill(&latest_routine.target_id) {
                 Ok(Some(skill_rec)) => {
                     match serde_json::from_str::<Vec<super::skill::SkillStep>>(
                         &skill_rec.steps_json,
@@ -341,119 +376,149 @@ impl RoutineScheduler {
                                 steps,
                                 created_at: skill_rec.created_at,
                             };
-                            match SkillReplayer::execute(
+                            SkillReplayer::execute(
                                 &skill,
                                 Some(&db),
                                 Some(&cancel_token),
                                 |step, total, desc| {
-                                    log::debug!("[Scheduler Skill] {}/{}: {}", step, total, desc);
+                                    log::debug!("[Routine Skill] {}/{}: {}", step, total, desc);
                                 },
                             )
                             .await
-                            {
-                                Ok(()) => {
-                                    let comp = chrono::Utc::now().timestamp_millis();
-                                    let _ = db.update_run_status(
-                                        &run_id,
-                                        "succeeded",
-                                        None,
-                                        Some(comp),
-                                        None,
-                                    );
-                                }
-                                Err(e) => {
-                                    let comp = chrono::Utc::now().timestamp_millis();
-                                    let _ = db.update_run_status(
-                                        &run_id,
-                                        "failed",
-                                        None,
-                                        Some(comp),
-                                        Some(&e),
-                                    );
-                                }
-                            }
+                            .map(|_| format!("Skill '{}' executed successfully.", skill.name))
                         }
-                        Err(e) => {
-                            let comp = chrono::Utc::now().timestamp_millis();
-                            let err_str = format!("Failed to parse skill steps: {}", e);
-                            let _ = db.update_run_status(
-                                &run_id,
-                                "failed",
-                                None,
-                                Some(comp),
-                                Some(&err_str),
-                            );
-                        }
+                        Err(e) => Err(format!("Failed to parse skill steps: {}", e)),
                     }
                 }
-                Ok(None) => {
-                    let comp = chrono::Utc::now().timestamp_millis();
-                    let err_str = format!("Target skill '{}' not found", routine.target_id);
-                    let _ =
-                        db.update_run_status(&run_id, "failed", None, Some(comp), Some(&err_str));
-                }
-                Err(e) => {
-                    let comp = chrono::Utc::now().timestamp_millis();
-                    let _ = db.update_run_status(
-                        &run_id,
-                        "failed",
-                        None,
-                        Some(comp),
-                        Some(&e.to_string()),
-                    );
+                Ok(None) => Err(format!(
+                    "Target skill '{}' not found",
+                    latest_routine.target_id
+                )),
+                Err(e) => Err(format!("Database error reading skill: {}", e)),
+            }
+        } else if latest_routine.action_type == "prompt" {
+            // Resolve configured model from settings
+            let configured_model = db
+                .get_setting("selected_model")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| DEFAULT_NEMOTRON_MODEL.to_string());
+
+            let caps = ModelRouter::resolve_capabilities(&configured_model);
+            if let Some(err) = caps.configuration_error {
+                Err(format!(
+                    "Model configuration error for '{}': {}",
+                    configured_model, err
+                ))
+            } else {
+                let keys = vault
+                    .get_all_keys()
+                    .map_err(|e| format!("Vault error: {}", e))?;
+                let api_key = match caps.provider.as_str() {
+                    "nvidia" => keys.nvidia.unwrap_or_default(),
+                    _ => keys.nvidia.unwrap_or_default(),
+                };
+
+                if api_key.is_empty() {
+                    Err(format!(
+                        "{} API key not configured for routine. Please add your key in Kyro Settings under Model & Credentials.",
+                        caps.provider.to_uppercase()
+                    ))
+                } else {
+                    let history = vec![ChatMessage {
+                        role: "user".to_string(),
+                        content: MessageContent::from_text(&latest_routine.target_id),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    }];
+
+                    let sys_prompt = "You are Kyro executing an autonomous routine. Complete the requested objective deterministically, safely, and truthfully.";
+
+                    engine
+                        .run_step_with_connectors(
+                            &run_id,
+                            &configured_model,
+                            &api_key,
+                            None,
+                            sys_prompt,
+                            history,
+                            db.clone(),
+                            mcp,
+                            connector_manager,
+                            Some(cancel_token.clone()),
+                            |_| {},
+                        )
+                        .await
                 }
             }
-        } else if routine.action_type == "prompt" {
-            let api_key = match vault.get_all_keys() {
-                Ok(keys) => keys.nvidia.unwrap_or_default(),
-                Err(_) => String::new(),
-            };
+        } else {
+            Err(format!(
+                "Unsupported routine action type '{}'",
+                latest_routine.action_type
+            ))
+        };
 
-            if api_key.is_empty() {
-                let comp = chrono::Utc::now().timestamp_millis();
-                let _ = db.update_run_status(
-                    &run_id,
-                    "failed",
-                    None,
-                    Some(comp),
-                    Some("NVIDIA API key not configured for scheduled prompt routine"),
-                );
-                return;
-            }
-
-            let history = vec![ChatMessage {
-                role: "user".to_string(),
-                content: crate::agent::router::MessageContent::from_text(&routine.target_id),
-                tool_calls: None,
-                tool_call_id: None,
-            }];
-
-            let sys_prompt = "You are Kyro executing a scheduled autonomous routine. Complete the objective deterministically.";
-
-            match engine
-                .run_step(
-                    &run_id,
-                    "nvidia/nemotron-3-ultra-550b-a55b",
-                    &api_key,
-                    None,
-                    sys_prompt,
-                    history,
-                    db.clone(),
-                    mcp,
-                    Some(cancel_token),
-                    |_: crate::agent::AgentStepEvent| {},
-                )
-                .await
-            {
-                Ok(_) => {
-                    let comp = chrono::Utc::now().timestamp_millis();
-                    let _ = db.update_run_status(&run_id, "succeeded", None, Some(comp), None);
+        let completed_at = chrono::Utc::now().timestamp_millis();
+        let (status, summary, error) = if cancel_token.is_cancelled() {
+            (
+                "cancelled".to_string(),
+                Some(format!(
+                    "Routine '{}' execution was cancelled.",
+                    latest_routine.name
+                )),
+                Some("Execution was cancelled by user or system.".to_string()),
+            )
+        } else {
+            match exec_result {
+                Ok(output) => {
+                    let s = if output.trim().is_empty() {
+                        format!("Routine '{}' completed successfully.", latest_routine.name)
+                    } else {
+                        output
+                    };
+                    ("succeeded".to_string(), Some(s), None)
                 }
-                Err(e) => {
-                    let comp = chrono::Utc::now().timestamp_millis();
-                    let _ = db.update_run_status(&run_id, "failed", None, Some(comp), Some(&e));
-                }
+                Err(err_msg) => (
+                    "failed".to_string(),
+                    Some(format!("Routine failed: {}", err_msg)),
+                    Some(err_msg),
+                ),
             }
-        }
+        };
+
+        // 4. Update terminal status truthfully
+        let _ = db.update_routine_run(
+            &run_id,
+            &status,
+            completed_at,
+            summary.as_deref(),
+            error.as_deref(),
+        );
+        let _ = db.update_run_status(&run_id, &status, None, Some(completed_at), error.as_deref());
+        let _ = db.update_routine_last_run(&latest_routine.id, start_time);
+
+        let final_record = RoutineRunRecord {
+            id: run_id,
+            routine_id: latest_routine.id,
+            routine_name: latest_routine.name,
+            status,
+            started_at: start_time,
+            completed_at: Some(completed_at),
+            summary,
+            error,
+        };
+
+        Ok(final_record)
+    }
+
+    /// Backwards-compatibility wrapper
+    pub async fn execute_routine(
+        routine: RoutineRecord,
+        db: Database,
+        vault: Vault,
+        engine: Arc<AgentLoopEngine>,
+        mcp: Option<McpManager>,
+    ) {
+        let _ = Self::execute_routine_unified(routine, db, vault, engine, mcp, None, false).await;
     }
 }
