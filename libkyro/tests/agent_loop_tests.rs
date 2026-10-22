@@ -1405,3 +1405,690 @@ async fn test_agent_loop_delegate_task_to_subagent() {
     assert!(res.is_ok());
     assert_eq!(res.unwrap(), "Delegation dispatched successfully.");
 }
+
+#[tokio::test]
+async fn test_agent_loop_approval_flow_expired_and_cancelled() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_appr_exp");
+    let run_id = "run_appr_exp_1";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    db.set_setting("mcp_perm:sensitive_op", "ask").unwrap();
+
+    // Step 1: LLM calls tool requiring approval (will expire)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Executing sensitive operation that expires",
+                    "tool_calls": [{
+                        "id": "tc_exp_1",
+                        "type": "function",
+                        "function": {
+                            "name": "sensitive_op",
+                            "arguments": serde_json::json!({ "target": "db1" }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 2: LLM receives expired error and calls tool again (will be cancelled)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Retrying sensitive operation which will be cancelled",
+                    "tool_calls": [{
+                        "id": "tc_canc_1",
+                        "type": "function",
+                        "function": {
+                            "name": "sensitive_op",
+                            "arguments": serde_json::json!({ "target": "db2" }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 3: LLM receives cancelled error and finishes
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Handled expirations and cancellations gracefully."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    // Spawn background task to expire the 1st request, then cancel the 2nd request
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        let mut handled_first = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(pending) = db_clone.list_pending_approvals() {
+                if let Some(req) = pending.first() {
+                    if !handled_first {
+                        let _ = db_clone.resolve_approval_request(&req.id, "expired", "timeout");
+                        handled_first = true;
+                    } else {
+                        let _ = db_clone.resolve_approval_request(&req.id, "cancelled", "user_cancellation");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Test approval timeouts"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Handled expirations and cancellations gracefully.");
+}
+
+#[tokio::test]
+async fn test_agent_loop_computer_actions_ghost_mode_operations() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_ghost_ops");
+    let run_id = "run_ghost_ops_1";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    // Enable ghost mode
+    let _ = kyro_lib::ghost::GhostDisplayManager::set_enabled(true);
+
+    // Enqueue 7 computer_action steps for mouse_move, left_click, right_click, double_click, type, key, wait
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Moving mouse and clicking",
+                    "tool_calls": [
+                        {
+                            "id": "tc_cm_1",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "mouse_move", "x": 100, "y": 200 }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_cm_2",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "left_click", "x": 100, "y": 200 }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_cm_3",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "right_click", "x": 100, "y": 200 }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_cm_4",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "double_click", "x": 100, "y": 200 }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_cm_5",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "type", "text": "hello kyro" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_cm_6",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "key", "text": "Return" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_cm_7",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "wait" }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 2: Enqueue error cases (missing coordinates, empty text)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Testing computer action error validations",
+                    "tool_calls": [
+                        {
+                            "id": "tc_err_1",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "mouse_move" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_err_2",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "left_click" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_err_3",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "right_click" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_err_4",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "double_click" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_err_5",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "type", "text": "" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_err_6",
+                            "type": "function",
+                            "function": {
+                                "name": "computer_action",
+                                "arguments": serde_json::json!({ "action": "key", "text": "" }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 3: Finish
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Ghost actions finished successfully."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Execute ghost actions"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    let _ = kyro_lib::ghost::GhostDisplayManager::set_enabled(false);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Ghost actions finished successfully.");
+}
+
+#[tokio::test]
+async fn test_agent_loop_grounded_screen_and_click_mark() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_grounding");
+    let run_id = "run_grounding_1";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    // Step 1: Capture grounded screen and click mark (mark 9999 is unmapped)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Capturing grounded screen and clicking mark",
+                    "tool_calls": [
+                        {
+                            "id": "tc_ground_1",
+                            "type": "function",
+                            "function": {
+                                "name": "capture_grounded_screen",
+                                "arguments": "{}".to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_mark_1",
+                            "type": "function",
+                            "function": {
+                                "name": "click_mark",
+                                "arguments": serde_json::json!({ "mark_id": 9999 }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 2: Finish
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Grounded screen and mark handled."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Ground screen"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step(
+            run_id,
+            "gpt-4o",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Grounded screen and mark handled.");
+}
+
+#[tokio::test]
+async fn test_agent_loop_launch_ghost_app_and_skill() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_ghost_skill");
+    let run_id = "run_ghost_skill_1";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    // Create a real skill record in DB
+    let skill_rec = kyro_lib::storage::db::SkillRecord {
+        id: "skill_test_1".to_string(),
+        name: "Test Skill".to_string(),
+        description: "Replays a test delay".to_string(),
+        steps_json: serde_json::to_string(&vec![
+            kyro_lib::teach_task::skill::SkillStep {
+                action_type: "delay".to_string(),
+                x: None,
+                y: None,
+                text: None,
+                key: None,
+                delay_ms: 5,
+            }
+        ]).unwrap(),
+        created_at: 1000,
+    };
+    db.create_skill(&skill_rec).unwrap();
+
+    // Step 1: Launch ghost app (empty executable and non-existent executable), and invoke_skill (valid and invalid)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Testing ghost app launch and skill replay",
+                    "tool_calls": [
+                        {
+                            "id": "tc_ghost_empty",
+                            "type": "function",
+                            "function": {
+                                "name": "launch_ghost_app",
+                                "arguments": serde_json::json!({ "executable": "" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_ghost_invalid",
+                            "type": "function",
+                            "function": {
+                                "name": "launch_ghost_app",
+                                "arguments": serde_json::json!({ "executable": "nonexistent_app_12345" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_skill_valid",
+                            "type": "function",
+                            "function": {
+                                "name": "invoke_skill",
+                                "arguments": serde_json::json!({ "skill_id": "skill_test_1" }).to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_skill_invalid",
+                            "type": "function",
+                            "function": {
+                                "name": "invoke_skill",
+                                "arguments": serde_json::json!({ "skill_id": "missing_skill" }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 2: Finish
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Ghost app and skill invocations completed."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Test ghost app and skills"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Ghost app and skill invocations completed.");
+}
+
+#[tokio::test]
+async fn test_agent_loop_audit_ui_tool_validation() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_audit_ui");
+    let run_id = "run_audit_ui_1";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    db.set_setting("mcp_perm:audit_ui", "allow").unwrap();
+
+    // Step 1: Call audit_ui with missing parameters, and with non-existent project path
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Validating audit_ui tool",
+                    "tool_calls": [
+                        {
+                            "id": "tc_audit_empty",
+                            "type": "function",
+                            "function": {
+                                "name": "audit_ui",
+                                "arguments": "{}".to_string()
+                            }
+                        },
+                        {
+                            "id": "tc_audit_missing_path",
+                            "type": "function",
+                            "function": {
+                                "name": "audit_ui",
+                                "arguments": serde_json::json!({ "project_path": "/tmp/definitely_not_a_project_dir_xyz" }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 2: Finish
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "audit_ui validation completed."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    // Spawn background task to deny dev server start approval if requested
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(pending) = db_clone.list_pending_approvals() {
+                if let Some(req) = pending.first() {
+                    let _ = db_clone.resolve_approval_request(&req.id, "denied", "tester");
+                    break;
+                }
+            }
+        }
+    });
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Audit UI test"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "audit_ui validation completed.");
+}
+
+#[tokio::test]
+async fn test_agent_loop_run_step_with_connectors_and_custom_tools() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_conn_loop");
+    let run_id = "run_conn_loop_1";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    db.set_setting("mcp_perm:unknown_custom_tool", "allow").unwrap();
+
+    let vault = kyro_lib::storage::Vault::new_encrypted_fallback(db.clone());
+    let mcp_mgr = kyro_lib::mcp::McpManager::new(db.clone(), vault.clone());
+    let conn_mgr = Arc::new(kyro_lib::connector::ConnectorManager::new(
+        db.clone(),
+        vault,
+        mcp_mgr.clone(),
+    ));
+
+    // Connect GitHub account in DB to register tools
+    let acc_record = kyro_lib::storage::db::ConnectedAccountRecord {
+        id: "acc_conn_1".to_string(),
+        connector_id: "github".to_string(),
+        account_identifier: "kyro_bot".to_string(),
+        display_name: "Kyro Bot".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[\"repo\"]".to_string(),
+        credential_key: "vault_key".to_string(),
+        config_json: "{}".to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+        last_connected_at: Some(1000),
+        last_error: None,
+        expires_at: None,
+    };
+    db.create_connected_account(&acc_record).unwrap();
+
+    // Step 1: Model calls an unknown/unhandled tool and a connector tool
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Calling connector tools",
+                    "tool_calls": [
+                        {
+                            "id": "tc_unhandled_1",
+                            "type": "function",
+                            "function": {
+                                "name": "unknown_custom_tool",
+                                "arguments": "{}".to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Step 2: Finish
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Connector loop step completed."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Test connector loop"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step_with_connectors(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            Some(mcp_mgr),
+            Some(conn_mgr),
+            None,
+            |_| {},
+        )
+        .await;
+
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Connector loop step completed.");
+}

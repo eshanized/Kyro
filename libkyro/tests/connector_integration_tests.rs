@@ -135,6 +135,7 @@ fn test_connector_permanent_vs_transient_refresh_errors() {
 #[tokio::test]
 async fn test_connector_catalog_and_account_management() {
     let (db, vault, _td) = create_test_db_and_vault();
+    db.seed_default_connectors().unwrap();
     let local_mcp = McpManager::new(db.clone(), vault.clone());
     let conn_mgr = ConnectorManager::new(db.clone(), vault.clone(), local_mcp);
 
@@ -206,6 +207,7 @@ async fn test_connector_catalog_and_account_management() {
 #[tokio::test]
 async fn test_connector_tool_authorization_evaluation() {
     let (db, vault, _td) = create_test_db_and_vault();
+    db.seed_default_connectors().unwrap();
     let local_mcp = McpManager::new(db.clone(), vault.clone());
     let conn_mgr = Arc::new(ConnectorManager::new(db.clone(), vault.clone(), local_mcp));
 
@@ -545,4 +547,238 @@ fn test_mcp_json_schema_validation() {
     let err = validate_schema(&schema, &wrong_type);
     assert!(err.is_err());
     assert!(err.unwrap_err().contains("integer"));
+}
+
+#[tokio::test]
+async fn test_connector_manager_oauth_flow_and_tools_governance() {
+    let (db, vault, _td) = create_test_db_and_vault();
+    db.seed_default_connectors().unwrap();
+    let local_mcp = McpManager::new(db.clone(), vault.clone());
+    let conn_mgr = ConnectorManager::new(db.clone(), vault.clone(), local_mcp);
+
+    // 1. start_oauth_flow provider validation
+    let unsupp = conn_mgr
+        .start_oauth_flow("unsupported_provider", None, None)
+        .await;
+    assert!(unsupp.is_err());
+    assert!(unsupp.unwrap_err().contains("not supported"));
+
+    let gh_missing_cid = conn_mgr.start_oauth_flow("github", None, None).await;
+    assert!(gh_missing_cid.is_err());
+    assert!(gh_missing_cid.unwrap_err().contains("Client ID"));
+
+    let google_missing_cid = conn_mgr.start_oauth_flow("google", None, None).await;
+    assert!(google_missing_cid.is_err());
+    assert!(google_missing_cid.unwrap_err().contains("Client ID"));
+
+    let gh_init = conn_mgr
+        .start_oauth_flow("github", Some("test_client_id".to_string()), None)
+        .await;
+    assert!(gh_init.is_ok());
+    let init_res = gh_init.unwrap();
+    assert!(!init_res.session_id.is_empty());
+    assert!(init_res.auth_url.contains("github.com"));
+
+    // 2. get_oauth_status
+    let status = conn_mgr.get_oauth_status(&init_res.session_id).await;
+    assert!(status.is_ok());
+    assert_eq!(status.unwrap().status, "pending");
+
+    let status_missing = conn_mgr.get_oauth_status("missing_session_xyz").await;
+    assert!(status_missing.is_err());
+
+    // 3. refresh_account_token validation
+    // Non-existent account
+    let ref_missing = conn_mgr.refresh_account_token("no_such_account").await;
+    assert!(ref_missing.is_err());
+
+    // Account exists in DB
+    let acc_google = ConnectedAccountRecord {
+        id: "acc_goog_1".to_string(),
+        connector_id: "google_calendar".to_string(),
+        account_identifier: "test@gmail.com".to_string(),
+        display_name: "Test Google".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[\"email\"]".to_string(),
+        credential_key: "vault_goog".to_string(),
+        config_json: "{}".to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+        last_connected_at: Some(1000),
+        last_error: None,
+        expires_at: None,
+    };
+    db.create_connected_account(&acc_google).unwrap();
+
+    // Invalid secret JSON in vault
+    vault.store_account_secret("acc_goog_1", "invalid_json").unwrap();
+    let ref_invalid_json = conn_mgr.refresh_account_token("acc_goog_1").await;
+    assert!(ref_invalid_json.is_err());
+    assert!(ref_invalid_json.unwrap_err().contains("Invalid secret JSON"));
+
+    // Secret missing refresh_token
+    vault.store_account_secret("acc_goog_1", "{\"access_token\": \"dummy\"}").unwrap();
+    let ref_no_refresh = conn_mgr.refresh_account_token("acc_goog_1").await;
+    assert!(ref_no_refresh.is_err());
+    assert!(ref_no_refresh.unwrap_err().contains("refresh token"));
+
+    // Secret with recent updated_at (within 15s) reuses access token
+    let now = chrono::Utc::now().timestamp_millis();
+    let recent_secret = json!({
+        "access_token": "cached_access_token_123",
+        "refresh_token": "refresh_tok_xyz",
+        "updated_at": now - 2000
+    });
+    vault.store_account_secret("acc_goog_1", &recent_secret.to_string()).unwrap();
+    let ref_cached = conn_mgr.refresh_account_token("acc_goog_1").await;
+    assert!(ref_cached.is_ok());
+    assert_eq!(ref_cached.unwrap(), "cached_access_token_123");
+
+    // 4. test_connection
+    let test_missing = conn_mgr.test_connection("missing_acc_id").await;
+    assert!(test_missing.is_err());
+    assert!(test_missing.unwrap_err().contains("not found"));
+
+    let unsupp_def = kyro_lib::storage::db::ConnectorDefinitionRecord {
+        id: "unsupported_type".into(),
+        name: "Unsupported".into(),
+        connector_type: "native".into(),
+        description: "Unsupported connector".into(),
+        icon: "icon".into(),
+        auth_type: "token".into(),
+        capabilities_json: "[]".into(),
+        required_scopes_json: "[]".into(),
+        is_builtin: false,
+        is_available: true,
+        doc_url: None,
+        created_at: 1000,
+    };
+    db.create_connector_definition(&unsupp_def).unwrap();
+
+    let acc_unsupported = ConnectedAccountRecord {
+        id: "acc_other_1".to_string(),
+        connector_id: "unsupported_type".to_string(),
+        account_identifier: "other_user".to_string(),
+        display_name: "Other".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "vault_other".to_string(),
+        config_json: "{}".to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+        last_connected_at: Some(1000),
+        last_error: None,
+        expires_at: None,
+    };
+    db.create_connected_account(&acc_unsupported).unwrap();
+    let test_unsupp = conn_mgr.test_connection("acc_other_1").await;
+    assert!(test_unsupp.is_err());
+    assert!(test_unsupp.unwrap_err().contains("No connection tester available"));
+
+    // 5. get_tools_for_account for google and google_calendar
+    let goog_tools = conn_mgr.get_tools_for_account("acc_goog_1").await;
+    assert!(!goog_tools.is_empty());
+    assert!(goog_tools.iter().any(|t| t.original_name.contains("gmail") || t.original_name.contains("calendar")));
+
+    let acc_cal = ConnectedAccountRecord {
+        id: "acc_cal_1".to_string(),
+        connector_id: "google_calendar".to_string(),
+        account_identifier: "cal@gmail.com".to_string(),
+        display_name: "Calendar".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "vault_cal".to_string(),
+        config_json: "{}".to_string(),
+        created_at: 1000,
+        updated_at: 1000,
+        last_connected_at: Some(1000),
+        last_error: None,
+        expires_at: None,
+    };
+    db.create_connected_account(&acc_cal).unwrap();
+    let cal_tools = conn_mgr.get_tools_for_account("acc_cal_1").await;
+    assert!(!cal_tools.is_empty());
+
+    // 6. resolve_tool
+    assert!(conn_mgr.resolve_tool("nonexistent_scoped_tool").await.is_none());
+}
+
+#[tokio::test]
+async fn test_oauth_manager_error_paths_and_finalize() {
+    let oauth = OAuthManager::new();
+
+    // 1. Error paths for missing sessions
+    assert!(oauth.record_callback("missing", "code".to_string()).await.is_err());
+    assert!(oauth.claim_exchange("missing").await.is_err());
+    assert!(oauth.claim_finalizing("missing").await.is_err());
+    assert!(oauth.get_session_for_manual_exchange("missing").await.is_err());
+
+    // 2. Register session and fail exchange
+    let now = chrono::Utc::now().timestamp_millis();
+    let session = PendingOAuthSession {
+        session_id: "sess_fail".to_string(),
+        provider_id: "github".to_string(),
+        client_id: "cid".to_string(),
+        client_secret: None,
+        code_verifier: "verifier".to_string(),
+        state: "state".to_string(),
+        redirect_uri: "http://localhost/callback".to_string(),
+        token_endpoint: "https://example.com/token".to_string(),
+        status: kyro_lib::connector::auth::OAuthSessionStatus::Pending,
+        created_at: now,
+        expires_at: now + 60_000,
+    };
+    oauth.register_session(session).await;
+
+    // Finish exchange with error
+    oauth.finish_exchange("sess_fail", Err("Handshake network error".to_string())).await;
+    let status_view = oauth.get_session_status_view("sess_fail").await.unwrap();
+    assert_eq!(status_view.status, "failed");
+    assert!(status_view.error.unwrap().contains("Handshake network error"));
+
+    // 3. Finalize success and finalize failure
+    let tok_dummy = TokenExchangeResult {
+        access_token: "tok_fin".to_string(),
+        refresh_token: None,
+        token_type: "bearer".to_string(),
+        granted_scopes: vec![],
+        expires_in_seconds: None,
+    };
+    let session2 = PendingOAuthSession {
+        session_id: "sess_fin".to_string(),
+        provider_id: "github".to_string(),
+        client_id: "cid".to_string(),
+        client_secret: None,
+        code_verifier: "verifier".to_string(),
+        state: "state".to_string(),
+        redirect_uri: "http://localhost/callback".to_string(),
+        token_endpoint: "https://example.com/token".to_string(),
+        status: kyro_lib::connector::auth::OAuthSessionStatus::Finalizing { token: tok_dummy.clone() },
+        created_at: now,
+        expires_at: now + 60_000,
+    };
+    oauth.register_session(session2).await;
+    oauth.finalize_success("sess_fin").await;
+    assert!(oauth.get_session_status("sess_fin").await.is_none());
+
+    let session3 = PendingOAuthSession {
+        session_id: "sess_fin2".to_string(),
+        provider_id: "github".to_string(),
+        client_id: "cid".to_string(),
+        client_secret: None,
+        code_verifier: "verifier".to_string(),
+        state: "state".to_string(),
+        redirect_uri: "http://localhost/callback".to_string(),
+        token_endpoint: "https://example.com/token".to_string(),
+        status: kyro_lib::connector::auth::OAuthSessionStatus::Finalizing { token: tok_dummy.clone() },
+        created_at: now,
+        expires_at: now + 60_000,
+    };
+    oauth.register_session(session3).await;
+    oauth.finalize_failure("sess_fin2", "Database write error".to_string()).await;
+    let s2_fail = oauth.get_session_status("sess_fin2").await.unwrap();
+    assert!(matches!(s2_fail, kyro_lib::connector::auth::OAuthSessionStatus::Failed { .. }));
 }
