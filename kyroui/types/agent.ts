@@ -809,6 +809,7 @@ export interface TodayEmailSummary {
   recent_subjects: string[];
   is_connected: boolean;
   account_email?: string | null;
+  error?: string | null;
 }
 
 export interface TodayDocumentItem {
@@ -862,6 +863,8 @@ export interface TodayDashboardData {
   pending_approvals?: PendingApprovalItem[];
   pending_approvals_count?: number;
   services: TodayServiceStatus[];
+  calendar_error?: string | null;
+  email_error?: string | null;
 }
 
 export interface NlRoutineSuggestion {

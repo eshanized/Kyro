@@ -664,6 +664,22 @@ impl NativeConnectorAdapter for GoogleAdapter {
                             "description": "Desired meeting duration in minutes (default 30)",
                             "minimum": 15,
                             "maximum": 240
+                        },
+                        "timezone": {
+                            "type": "string",
+                            "description": "IANA timezone identifier (e.g., 'America/New_York', 'UTC', 'Europe/London'). If omitted, uses UTC."
+                        },
+                        "work_start_hour": {
+                            "type": "integer",
+                            "description": "Start of working hours (0-23, default 9)",
+                            "minimum": 0,
+                            "maximum": 23
+                        },
+                        "work_end_hour": {
+                            "type": "integer",
+                            "description": "End of working hours (1-24, default 17)",
+                            "minimum": 1,
+                            "maximum": 24
                         }
                     },
                     "required": ["date"]
@@ -1022,12 +1038,35 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     .clamp(15, 240);
 
                 let tz_str = args["timezone"].as_str().unwrap_or("UTC");
-                let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+                let tz: chrono_tz::Tz = if let Some(tz_raw) =
+                    args.get("timezone").and_then(|t| t.as_str())
+                {
+                    let trimmed = tz_raw.trim();
+                    if trimmed.is_empty() {
+                        chrono_tz::UTC
+                    } else {
+                        trimmed.parse::<chrono_tz::Tz>().map_err(|_| {
+                            format!(
+                                "Invalid timezone '{}'. Expected a valid IANA timezone identifier (e.g. 'America/New_York', 'Europe/London', 'UTC').",
+                                trimmed
+                            )
+                        })?
+                    }
+                } else {
+                    chrono_tz::UTC
+                };
 
                 let start_hour: u32 =
                     args["work_start_hour"].as_u64().unwrap_or(9).clamp(0, 23) as u32;
                 let end_hour: u32 =
                     args["work_end_hour"].as_u64().unwrap_or(17).clamp(1, 24) as u32;
+
+                if start_hour >= end_hour {
+                    return Err(format!(
+                        "Invalid working hours: work_start_hour ({}) must be less than work_end_hour ({}).",
+                        start_hour, end_hour
+                    ));
+                }
 
                 let naive_date =
                     chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").map_err(|e| {
@@ -1038,22 +1077,27 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     })?;
 
                 use chrono::TimeZone;
-                let work_start_local = tz
-                    .from_local_datetime(
-                        &naive_date
-                            .and_hms_opt(start_hour, 0, 0)
-                            .ok_or("Invalid start hour")?,
-                    )
-                    .single()
-                    .ok_or("Ambiguous or invalid local start time in specified timezone")?;
-                let work_end_local = tz
-                    .from_local_datetime(
-                        &naive_date
-                            .and_hms_opt(end_hour, 0, 0)
-                            .ok_or("Invalid end hour")?,
-                    )
-                    .single()
-                    .ok_or("Ambiguous or invalid local end time in specified timezone")?;
+                let resolve_local_dt = |h: u32| -> Result<chrono::DateTime<chrono_tz::Tz>, String> {
+                    let ndt = naive_date
+                        .and_hms_opt(h, 0, 0)
+                        .ok_or_else(|| format!("Invalid time {}:00", h))?;
+                    match tz.from_local_datetime(&ndt) {
+                        chrono::LocalResult::Single(dt) => Ok(dt),
+                        chrono::LocalResult::Ambiguous(earliest, _) => Ok(earliest),
+                        chrono::LocalResult::None => {
+                            // Gap during spring-forward DST transition: advance by 1 hour
+                            let shifted = ndt
+                                .checked_add_signed(chrono::Duration::hours(1))
+                                .ok_or("Invalid datetime")?;
+                            tz.from_local_datetime(&shifted).single().ok_or_else(|| {
+                                "Failed to resolve local time across DST transition".to_string()
+                            })
+                        }
+                    }
+                };
+
+                let work_start_local = resolve_local_dt(start_hour)?;
+                let work_end_local = resolve_local_dt(end_hour)?;
 
                 let time_min = work_start_local.with_timezone(&chrono::Utc).to_rfc3339();
                 let time_max = work_end_local.with_timezone(&chrono::Utc).to_rfc3339();
@@ -1096,6 +1140,10 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     if page_token.is_none() || page_count >= 10 {
                         break;
                     }
+                }
+
+                if page_token.is_some() && page_count >= 10 {
+                    return Err("Calendar pagination safety limit reached (10 pages) with additional events remaining. Availability cannot be definitively calculated from incomplete calendar data.".to_string());
                 }
 
                 let work_start_ts = work_start_local.timestamp_millis();

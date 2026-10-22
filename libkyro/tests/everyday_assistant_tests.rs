@@ -5,11 +5,15 @@
 //! - Routine execution history and natural language routine authoring
 //! - Today dashboard aggregation
 
+use kyro_lib::commands::natural_language_to_routine;
+use kyro_lib::connector::manager::ConnectorManager;
 use kyro_lib::connector::native::google::GoogleAdapter;
 use kyro_lib::connector::NativeConnectorAdapter;
 use kyro_lib::execution::permissions::RiskLevel;
 use kyro_lib::storage::file_assistant::FileAssistant;
-use kyro_lib::storage::organizer::{FileOrganizer, OrganizationPlan, PlannedFileOp};
+use kyro_lib::storage::organizer::{
+    FileOrganizer, OrganizationOpRecord, OrganizationPlan, OrganizationTransaction, PlannedFileOp,
+};
 use kyro_lib::storage::{
     AuthorizedFolderRecord, ConnectedAccountRecord, Database, DocumentIndexRecord, RoutineRecord,
     RoutineRunRecord, Vault,
@@ -416,8 +420,26 @@ fn test_grounded_passage_explanation_and_filtered_study_notes() {
 fn test_document_index_caching_and_queries() {
     let (dir, db, _vault) = temp_db("doc_index");
 
+    let invoices_dir = dir.join("invoices");
+    let notes_dir = dir.join("notes");
+    fs::create_dir_all(&invoices_dir).unwrap();
+    fs::create_dir_all(&notes_dir).unwrap();
+
+    let doc1_path = invoices_dir.join("inv_october.pdf");
+    let doc2_path = notes_dir.join("meeting.md");
+    fs::write(
+        &doc1_path,
+        "Acme Corp October invoice for software engineering services total $1500",
+    )
+    .unwrap();
+    fs::write(
+        &doc2_path,
+        "Standup notes discussing sprint goals and timeline",
+    )
+    .unwrap();
+
     let doc1 = kyro_lib::storage::DocumentIndexRecord {
-        path: "/allowed/invoices/inv_october.pdf".to_string(),
+        path: doc1_path.to_string_lossy().to_string(),
         file_name: "inv_october.pdf".to_string(),
         format: "pdf".to_string(),
         size_bytes: 10240,
@@ -429,7 +451,7 @@ fn test_document_index_caching_and_queries() {
         indexed_at: 1729000500000,
     };
     let doc2 = kyro_lib::storage::DocumentIndexRecord {
-        path: "/allowed/notes/meeting.md".to_string(),
+        path: doc2_path.to_string_lossy().to_string(),
         file_name: "meeting.md".to_string(),
         format: "md".to_string(),
         size_bytes: 2048,
@@ -445,20 +467,41 @@ fn test_document_index_caching_and_queries() {
     let all_docs = db.list_indexed_documents().unwrap();
     assert_eq!(all_docs.len(), 2);
 
-    // Verify retrieval by path
+    // Before authorizing folder, get_indexed_document fails closed
+    let unauth_retrieved = db.get_indexed_document(&doc1.path).unwrap();
+    assert!(
+        unauth_retrieved.is_none(),
+        "Must fail closed when no authorized folder covers document path"
+    );
+
+    // Authorize folder covering doc1
+    let auth_invoices = AuthorizedFolderRecord {
+        id: "auth_inv".to_string(),
+        path: invoices_dir.to_string_lossy().to_string(),
+        display_name: "Invoices".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&auth_invoices).unwrap();
+
+    // Verify retrieval by path now succeeds
     let retrieved = db.get_indexed_document(&doc1.path).unwrap();
     assert!(retrieved.is_some());
     assert_eq!(retrieved.unwrap().sha256, "hash1");
 
-    // Prune unauthorized
-    let auth = AuthorizedFolderRecord {
+    // doc2 is still unauthorized
+    assert!(db.get_indexed_document(&doc2.path).unwrap().is_none());
+
+    // Prune unauthorized: only notes_dir is passed, so doc1 (in invoices) is pruned
+    let auth_notes = AuthorizedFolderRecord {
         id: "auth1".to_string(),
-        path: "/allowed/notes".to_string(),
+        path: notes_dir.to_string_lossy().to_string(),
         display_name: "Notes".to_string(),
         added_at: 1000,
     };
-    let pruned = db.prune_unauthorized_indexed_documents(&[auth]).unwrap();
-    assert_eq!(pruned, 2); // since neither directory physically exists on disk in temp test
+    let pruned = db
+        .prune_unauthorized_indexed_documents(&[auth_notes])
+        .unwrap();
+    assert_eq!(pruned, 1);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -877,6 +920,475 @@ fn test_file_organizer_toctou_symlink_traversal_rejection() {
 
     // Verify outside file was NOT moved
     assert!(outside_secret.exists());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_filesystem_move_and_copy_destination_collision_and_confirm() {
+    let dir = std::env::temp_dir().join(format!("kyro_fs_collision_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    let src = dir.join("source.txt");
+    let dest = dir.join("existing_dest.txt");
+    fs::write(&src, "Source Content v1").unwrap();
+    fs::write(&dest, "Original Destination Content").unwrap();
+
+    // 1. Copy collision without confirmation -> fails closed with requires_confirmation
+    let copy_unconfirmed =
+        FileAssistant::execute_safe_op("copy", &src, Some(&dest), false).unwrap();
+    assert!(!copy_unconfirmed.success);
+    assert!(copy_unconfirmed.requires_confirmation);
+    assert!(copy_unconfirmed.message.contains("already exists"));
+    assert_eq!(
+        fs::read_to_string(&dest).unwrap(),
+        "Original Destination Content"
+    );
+
+    // 2. Copy collision with confirmation -> succeeds and replaces
+    let copy_confirmed = FileAssistant::execute_safe_op("copy", &src, Some(&dest), true).unwrap();
+    assert!(copy_confirmed.success);
+    assert!(!copy_confirmed.requires_confirmation);
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "Source Content v1");
+    assert!(src.exists());
+
+    // 3. Move collision without confirmation -> fails closed with requires_confirmation
+    fs::write(&dest, "Destination Overwrite Guard").unwrap();
+    let move_unconfirmed =
+        FileAssistant::execute_safe_op("move", &src, Some(&dest), false).unwrap();
+    assert!(!move_unconfirmed.success);
+    assert!(move_unconfirmed.requires_confirmation);
+    assert!(move_unconfirmed.message.contains("already exists"));
+    assert_eq!(
+        fs::read_to_string(&dest).unwrap(),
+        "Destination Overwrite Guard"
+    );
+    assert!(src.exists());
+
+    // 4. Move collision with confirmation -> succeeds, moves and replaces
+    let move_confirmed = FileAssistant::execute_safe_op("move", &src, Some(&dest), true).unwrap();
+    assert!(move_confirmed.success);
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "Source Content v1");
+    assert!(!src.exists());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_dynamic_toctou_path_race_rejection_and_documentation() {
+    // Audit Note on TOCTOU Protection:
+    // Full race-free TOCTOU resistance on standard POSIX without openat2 / O_BENEATH relies on:
+    // 1. Immediate canonicalization and verification of path containment at every execution step.
+    // 2. Safe directory pre-removal and symlink-metadata checks preventing symlink dereferencing.
+    // 3. Re-checking source and destination containment within authorized root immediately before rename/copy.
+    let (dir, _db, _vault) = temp_db("dynamic_toctou");
+    let authorized_root = dir.join("authorized");
+    let outside_forbidden = dir.join("forbidden");
+    fs::create_dir_all(&authorized_root).unwrap();
+    fs::create_dir_all(&outside_forbidden).unwrap();
+
+    let outside_secret = outside_forbidden.join("secret_keys.pem");
+    fs::write(&outside_secret, "PRIVATE KEY DATA").unwrap();
+
+    let valid_source = authorized_root.join("notes.txt");
+    fs::write(&valid_source, "My public notes").unwrap();
+
+    let planned_dest = authorized_root.join("subfolder/notes.txt");
+
+    let plan = OrganizationPlan {
+        plan_id: "plan_race_test".to_string(),
+        target_directory: authorized_root.clone(),
+        total_scanned: 1,
+        duplicates_count: 0,
+        conflicts_count: 0,
+        operations: vec![PlannedFileOp {
+            source_path: valid_source.clone(),
+            destination_path: planned_dest.clone(),
+            category: "Documents".to_string(),
+            reason: "Organize notes".to_string(),
+            file_size: 15,
+            file_hash: None,
+            is_duplicate: false,
+            duplicate_of: None,
+            conflict: None,
+        }],
+    };
+
+    // Simulate TOCTOU race: an attacker creates a symlink at the destination parent pointing to outside_forbidden
+    #[cfg(unix)]
+    {
+        let subfolder_link = authorized_root.join("subfolder");
+        std::os::unix::fs::symlink(&outside_forbidden, &subfolder_link).unwrap();
+
+        // Execution must detect that the destination resolves through a symlink outside authorized root!
+        let result = FileOrganizer::execute(&plan).unwrap();
+        assert_eq!(result.operations.len(), 1);
+        assert_eq!(result.operations[0].status, "failed");
+        assert!(result.operations[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Security rejection"));
+
+        // Verify the forbidden directory did not receive the file
+        assert!(!outside_forbidden.join("notes.txt").exists());
+        // Verify original source still exists
+        assert!(valid_source.exists());
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_file_organizer_undo_containment_and_overwrite_safety() {
+    let (dir, _db, _vault) = temp_db("undo_containment");
+    let root = dir.join("root");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+
+    let organized_file = root.join("category/file.txt");
+    fs::create_dir_all(organized_file.parent().unwrap()).unwrap();
+    fs::write(&organized_file, "Organized text").unwrap();
+
+    // 1. Transaction trying to rollback to an outside directory escapes authorized root -> rejected
+    let mut bad_tx = OrganizationTransaction {
+        transaction_id: "tx_bad".to_string(),
+        created_at: 1000,
+        target_directory: root.to_string_lossy().to_string(),
+        status: "completed".to_string(),
+        operations: vec![OrganizationOpRecord {
+            source_path: outside.join("file.txt").to_string_lossy().to_string(), // tries to escape root
+            destination_path: organized_file.to_string_lossy().to_string(),
+            file_size: 14,
+            file_hash: String::new(),
+            status: "completed".to_string(),
+            error: None,
+        }],
+    };
+    let reversed = FileOrganizer::undo(&mut bad_tx).unwrap();
+    assert_eq!(reversed, 0);
+    assert!(bad_tx.operations[0]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("escapes authorized target directory"));
+
+    // 2. Transaction where original location already has a file -> overwrite guard prevents undo clobbering
+    let orig_in_root = root.join("file.txt");
+    fs::write(
+        &orig_in_root,
+        "Existing original file that shouldn't be overwritten",
+    )
+    .unwrap();
+    let mut clobber_tx = OrganizationTransaction {
+        transaction_id: "tx_clobber".to_string(),
+        created_at: 1000,
+        target_directory: root.to_string_lossy().to_string(),
+        status: "completed".to_string(),
+        operations: vec![OrganizationOpRecord {
+            source_path: orig_in_root.to_string_lossy().to_string(),
+            destination_path: organized_file.to_string_lossy().to_string(),
+            file_size: 14,
+            file_hash: String::new(),
+            status: "completed".to_string(),
+            error: None,
+        }],
+    };
+    let reversed_clobber = FileOrganizer::undo(&mut clobber_tx).unwrap();
+    assert_eq!(reversed_clobber, 0);
+    assert!(clobber_tx.operations[0]
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("occupied"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_unicode_multibyte_document_explanation_safety() {
+    let dir = std::env::temp_dir().join(format!("kyro_unicode_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+
+    let doc_path = dir.join("multilingual_contract.txt");
+    let content = "KYRO GLOBAL AGREEMENT 🚀\n\
+                   Café de la Paix: Résumé des engagements financiers.\n\
+                   Russian section: Привет мир! Безопасность данных гарантирована.\n\
+                   Japanese section: 日本語の文書データとAI解析.\n\
+                   German: Übergröße für besondere Anforderungen.\n\
+                   Key Clause: Action required before 2026-11-15.";
+    fs::write(&doc_path, content).unwrap();
+
+    // 1. Emoji passage
+    let expl_emoji = FileAssistant::explain_passage(&doc_path, "KYRO GLOBAL AGREEMENT 🚀");
+    assert!(expl_emoji.is_ok(), "Multibyte emoji passage must not panic");
+    assert!(expl_emoji.unwrap().contains("Plain Language Explanation"));
+
+    // 2. Accented passage
+    let expl_accents = FileAssistant::explain_passage(&doc_path, "Café de la Paix: Résumé");
+    assert!(expl_accents.is_ok(), "Accented passage must not panic");
+
+    // 3. Cyrillic passage
+    let expl_cyrillic = FileAssistant::explain_passage(&doc_path, "Привет мир!");
+    assert!(expl_cyrillic.is_ok(), "Cyrillic passage must not panic");
+
+    // 4. Japanese CJK passage
+    let expl_cjk = FileAssistant::explain_passage(&doc_path, "日本語の文書データ");
+    assert!(expl_cjk.is_ok(), "CJK passage must not panic");
+
+    // 5. Umlaut passage
+    let expl_umlaut = FileAssistant::explain_passage(&doc_path, "Übergröße");
+    assert!(expl_umlaut.is_ok(), "German umlaut passage must not panic");
+
+    // 6. Grounding rejection on missing excerpt
+    let err_missing = FileAssistant::explain_passage(&doc_path, "Non-existent clause xyz 123");
+    assert!(err_missing.is_err());
+    assert!(err_missing
+        .unwrap_err()
+        .contains("Passage not found in document"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_startup_reconciliation_cleans_running_routine_runs() {
+    let (dir, db, _vault) = temp_db("startup_reconcile");
+
+    let routine = RoutineRecord {
+        id: "rt_recon".to_string(),
+        name: "Backup Routine".to_string(),
+        cron_expression: "0 0 * * *".to_string(),
+        action_type: "prompt".to_string(),
+        target_id: "backup".to_string(),
+        enabled: true,
+        last_run: None,
+        next_run: None,
+    };
+    db.create_routine(&routine).unwrap();
+
+    let running_run = RoutineRunRecord {
+        id: "run_stuck".to_string(),
+        routine_id: "rt_recon".to_string(),
+        routine_name: "Backup Routine".to_string(),
+        status: "running".to_string(),
+        started_at: 1000,
+        completed_at: None,
+        summary: None,
+        error: None,
+    };
+    let completed_run = RoutineRunRecord {
+        id: "run_done".to_string(),
+        routine_id: "rt_recon".to_string(),
+        routine_name: "Backup Routine".to_string(),
+        status: "succeeded".to_string(),
+        started_at: 500,
+        completed_at: Some(600),
+        summary: Some("Done".to_string()),
+        error: None,
+    };
+
+    db.record_routine_run(&running_run).unwrap();
+    db.record_routine_run(&completed_run).unwrap();
+
+    // Reconcile on startup
+    let count = db.reconcile_active_runs_on_startup().unwrap();
+    assert!(count >= 1, "Must reconcile at least 1 interrupted run");
+
+    let runs = db.list_runs_for_routine("rt_recon", 10).unwrap();
+    let stuck = runs.iter().find(|r| r.id == "run_stuck").unwrap();
+    assert_eq!(stuck.status, "interrupted");
+    assert!(stuck.completed_at.is_some());
+    assert!(stuck
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("Process terminated unexpectedly"));
+
+    let done = runs.iter().find(|r| r.id == "run_done").unwrap();
+    assert_eq!(done.status, "succeeded");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_oauth_refresh_transient_vs_permanent_classification() {
+    // Transient errors -> must NOT trigger needs_reauth
+    let transient_cases = [
+        "Connection refused (os error 111)",
+        "dns error: failed to lookup address information",
+        "operation timed out after 30000ms",
+        "HTTP 429 Too Many Requests: Rate limit exceeded",
+        "HTTP 502 Bad Gateway",
+        "HTTP 503 Service Unavailable",
+        "HTTP 504 Gateway Timeout",
+        "network unreachable",
+    ];
+
+    for err in transient_cases {
+        assert!(
+            !ConnectorManager::is_permanent_refresh_error(err),
+            "Error '{}' should be classified as transient, not permanent",
+            err
+        );
+    }
+
+    // Permanent errors -> must trigger needs_reauth
+    let permanent_cases = [
+        "HTTP 400 Bad Request: invalid_grant: Token has been expired or revoked",
+        "unauthorized_client: The OAuth client is not authorized",
+        "access_denied: The user has revoked access to this application",
+        "HTTP 401 Unauthorized: token has been expired",
+        "HTTP 403 Forbidden: invalid_scope",
+        "status 400: invalid_grant",
+        "status 401: unauthorized",
+    ];
+
+    for err in permanent_cases {
+        assert!(
+            ConnectorManager::is_permanent_refresh_error(err),
+            "Error '{}' should be classified as permanent reauth requirement",
+            err
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_calendar_invalid_timezone_rejection_and_working_hours() {
+    let (_dir, _db, vault) = temp_db("cal_tz");
+    let adapter = GoogleAdapter::new();
+    let account = ConnectedAccountRecord {
+        id: "conn_cal_tz".to_string(),
+        connector_id: "google".to_string(),
+        account_identifier: "user@example.com".to_string(),
+        display_name: "Google (User)".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "cred_test".to_string(),
+        config_json: "{}".to_string(),
+        created_at: 0,
+        updated_at: 0,
+        last_connected_at: None,
+        last_error: None,
+        expires_at: None,
+    };
+    vault.set_secret("cred_test", "mock_bearer_token").unwrap();
+
+    // 1. Invalid timezone string -> rejected before any network call
+    let bad_tz_args = serde_json::json!({
+        "date": "2026-10-30",
+        "timezone": "Not/A_Real_Timezone_Name",
+    });
+    let err_tz = adapter
+        .execute_tool(&account, "calendar_find_meeting_times", bad_tz_args, &vault)
+        .await;
+    assert!(err_tz.is_err());
+    assert!(err_tz.unwrap_err().contains("Invalid timezone"));
+
+    // 2. Inverted working hours (start >= end) -> rejected
+    let bad_hours_args = serde_json::json!({
+        "date": "2026-10-30",
+        "timezone": "America/New_York",
+        "work_start_hour": 18,
+        "work_end_hour": 9,
+    });
+    let err_hours = adapter
+        .execute_tool(
+            &account,
+            "calendar_find_meeting_times",
+            bad_hours_args,
+            &vault,
+        )
+        .await;
+    assert!(err_hours.is_err());
+    assert!(err_hours
+        .unwrap_err()
+        .contains("work_start_hour (18) must be less than work_end_hour (9)"));
+}
+
+#[test]
+fn test_nl_routine_clarification_for_ambiguous_prompts() {
+    // 1. Time only without frequency -> needs clarification
+    let res_time_only =
+        natural_language_to_routine("At 9am find invoices in Downloads".to_string()).unwrap();
+    assert!(res_time_only.needs_clarification);
+    assert!(res_time_only.requires_confirmation);
+    assert!(res_time_only
+        .clarification_prompt
+        .as_ref()
+        .unwrap()
+        .contains("without indicating recurrence"));
+
+    // 2. Monthly without specific day -> needs clarification
+    let res_monthly =
+        natural_language_to_routine("Every month summarize my expenses".to_string()).unwrap();
+    assert!(res_monthly.needs_clarification);
+    assert!(res_monthly.requires_confirmation);
+    assert!(res_monthly
+        .clarification_prompt
+        .as_ref()
+        .unwrap()
+        .contains("day of the month"));
+
+    // 3. Complete explicit prompt -> no clarification needed
+    let res_complete =
+        natural_language_to_routine("Every Friday at 5pm organize my downloads".to_string())
+            .unwrap();
+    assert!(!res_complete.needs_clarification);
+    assert_eq!(res_complete.cron_expression, "0 17 * * 5");
+}
+
+#[test]
+fn test_revoked_folder_and_prune_removes_authorization_and_indexed_data() {
+    let (dir, db, _vault) = temp_db("revoke_and_prune");
+    let folder = dir.join("personal_docs");
+    fs::create_dir_all(&folder).unwrap();
+
+    let doc = folder.join("tax_return.pdf");
+    fs::write(&doc, "Tax Return 2026 Sensitive Financial Data").unwrap();
+
+    let auth = AuthorizedFolderRecord {
+        id: "auth_tax".to_string(),
+        path: folder.to_string_lossy().to_string(),
+        display_name: "Tax Folder".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&auth).unwrap();
+
+    let index_rec = DocumentIndexRecord {
+        path: doc.to_string_lossy().to_string(),
+        file_name: "tax_return.pdf".to_string(),
+        format: "pdf".to_string(),
+        size_bytes: 40,
+        modified_at: 1000,
+        sha256: "taxhash".to_string(),
+        extracted_text: Some("Tax Return 2026 Sensitive Financial Data".to_string()),
+        indexed_at: 1000,
+    };
+    db.upsert_indexed_document(&index_rec).unwrap();
+
+    // Verification: document is accessible
+    assert!(db
+        .get_indexed_document(&doc.to_string_lossy())
+        .unwrap()
+        .is_some());
+
+    // Revoke and prune atomically
+    let removed = db.remove_authorized_folder_and_prune(&auth.id).unwrap();
+    assert!(removed, "Tax return document and folder must be pruned");
+
+    // Verification: folder authorization is revoked
+    assert!(db.list_authorized_folders().unwrap().is_empty());
+
+    // Verification: get_indexed_document fails closed
+    assert!(db
+        .get_indexed_document(&doc.to_string_lossy())
+        .unwrap()
+        .is_none());
+
+    // Verification: document_index has 0 records
+    assert!(db.list_indexed_documents().unwrap().is_empty());
 
     fs::remove_dir_all(&dir).ok();
 }

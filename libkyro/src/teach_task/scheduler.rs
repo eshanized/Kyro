@@ -101,7 +101,7 @@ impl RoutineScheduler {
         let (clean_expr, inline_tz) = Self::extract_timezone(expr);
         let tz_name = tz_override.or(inline_tz.as_deref()).unwrap_or("UTC");
 
-        let tz: chrono_tz::Tz = tz_name.parse().unwrap_or(chrono_tz::UTC);
+        let tz: chrono_tz::Tz = tz_name.parse().ok()?;
         let sched = Self::parse_schedule(&clean_expr).ok()?;
         let now_in_tz = chrono::Utc::now().with_timezone(&tz);
 
@@ -354,7 +354,20 @@ impl RoutineScheduler {
             ),
             parent_run_id: None,
         };
-        let _ = db.create_run(&agent_run);
+        if let Err(e) = db.create_run(&agent_run) {
+            log::error!("[Scheduler] Failed to create initial agent run: {}", e);
+            let _ = db.update_routine_run(
+                &run_id,
+                "failed",
+                start_time,
+                Some("Failed to create agent run record in database"),
+                Some(&e.to_string()),
+            );
+            return Err(format!(
+                "Database persistence error creating initial agent run: {}",
+                e
+            ));
+        }
 
         // 3. Execution setup
         let cancel_token = CancellationToken::new();
@@ -512,27 +525,44 @@ impl RoutineScheduler {
         };
 
         // 4. Update terminal status truthfully in SQLite
-        if let Err(e) = db.update_routine_run(
+        let routine_update_res = db.update_routine_run(
             &run_id,
             &status,
             completed_at,
             summary.as_deref(),
             error.as_deref(),
-        ) {
+        );
+        let agent_update_res =
+            db.update_run_status(&run_id, &status, None, Some(completed_at), error.as_deref());
+        let last_run_res = db.update_routine_last_run(&latest_routine.id, start_time);
+
+        if let Err(e) = routine_update_res {
             log::error!(
-                "[Scheduler] Failed to update routine run status in SQLite: {}",
+                "[Scheduler] Critical failure: unable to persist routine run terminal status in SQLite: {}",
                 e
             );
+            return Err(format!(
+                "Durable persistence failure for routine run: {}",
+                e
+            ));
         }
-        if let Err(e) =
-            db.update_run_status(&run_id, &status, None, Some(completed_at), error.as_deref())
-        {
+        if let Err(e) = agent_update_res {
             log::error!(
-                "[Scheduler] Failed to update agent run status in SQLite: {}",
+                "[Scheduler] Critical failure: unable to persist agent run terminal status in SQLite: {}",
                 e
             );
+            return Err(format!("Durable persistence failure for agent run: {}", e));
         }
-        let _ = db.update_routine_last_run(&latest_routine.id, start_time);
+        if let Err(e) = last_run_res {
+            log::error!(
+                "[Scheduler] Critical failure: unable to update routine last-run metadata in SQLite: {}",
+                e
+            );
+            return Err(format!(
+                "Durable persistence failure updating routine last-run metadata: {}",
+                e
+            ));
+        }
 
         let final_record = RoutineRunRecord {
             id: run_id,

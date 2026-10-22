@@ -718,6 +718,31 @@ impl ConnectorManager {
         tools
     }
 
+    /// Classify whether an OAuth token refresh error is permanent (revocation, expired token, invalid scope)
+    /// versus transient (network glitch, connection reset, timeout, rate limit).
+    pub fn is_permanent_refresh_error(err_msg: &str) -> bool {
+        let err_lower = err_msg.to_lowercase();
+        (err_lower.contains("invalid_grant")
+            || err_lower.contains("invalid_client")
+            || err_lower.contains("unauthorized_client")
+            || err_lower.contains("access_denied")
+            || err_lower.contains("invalid_scope")
+            || err_lower.contains("revoked")
+            || err_lower.contains("token has been expired")
+            || err_lower.contains("status 400")
+            || err_lower.contains("status: 400")
+            || err_lower.contains("status 401")
+            || err_lower.contains("status: 401")
+            || err_lower.contains("status 403")
+            || err_lower.contains("status: 403")
+            || err_lower.contains("status 404")
+            || err_lower.contains("status: 404")
+            || err_lower.contains("not found")
+            || err_lower.contains("bad_verification_code"))
+            && !err_lower.contains("rate limit")
+            && !err_lower.contains("429")
+    }
+
     /// Perform serialized refresh token rotation for an account
     pub async fn refresh_account_token(&self, account_id: &str) -> Result<String, String> {
         let lock = {
@@ -835,34 +860,32 @@ impl ConnectorManager {
         let refreshed = match refresh_result {
             Ok(r) => r,
             Err(e) => {
-                let err_msg = format!("OAuth token refresh failed: {}", e);
-                let err_lower = err_msg.to_lowercase();
-                let is_transient = (err_lower.contains("status 5")
-                    || err_lower.contains("status: 5")
-                    || err_lower.contains("timeout")
-                    || err_lower.contains("timed out")
-                    || err_lower.contains("connection refused")
-                    || err_lower.contains("dns")
-                    || err_lower.contains("temporarily unavailable")
-                    || err_lower.contains("rate limit")
-                    || err_lower.contains("429"))
-                    && !err_lower.contains("invalid_grant")
-                    && !err_lower.contains("revoked")
-                    && !err_lower.contains("expired");
+                let mut err_msg = format!("OAuth token refresh failed: {}", e);
+                // Sanitize secrets from error message
+                if let Some(sec) = client_secret {
+                    if !sec.is_empty() {
+                        err_msg = err_msg.replace(sec, "<REDACTED_SECRET>");
+                    }
+                }
+                if !refresh_tok.is_empty() {
+                    err_msg = err_msg.replace(refresh_tok, "<REDACTED_TOKEN>");
+                }
 
-                if is_transient {
+                let is_permanent = Self::is_permanent_refresh_error(&err_msg);
+
+                if is_permanent {
                     let _ = self.db.update_connected_account_status(
                         account_id,
-                        "error",
-                        Some("Transient failure refreshing OAuth token"),
+                        "needs_reauth",
+                        Some("Reauthorization required: OAuth refresh token has expired or was revoked"),
                         Some(&err_msg),
                         Some(now),
                     );
                 } else {
                     let _ = self.db.update_connected_account_status(
                         account_id,
-                        "needs_reauth",
-                        Some("Reauthorization required: OAuth refresh token has expired or is invalid"),
+                        "error",
+                        Some("Transient failure refreshing OAuth token"),
                         Some(&err_msg),
                         Some(now),
                     );
@@ -890,7 +913,14 @@ impl ConnectorManager {
         if expires_at_opt.is_some() {
             updated_account.expires_at = expires_at_opt;
         }
-        let _ = self.db.update_connected_account(&updated_account);
+        self.db
+            .update_connected_account(&updated_account)
+            .map_err(|e| {
+                format!(
+                    "Failed to update account in database after token refresh: {}",
+                    e
+                )
+            })?;
 
         Ok(refreshed.access_token)
     }

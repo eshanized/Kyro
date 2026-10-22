@@ -806,7 +806,8 @@ impl FileAssistant {
             "rename" | "move" => {
                 let dest = destination
                     .ok_or_else(|| "Destination path is required for rename/move.".to_string())?;
-                if dest.exists() && !confirm_destructive {
+                let dest_exists = dest.exists() || fs::symlink_metadata(dest).is_ok();
+                if dest_exists && !confirm_destructive {
                     return Ok(SafeFileOpResult {
                         operation: operation.to_string(),
                         source_path: source.to_string_lossy().to_string(),
@@ -826,14 +827,30 @@ impl FileAssistant {
                         .map_err(|e| format!("Failed to create destination directory: {}", e))?;
                 }
 
-                fs::rename(source, dest).map_err(|e| {
-                    format!(
-                        "Failed to move file '{}' to '{}': {}",
-                        source.display(),
-                        dest.display(),
-                        e
-                    )
-                })?;
+                // If dest exists and confirmation was given, safely remove it first so we don't write through symlinks
+                if dest_exists {
+                    if dest.is_dir() {
+                        return Err(format!(
+                            "Destination '{}' is a directory; cannot overwrite a directory with a file.",
+                            dest.display()
+                        ));
+                    }
+                    let _ = fs::remove_file(dest);
+                }
+
+                fs::rename(source, dest)
+                    .or_else(|_| {
+                        // Fallback for cross-filesystem moves
+                        fs::copy(source, dest).and_then(|_| fs::remove_file(source))
+                    })
+                    .map_err(|e| {
+                        format!(
+                            "Failed to move file '{}' to '{}': {}",
+                            source.display(),
+                            dest.display(),
+                            e
+                        )
+                    })?;
 
                 Ok(SafeFileOpResult {
                     operation: operation.to_string(),
@@ -852,9 +869,35 @@ impl FileAssistant {
             "copy" => {
                 let dest = destination
                     .ok_or_else(|| "Destination path is required for copy.".to_string())?;
+                let dest_exists = dest.exists() || fs::symlink_metadata(dest).is_ok();
+                if dest_exists && !confirm_destructive {
+                    return Ok(SafeFileOpResult {
+                        operation: "copy".to_string(),
+                        source_path: source.to_string_lossy().to_string(),
+                        destination_path: Some(dest.to_string_lossy().to_string()),
+                        success: false,
+                        requires_confirmation: true,
+                        message: format!(
+                            "Destination '{}' already exists. Overwrite requires confirmation.",
+                            dest.display()
+                        ),
+                        undoable: false,
+                    });
+                }
+
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+                }
+
+                if dest_exists {
+                    if dest.is_dir() {
+                        return Err(format!(
+                            "Destination '{}' is a directory; cannot overwrite a directory with a file.",
+                            dest.display()
+                        ));
+                    }
+                    let _ = fs::remove_file(dest);
                 }
 
                 fs::copy(source, dest).map_err(|e| format!("Failed to copy file: {}", e))?;
@@ -1039,7 +1082,58 @@ impl FileAssistant {
         })
     }
 
+    /// Locates a passage within text using exact match or character-by-character Unicode case-insensitive matching,
+    /// returning the exact `(start_byte, end_byte)` character boundaries within `text`.
+    pub fn find_unicode_passage(text: &str, query: &str) -> Option<(usize, usize)> {
+        let q_trimmed = query.trim();
+        if q_trimmed.is_empty() {
+            return None;
+        }
+
+        // 1. Try exact byte-level substring match first
+        if let Some(idx) = text.find(q_trimmed) {
+            return Some((idx, idx + q_trimmed.len()));
+        }
+
+        // 2. Character-by-character case-folded matching preserving exact text char boundaries
+        let q_folded: Vec<char> = q_trimmed.chars().flat_map(|c| c.to_lowercase()).collect();
+        if q_folded.is_empty() {
+            return None;
+        }
+
+        for (start_byte, _) in text.char_indices() {
+            let mut text_char_iter = text[start_byte..].char_indices();
+            let mut match_len_bytes = 0;
+            let mut matched = true;
+
+            for &expected_c in &q_folded {
+                if let Some((_, text_c)) = text_char_iter.next() {
+                    let mut text_c_folded = text_c.to_lowercase();
+                    if text_c_folded.next() != Some(expected_c) {
+                        matched = false;
+                        break;
+                    }
+                    match_len_bytes += text_c.len_utf8();
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                let end_byte = start_byte + match_len_bytes;
+                if text.is_char_boundary(start_byte) && text.is_char_boundary(end_byte) {
+                    return Some((start_byte, end_byte));
+                }
+            }
+        }
+
+        None
+    }
+
     /// Explain a specific passage in simple, ordinary language grounded in document content.
+    /// Strictly guarantees UTF-8 character boundary safety to eliminate any panics on Unicode,
+    /// emoji, accents, or non-Latin text.
     pub fn explain_passage(doc_path: &Path, passage: &str) -> Result<String, String> {
         let (text, metadata) = DocumentAssistant::extract_text(doc_path)?;
         let p_trimmed = passage.trim();
@@ -1048,45 +1142,58 @@ impl FileAssistant {
             return Err("Passage to explain cannot be empty.".to_string());
         }
 
-        let text_lower = text.to_lowercase();
-        let p_lower = p_trimmed.to_lowercase();
-        let found_idx = text_lower.find(&p_lower);
+        let (match_start, match_end) = match Self::find_unicode_passage(&text, p_trimmed) {
+            Some(bounds) => bounds,
+            None => {
+                return Err(format!(
+                    "Passage not found in document '{}': '{}'. Please select or provide an excerpt that actually appears in the document.",
+                    metadata.file_name, p_trimmed
+                ));
+            }
+        };
 
-        if found_idx.is_none() {
-            return Err(format!(
-                "Passage not found in document '{}': '{}'. Please select or provide an excerpt that actually appears in the document.",
-                metadata.file_name, p_trimmed
-            ));
-        }
+        // Determine context window using valid UTF-8 character boundaries (avoiding arbitrary byte slicing)
+        let ctx_start = text[..match_start]
+            .char_indices()
+            .rev()
+            .take(120)
+            .last()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
 
-        let idx = found_idx.unwrap();
-        let ctx_start = idx.saturating_sub(100);
-        let ctx_end = (idx + p_trimmed.len() + 100).min(text.len());
+        let ctx_end = text[match_end..]
+            .char_indices()
+            .take(120)
+            .last()
+            .map(|(offset, ch)| match_end + offset + ch.len_utf8())
+            .unwrap_or(text.len());
+
         let context_slice = text[ctx_start..ctx_end].trim();
+        let exact_passage = &text[match_start..match_end];
 
-        let dates_in_passage = DocumentAssistant::extract_dates(p_trimmed);
-        let action_items_in_passage = DocumentAssistant::extract_action_items(p_trimmed);
+        let dates_in_passage = DocumentAssistant::extract_dates(exact_passage);
+        let action_items_in_passage = DocumentAssistant::extract_action_items(exact_passage);
 
         let mut explanation = format!(
-            "### Plain Language Explanation of Passage from {}\n\n**Quoted Excerpt:**\n> \"{}\"\n\n**Surrounding Context in Source:**\n> \"...{}...\"\n\n",
-            metadata.file_name, p_trimmed, context_slice
+            "### Plain Language Explanation of Passage from {}\n\n**Quoted Excerpt (Verified Source):**\n> \"{}\"\n\n**Surrounding Context in Source:**\n> \"...{}...\"\n\n",
+            metadata.file_name, exact_passage, context_slice
         );
 
-        explanation.push_str("#### Key Points & Core Meaning:\n");
+        explanation.push_str("#### Source-Supported Interpretation:\n");
         explanation.push_str(&format!(
-            "- **Statement**: The source explicitly states: \"{}\"\n",
-            p_trimmed
+            "- **Verified Statement**: The document explicitly states: \"{}\"\n",
+            exact_passage
         ));
 
         if !dates_in_passage.is_empty() {
-            explanation.push_str("- **Key Dates Mentioned**:\n");
+            explanation.push_str("- **Verified Dates / Deadlines Mentioned**:\n");
             for d in &dates_in_passage {
                 explanation.push_str(&format!("  - `{}` ({})\n", d.raw_date, d.context));
             }
         }
 
         if !action_items_in_passage.is_empty() {
-            explanation.push_str("- **Actionable Obligations**:\n");
+            explanation.push_str("- **Explicit Obligations / Action Items**:\n");
             for item in &action_items_in_passage {
                 explanation.push_str(&format!(
                     "  - {} [Priority: {}]\n",
@@ -1096,7 +1203,27 @@ impl FileAssistant {
         }
 
         explanation.push_str("\n#### Plain-English Breakdown:\n");
-        explanation.push_str("This excerpt describes the core rule or statement made in the document. It lays out expectations, deliverables, or criteria in everyday terms without confusing jargon.");
+        let sentences: Vec<&str> = exact_passage
+            .split(&['.', ';', '\n'][..])
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if sentences.is_empty() {
+            explanation.push_str(&format!(
+                "The selected excerpt establishes: \"{}\". This excerpt conveys specific operational criteria directly defined in the text.",
+                exact_passage
+            ));
+        } else {
+            for (i, sent) in sentences.iter().enumerate() {
+                explanation.push_str(&format!(
+                    "{}. **Clause**: \"{}\" — Sets forth specific conditions and scope defined in the source document.\n",
+                    i + 1, sent
+                ));
+            }
+        }
+
+        explanation.push_str("\n*Note: All statements above are strictly grounded in the document excerpt. Interpretations are limited to plain-English clarification of the source text.*");
 
         Ok(explanation)
     }

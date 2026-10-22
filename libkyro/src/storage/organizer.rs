@@ -540,6 +540,9 @@ impl FileOrganizer {
             return Err("Transaction has already been undone.".to_string());
         }
 
+        let canonical_root = fs::canonicalize(&transaction.target_directory)
+            .map_err(|e| format!("Target directory cannot be canonicalized: {}", e))?;
+
         let mut reversed_count = 0;
         let mut dirs_to_prune: HashSet<PathBuf> = HashSet::new();
 
@@ -560,9 +563,28 @@ impl FileOrganizer {
                 continue;
             }
 
+            // Canonicalize destination and verify containment within authorized root
+            let canon_dest = match fs::canonicalize(&dest_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    op.error = Some(format!(
+                        "Cannot undo: destination file cannot be canonicalized: {}",
+                        e
+                    ));
+                    continue;
+                }
+            };
+            if !canon_dest.starts_with(&canonical_root) {
+                op.error = Some(
+                    "Security rejection: destination escapes authorized target directory"
+                        .to_string(),
+                );
+                continue;
+            }
+
             // Verify content hash before reversing to ensure file wasn't modified after move
             if !op.file_hash.is_empty() {
-                if let Ok(current_hash) = Self::compute_sha256(&dest_path) {
+                if let Ok(current_hash) = Self::compute_sha256(&canon_dest) {
                     if current_hash != op.file_hash {
                         op.error = Some(format!(
                             "Cannot undo: file at '{}' has been modified since organization (hash mismatch)",
@@ -573,20 +595,42 @@ impl FileOrganizer {
                 }
             }
 
-            // Verify original location is clear
-            if orig_path.exists() {
+            // Verify original parent directory and containment within authorized root
+            if let Some(parent) = orig_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    op.error = Some(format!("Cannot create original directory: {}", e));
+                    continue;
+                }
+                match fs::canonicalize(parent) {
+                    Ok(canon_parent) => {
+                        if !canon_parent.starts_with(&canonical_root) {
+                            op.error = Some(
+                                "Security rejection: original path escapes authorized target directory"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        op.error = Some(format!(
+                            "Original parent directory cannot be canonicalized: {}",
+                            e
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            // Verify original location is clear (checking both file existence and symlink metadata)
+            if orig_path.exists() || fs::symlink_metadata(&orig_path).is_ok() {
                 op.error = Some(format!(
-                    "Cannot undo: original path '{}' is now occupied by another file",
+                    "Cannot undo: original path '{}' is now occupied by another file or symlink",
                     orig_path.display()
                 ));
                 continue;
             }
 
-            if let Some(parent) = orig_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-
-            match fs::rename(&dest_path, &orig_path) {
+            match fs::rename(&canon_dest, &orig_path) {
                 Ok(_) => {
                     op.status = "undone".to_string();
                     reversed_count += 1;
@@ -596,8 +640,8 @@ impl FileOrganizer {
                 }
                 Err(e) => {
                     // Fallback copy + remove
-                    if fs::copy(&dest_path, &orig_path).is_ok()
-                        && fs::remove_file(&dest_path).is_ok()
+                    if fs::copy(&canon_dest, &orig_path).is_ok()
+                        && fs::remove_file(&canon_dest).is_ok()
                     {
                         op.status = "undone".to_string();
                         reversed_count += 1;

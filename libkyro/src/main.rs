@@ -52,7 +52,9 @@ fn main() {
         .setup(move |_app| {
             // Prune un-authorized or stale indexed documents on startup
             if let Ok(folders) = db.list_authorized_folders() {
-                let _ = db.prune_unauthorized_indexed_documents(&folders);
+                if let Err(e) = db.prune_unauthorized_indexed_documents(&folders) {
+                    log::error!("[Startup] Failed to prune unauthorized documents: {}", e);
+                }
             }
             RoutineScheduler::start_worker(
                 db.clone(),

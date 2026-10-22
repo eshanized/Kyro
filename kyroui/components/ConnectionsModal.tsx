@@ -737,12 +737,14 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                               className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
                                 acc.status === "connected"
                                   ? "bg-neutral-800 text-neutral-200 border-neutral-600"
+                                  : acc.status === "needs_reauth"
+                                  ? "bg-amber-600/20 text-amber-300 border-amber-500/30"
                                   : acc.status === "error"
                                   ? "bg-red-600/20 text-red-300 border-red-500/30"
                                   : "bg-neutral-800 text-neutral-400 border-neutral-700"
                               }`}
                             >
-                              {acc.status.toUpperCase()}
+                              {acc.status === "needs_reauth" ? "NEEDS REAUTH" : acc.status.toUpperCase()}
                             </span>
                           </div>
                         </div>
@@ -791,6 +793,22 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                       </div>
 
                       <div className="flex items-center gap-2 w-full md:w-auto justify-end">
+                        {acc.status === "needs_reauth" && (
+                          <button
+                            onClick={() => {
+                              const catItem = catalog.find((c) => c.id === acc.connector_id);
+                              if (catItem) {
+                                handleOpenConnect(catItem);
+                              } else {
+                                showMessage(`Reauthorization required for ${acc.display_name}.`, "error");
+                              }
+                            }}
+                            className="px-3 py-1.5 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/30 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
+                            title="Re-authenticate this account"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5 text-amber-300" /> Reauthorize
+                          </button>
+                        )}
                         <button
                           onClick={() => handleTestConnection(acc.id)}
                           className="px-3 py-1.5 bg-[#0a0a0a] hover:bg-neutral-800 border border-[#262626] text-neutral-300 rounded-lg text-xs flex items-center gap-1.5 transition"

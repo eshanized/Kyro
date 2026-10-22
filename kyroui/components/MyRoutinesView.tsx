@@ -24,6 +24,28 @@ interface MyRoutinesViewProps {
   onAskPrompt?: (prompt: string) => void;
 }
 
+function formatCronDescription(cron: string): string {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length < 5) return cron;
+  const [min, hour, dom, , dow] = parts;
+  if (cron === "* * * * *") return "Every minute";
+  if (cron === "0 * * * *") return "Every hour at minute 0";
+  if (cron === "0 9 * * *") return "Every day at 9:00 AM";
+  if (cron === "0 9 * * 1-5") return "Weekdays (Monday to Friday) at 9:00 AM";
+  if (cron === "0 9 * * 5") return "Every Friday at 9:00 AM";
+  if (cron === "0 0 1 * *") return "First day of every month at midnight";
+  if (cron === "0 9 1 * *") return "First day of every month at 9:00 AM";
+  if (cron === "0 0 1 1 *") return "Single manual trigger / run once on request";
+
+  const timeStr = `${hour.padStart(2, "0")}:${min.padStart(2, "0")}`;
+  if (dow === "1-5" && dom === "*") return `Weekdays (Mon-Fri) at ${timeStr}`;
+  if (dow === "*" && dom === "*") return `Every day at ${timeStr}`;
+  if (dom !== "*" && dow === "*") return `Day ${dom} of the month at ${timeStr}`;
+  if (dow === "5") return `Every Friday at ${timeStr}`;
+  if (dow === "1") return `Every Monday at ${timeStr}`;
+  return `Custom schedule (${cron}) at ${timeStr}`;
+}
+
 export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
   initialTab = "routines",
   onAskPrompt,
@@ -244,13 +266,73 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
             </div>
 
             {suggestion.needs_clarification && (
-              <div className="p-2.5 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-semibold block">Schedule Clarification:</span>
-                  <p className="text-[11px] text-amber-300 mt-0.5">
-                    {suggestion.clarification_prompt || "No recurring schedule was specified. You can customize the cron schedule below before saving."}
-                  </p>
+              <div className="p-3 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs space-y-2.5">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-semibold block text-amber-100">Schedule Clarification Required:</span>
+                    <p className="text-[11px] text-amber-300/90 mt-0.5">
+                      {suggestion.clarification_prompt ||
+                        "No recurring schedule was specified. Select a schedule below to activate this routine:"}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <span className="text-[11px] text-amber-400 font-medium">Quick select:</span>
+                  <button
+                    onClick={() => {
+                      const hourPart = suggestion.cron_expression.split(/\s+/)[1] || "9";
+                      const minPart = suggestion.cron_expression.split(/\s+/)[0] || "0";
+                      setSuggestion({
+                        ...suggestion,
+                        cron_expression: `${minPart} ${hourPart} * * *`,
+                        needs_clarification: false,
+                        explanation: `${suggestion.explanation} (Clarified: runs every day at ${hourPart}:${minPart.padStart(2, "0")})`,
+                      });
+                    }}
+                    className="px-2.5 py-1 bg-amber-900/40 hover:bg-amber-800/60 border border-amber-700/60 rounded text-xs text-amber-200 font-medium transition"
+                  >
+                    Every day
+                  </button>
+                  <button
+                    onClick={() => {
+                      const hourPart = suggestion.cron_expression.split(/\s+/)[1] || "9";
+                      const minPart = suggestion.cron_expression.split(/\s+/)[0] || "0";
+                      setSuggestion({
+                        ...suggestion,
+                        cron_expression: `${minPart} ${hourPart} * * 1-5`,
+                        needs_clarification: false,
+                        explanation: `${suggestion.explanation} (Clarified: runs weekdays Mon-Fri at ${hourPart}:${minPart.padStart(2, "0")})`,
+                      });
+                    }}
+                    className="px-2.5 py-1 bg-amber-900/40 hover:bg-amber-800/60 border border-amber-700/60 rounded text-xs text-amber-200 font-medium transition"
+                  >
+                    Weekdays only
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSuggestion({
+                        ...suggestion,
+                        cron_expression: "0 0 1 1 *",
+                        needs_clarification: false,
+                        explanation: `${suggestion.explanation} (Clarified: manual / run once on request)`,
+                      });
+                    }}
+                    className="px-2.5 py-1 bg-amber-900/40 hover:bg-amber-800/60 border border-amber-700/60 rounded text-xs text-amber-200 font-medium transition"
+                  >
+                    Run once
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSuggestion({
+                        ...suggestion,
+                        needs_clarification: false,
+                      });
+                    }}
+                    className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-neutral-600 rounded text-xs text-neutral-200 transition"
+                  >
+                    Accept Current Schedule
+                  </button>
                 </div>
               </div>
             )}
@@ -267,7 +349,12 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
               </div>
 
               <div>
-                <label className="text-[11px] text-neutral-400 block mb-0.5">Recurring Schedule (Cron Expression):</label>
+                <div className="flex items-center justify-between mb-0.5">
+                  <label className="text-[11px] text-neutral-400">Recurring Schedule (Cron Expression):</label>
+                  <span className="text-[11px] text-purple-300 font-medium">
+                    {formatCronDescription(suggestion.cron_expression)}
+                  </span>
+                </div>
                 <input
                   type="text"
                   value={suggestion.cron_expression}
@@ -312,8 +399,17 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
               </button>
               <button
                 onClick={handleSaveRoutine}
-                disabled={isSaving}
-                className="px-4 py-1.5 bg-neutral-100 hover:bg-white text-neutral-950 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+                disabled={isSaving || suggestion.needs_clarification}
+                title={
+                  suggestion.needs_clarification
+                    ? "Please select or confirm a schedule before saving"
+                    : "Save and schedule this routine"
+                }
+                className={`px-4 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm ${
+                  suggestion.needs_clarification
+                    ? "bg-neutral-800 text-neutral-500 cursor-not-allowed border border-neutral-700"
+                    : "bg-neutral-100 hover:bg-white text-neutral-950"
+                }`}
               >
                 {isSaving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                 Confirm & Schedule Routine

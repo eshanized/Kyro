@@ -170,15 +170,45 @@ This log chronicles the engineering remediation, feature completion, and verific
 - Added optional topic filter input in the Study Notes & Revision Flashcards tool.
 - Bound input to `generate_study_notes` IPC call with `topic: studyTopic.trim() || null`, enabling targeted study note generation and concept extraction.
 
-### 8. Verification Results
-- `cargo fmt --check`: Passed cleanly (0 formatting differences).
-- `cargo clippy --all-targets --all-features -- -D warnings`: Passed cleanly (0 warnings).
-- `cargo test --all-features`: 251 tests passed across all unit and integration test suites:
+### 8. Final Blockers Remediation & Verification Phase
+- **P0 Filesystem Authorization & Overwrite Safety**:
+  - Re-canonicalization and containment verification executed on both source and destination paths immediately before copy/move/undo operations.
+  - Hardened `FileAssistant::execute_safe_op` against silent destination clobbering: detects existing destinations via `exists()` and `symlink_metadata()` and requires explicit `confirm_destructive: true` confirmation before overwriting; safely pre-removes destinations when confirmed to avoid writing through symlinks.
+  - Documented POSIX TOCTOU boundary: kernel-level race resistance relies on containment verification right before syscalls and pre-removal of existing entries.
+  - Tested dynamic path replacement races in `test_dynamic_toctou_path_race_rejection_and_documentation`, move/copy collision in `test_filesystem_move_and_copy_destination_collision_and_confirm`, and undo containment/overwrite guards in `test_file_organizer_undo_containment_and_overwrite_safety`.
+- **P0 Routine Persistence Parity & Startup Reconciliation**:
+  - Unified routine runner in `RoutineScheduler::execute_routine_unified` verifies and propagates all initial agent run creation, terminal status persistence, and routine last-run metadata updates, never masking SQLite write failures as successes.
+  - Overhauled `Database::reconcile_active_runs_on_startup` to transition orphaned `routine_runs` with `status = 'running'` to `'interrupted'` with accurate timestamps and error descriptions, and included routine count in total reconciled records. Verified in `test_startup_reconciliation_cleans_running_routine_runs`.
+- **P1 OAuth State Handling & Account Lifecycle**:
+  - Overhauled `ConnectorManager::is_permanent_refresh_error`: permanent failures (`invalid_grant`, `invalid_client`, `unauthorized_client`, `access_denied`, `revoked`, `status 400`, `status 401`, `status 403`, `status 404`, `not found`) transition accounts to `needs_reauth`; transient errors (DNS, timeouts, connection refused, 429, 502, 503) transition accounts to `error` without clearing tokens.
+  - Redacted client secrets and refresh tokens from persisted error messages.
+  - Updated `ConnectionsModal.tsx` to render the canonical `NEEDS REAUTH` badge and actionable "Reauthorize" button. Tested in `test_oauth_refresh_transient_vs_permanent_classification` and vitest.
+- **P1 Timezone-Correct Calendar Availability**:
+  - Exposed `timezone`, `work_start_hour`, and `work_end_hour` in `calendar_find_meeting_times` tool schema.
+  - Added strict IANA timezone validation with `chrono_tz` and rejected inverted/invalid working hours (`start_hour >= end_hour`) before any network egress. Verified in `test_calendar_invalid_timezone_rejection_and_working_hours`.
+  - Added pagination safety check returning explicit incomplete-data error when maximum page bound is reached.
+- **P1 Unicode-Safe Document Grounding & Explanation**:
+  - Overhauled `FileAssistant::find_unicode_passage` and `explain_passage` to eliminate arbitrary byte slicing, using `char_indices()` to guarantee valid UTF-8 boundaries and character-by-character Unicode case-folded matching.
+  - Tested multilingual contracts with emoji (🚀), French accents (é), Cyrillic (Привет), Japanese CJK (日本語), and German umlauts (ü) in `test_unicode_multibyte_document_explanation_safety`.
+- **P1 Dashboard Truthfulness & Privacy Disclosures**:
+  - Updated `TodayDashboardView.tsx` to render explicit error banners for `calendar_error` and `email_error` with retry actions, eliminating deceptive empty states.
+  - Updated `MyRoutinesView.tsx` to disable routine scheduling when clarification is required, providing quick-clarification buttons ("Every day", "Weekdays only", "Run once") and plain English schedule previews. Tested in `test_nl_routine_clarification_for_ambiguous_prompts` and vitest.
+  - Updated `SettingsModal.tsx` privacy copy to accurately distinguish local file parsing and indexing from remote model inference over HTTPS.
+- **P1 Revoked-Folder Pruning & Fail-Closed Document Access**:
+  - Added `Database::remove_authorized_folder_and_prune` to atomically delete authorization records and purge un-authorized indexed document records and metadata.
+  - Hardened `get_indexed_document` with a fail-closed check returning `Ok(None)` if the requested document path is outside currently authorized folders. Tested in `test_revoked_folder_and_prune_removes_authorization_and_indexed_data`.
+
+### 9. Final End-to-End Verification Results
+- `cargo fmt --manifest-path libkyro/Cargo.toml --all -- --check`: **PASS** (clean, zero formatting differences).
+- `cargo clippy --manifest-path libkyro/Cargo.toml --all-targets --all-features -- -D warnings`: **PASS** (clean, zero warnings).
+- `cargo test --manifest-path libkyro/Cargo.toml --all-features`: **PASS** (325 total backend tests passed, 0 failed):
   - 146 unit tests in `libkyro/src/lib.rs`
-  - 18 everyday assistant tests in `libkyro/tests/everyday_assistant_tests.rs`
+  - 43 browser tests in `libkyro/tests/browser_tests.rs`
+  - 22 computer use tests in `libkyro/tests/computer_use_tests.rs`
   - 58 engine tests in `libkyro/tests/engine_tests.rs`
+  - 27 everyday assistant tests in `libkyro/tests/everyday_assistant_tests.rs`
   - 29 security tests in `libkyro/tests/security_tests.rs`
-- Vitest: 75/75 tests passed across 11 test suites.
-- TypeScript `tsc --noEmit`: 0 errors.
-- Vite production build: Built cleanly.
-- `make verify`: Full pipeline PASS.
+- Vitest suite (`npm test`): **PASS** (78 tests passed across 11 suites, 0 failed).
+- TypeScript compiler (`npx tsc --noEmit`): **PASS** (zero errors).
+- Frontend bundle (`npm run build`): **PASS** (clean production Vite build).
+- Verification pipeline (`make verify`): **PASS** (`[PASS] All Kyro verification checks passed successfully!`).

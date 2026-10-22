@@ -6,6 +6,7 @@ import { MyToolsView } from "../components/MyToolsView";
 import { MyRoutinesView } from "../components/MyRoutinesView";
 import { OnboardingModal } from "../components/OnboardingModal";
 import { SettingsModal } from "../components/SettingsModal";
+import { ConnectionsModal } from "../components/ConnectionsModal";
 import { App } from "../App";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -203,6 +204,54 @@ describe("Kyro Everyday Destinations & Workflows", () => {
           approved: true,
           note: "Approved from Today dashboard",
         });
+      });
+    });
+
+    it("renders calendar_error and email_error cards with retry buttons when services fail", async () => {
+      const mockErrorData = {
+        greeting: "Good morning",
+        date_display: "Wednesday, Oct 22",
+        upcoming_events: [],
+        calendar_error: "Google Calendar API rate limit exceeded. Please try again shortly.",
+        email_summary: {
+          is_connected: true,
+          unread_count: 0,
+          account_email: "user@example.com",
+          recent_subjects: [],
+          error: "Gmail API network timeout while fetching threads.",
+        },
+        email_error: "Gmail API network timeout while fetching threads.",
+        recent_documents: [],
+        upcoming_routines: [],
+        recent_routine_results: [],
+        pending_tasks_count: 0,
+        services: [],
+      };
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "get_today_dashboard_data") {
+          return Promise.resolve(mockErrorData);
+        }
+        return Promise.resolve(null);
+      });
+
+      render(
+        <TodayDashboardView
+          onOpenTool={vi.fn()}
+          onAskPrompt={vi.fn()}
+          onOpenConnections={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("Calendar Sync Failed")).toBeInTheDocument();
+        expect(screen.getByText(/Google Calendar API rate limit exceeded/i)).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Retry Calendar/i })).toBeInTheDocument();
+
+        expect(screen.getByText("Inbox Sync Failed")).toBeInTheDocument();
+        expect(screen.getByText(/Gmail API network timeout/i)).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Retry Inbox/i })).toBeInTheDocument();
       });
     });
   });
@@ -452,6 +501,48 @@ describe("Kyro Everyday Destinations & Workflows", () => {
         );
       });
     });
+
+    it("disables routine creation and offers clarification quick selects when ambiguous", async () => {
+      const mockAmbiguousSuggestion = {
+        name: "Morning Receipt Check",
+        cron_expression: "0 9 * * *",
+        action_type: "prompt",
+        target_id: "find_receipts",
+        explanation: "Find new receipts every day",
+        required_resources: [],
+        needs_clarification: true,
+        clarification_prompt:
+          "You specified a time of day (9:00 AM) but no recurring days (e.g. daily, weekdays, or a specific day of the week).",
+      };
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "list_routines") return Promise.resolve([]);
+        if (cmd === "list_routine_runs") return Promise.resolve([]);
+        if (cmd === "natural_language_to_routine") return Promise.resolve(mockAmbiguousSuggestion);
+        return Promise.resolve(null);
+      });
+
+      render(<MyRoutinesView onAskPrompt={vi.fn()} />);
+
+      const nlInput = screen.getByPlaceholderText(/e\.g\. 'Every Friday at 9am/i);
+      fireEvent.change(nlInput, { target: { value: "At 9am find receipts" } });
+      fireEvent.click(screen.getByText("Build Routine"));
+
+      await waitFor(() => {
+        expect(screen.getByText("Schedule Clarification Required:")).toBeInTheDocument();
+        expect(screen.getByText(/You specified a time of day/i)).toBeInTheDocument();
+      });
+
+      const confirmBtn = screen.getByRole("button", { name: /Confirm & Schedule Routine/i });
+      expect(confirmBtn).toBeDisabled();
+
+      const weekdaysBtn = screen.getByRole("button", { name: "Weekdays only" });
+      fireEvent.click(weekdaysBtn);
+
+      await waitFor(() => {
+        expect(confirmBtn).not.toBeDisabled();
+      });
+    });
   });
 
   describe("OnboardingModal", () => {
@@ -689,6 +780,46 @@ describe("Kyro Everyday Destinations & Workflows", () => {
 
       await waitFor(() => {
         expect(screen.getByText("Kyro Everyday Assistant")).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe("ConnectionsModal", () => {
+    it("renders needs_reauth badge and reauthorize button for expired accounts", async () => {
+      const mockAccounts = [
+        {
+          id: "acc-google-1",
+          connector_id: "google_workspace",
+          account_identifier: "user@gmail.com",
+          display_name: "Google Workspace",
+          status: "needs_reauth",
+          status_message: "Token has expired or was revoked. Reauthorization required.",
+          created_at: 1700000000000,
+          last_connected_at: 1700000000000,
+          granted_scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+      ];
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "list_connector_catalog") return Promise.resolve([]);
+        if (cmd === "list_connected_accounts") return Promise.resolve(mockAccounts);
+        if (cmd === "list_mcp_servers") return Promise.resolve([]);
+        if (cmd === "get_mcp_server_statuses") return Promise.resolve({});
+        return Promise.resolve(null);
+      });
+
+      render(
+        <ConnectionsModal
+          isOpen={true}
+          onClose={vi.fn()}
+          initialTab="connected"
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("Google Workspace")).toBeInTheDocument();
+        expect(screen.getByText("NEEDS REAUTH")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Reauthorize/i })).toBeInTheDocument();
       });
     });
   });

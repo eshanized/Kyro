@@ -466,11 +466,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* TAB: PRIVACY & AUTHORIZED FOLDERS */}
           {activeTab === "privacy" && (
             <div className="space-y-5">
-              <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed">
+              <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed space-y-1.5">
                 <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
                   <Shield className="w-4 h-4 text-amber-400" /> Local-First Architecture & Data Isolation
                 </div>
-                Kyro processes your documents and tasks locally on this computer. Your personal files never leave this machine without your explicit authorization. SQLite database and all credentials stay stored on this device.
+                <p>
+                  Document parsing, full-text extraction, folder indexing, SQLite metadata storage, and credentials stay securely on this device. Local files are never read or indexed outside your explicitly authorized folders.
+                </p>
+                <p className="text-neutral-400">
+                  When you request natural-language document analysis or summarization, only the relevant extracted text passages are sent via encrypted HTTPS to your configured model endpoint (such as NVIDIA NIM) for completion. No raw files or databases are uploaded to external telemetry.
+                </p>
               </div>
 
               {/* Authorized Folders */}

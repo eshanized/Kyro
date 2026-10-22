@@ -123,6 +123,20 @@ Report the coverage the audit achieved honestly, including the routes and viewpo
     );
 
     prompt.push_str(
+        "## Web Research, Sourcing & Product Comparison\n\
+When tasked with web research or product/price comparisons:\n\
+1. Retrieval is mandatory: Always perform real retrieval using browser tools (`browser_open`, \
+`browser_navigate`, `browser_snapshot`) or curl/fetch utilities. Never invent URLs, page titles, \
+prices, ratings, or citations without visiting the sources.\n\
+2. Verified citations: Every citation or source link must map to a real URL and page title retrieved \
+during the run. Quote the exact retrieved text as supporting evidence.\n\
+3. Unverified data disclosure: If retrieval fails, a domain is blocked, or a page is unreachable, \
+state explicitly that the information could not be verified rather than providing an unverified or hallucinated answer.\n\
+4. Product comparisons: Explicitly distinguish verified attributes (from retrieved pages), unavailable data, \
+and subjective inferences.\n\n",
+    );
+
+    prompt.push_str(
         "## Honesty\n\
 Report what actually happened. A tool result carries the operation, its status and the \
 evidence; report a failure as a failure, an unverified observation as unverified, and never \
@@ -1488,11 +1502,10 @@ pub async fn preview_file_organization(
     if folders.is_empty() {
         return Err("Access denied: No authorized folders configured. Please authorize folders in Settings first.".to_string());
     }
-    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
-        return Err(format!("Access denied for preview directory: {}", e));
-    }
+    let canonical_target = check_path_authorized_in_folders(p, &folders)
+        .map_err(|e| format!("Access denied for preview directory: {}", e))?;
 
-    FileOrganizer::preview(p, rule)
+    FileOrganizer::preview(&canonical_target, rule)
 }
 
 #[tauri::command]
@@ -1507,31 +1520,35 @@ pub async fn execute_file_organization(
 
     // Verify target directory
     let target = &plan.target_directory;
-    if let Err(e) = check_path_authorized_in_folders(target, &folders) {
-        return Err(format!("Access denied for target directory: {}", e));
-    }
+    let canonical_target = check_path_authorized_in_folders(target, &folders)
+        .map_err(|e| format!("Access denied for target directory: {}", e))?;
+
+    let mut canonical_plan = plan.clone();
+    canonical_plan.target_directory = canonical_target;
 
     // Recheck permissions immediately before execution for both source and destination
-    for action in &plan.operations {
+    for action in &mut canonical_plan.operations {
         let src = &action.source_path;
-        if let Err(e) = check_path_authorized_in_folders(src, &folders) {
-            return Err(format!(
+        let canon_src = check_path_authorized_in_folders(src, &folders).map_err(|e| {
+            format!(
                 "Access denied for organization source '{}': {}",
                 action.source_path.display(),
                 e
-            ));
-        }
+            )
+        })?;
         let dest = &action.destination_path;
-        if let Err(e) = check_path_authorized_in_folders(dest, &folders) {
-            return Err(format!(
+        let canon_dest = check_path_authorized_in_folders(dest, &folders).map_err(|e| {
+            format!(
                 "Access denied for organization destination '{}': {}",
                 action.destination_path.display(),
                 e
-            ));
-        }
+            )
+        })?;
+        action.source_path = canon_src;
+        action.destination_path = canon_dest;
     }
 
-    let trx = FileOrganizer::execute(&plan)?;
+    let trx = FileOrganizer::execute(&canonical_plan)?;
     if let Ok(manifest_json) = serde_json::to_string_pretty(&trx) {
         let art_id = format!("art_{}", uuid::Uuid::new_v4());
         let rec = ArtifactRecord {
@@ -1562,25 +1579,27 @@ pub async fn undo_file_organization(
     }
 
     let target = Path::new(&transaction.target_directory);
-    if let Err(e) = check_path_authorized_in_folders(target, &folders) {
-        return Err(format!("Access denied for rollback directory: {}", e));
-    }
+    let canonical_target = check_path_authorized_in_folders(target, &folders)
+        .map_err(|e| format!("Access denied for rollback directory: {}", e))?;
+    transaction.target_directory = canonical_target.to_string_lossy().to_string();
 
-    for op in &transaction.operations {
+    for op in &mut transaction.operations {
         let src = Path::new(&op.source_path);
-        if let Err(e) = check_path_authorized_in_folders(src, &folders) {
-            return Err(format!(
+        let canon_src = check_path_authorized_in_folders(src, &folders).map_err(|e| {
+            format!(
                 "Access denied for rollback source '{}': {}",
                 op.source_path, e
-            ));
-        }
+            )
+        })?;
         let dest = Path::new(&op.destination_path);
-        if let Err(e) = check_path_authorized_in_folders(dest, &folders) {
-            return Err(format!(
+        let canon_dest = check_path_authorized_in_folders(dest, &folders).map_err(|e| {
+            format!(
                 "Access denied for rollback destination '{}': {}",
                 op.destination_path, e
-            ));
-        }
+            )
+        })?;
+        op.source_path = canon_src.to_string_lossy().to_string();
+        op.destination_path = canon_dest.to_string_lossy().to_string();
     }
 
     FileOrganizer::undo(&mut transaction)
@@ -1597,11 +1616,10 @@ pub async fn analyze_document(
     if folders.is_empty() {
         return Err("Access denied: No authorized folders configured.".to_string());
     }
-    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
-        return Err(format!("Access denied for document: {}", e));
-    }
+    let canonical_doc = check_path_authorized_in_folders(p, &folders)
+        .map_err(|e| format!("Access denied for document: {}", e))?;
 
-    let res = DocumentAssistant::analyze(p, model.as_deref())?;
+    let res = DocumentAssistant::analyze(&canonical_doc, model.as_deref())?;
     let report_content = format!(
         "# Document Analysis Report: {}\n\n{}\n\n## Summary\n{}\n\n## Key Facts\n{}\n\n## Action Items\n{}\n\n## Dates & Deadlines\n{}\n",
         res.metadata.file_name,
@@ -1640,14 +1658,12 @@ pub async fn compare_documents(
     if folders.is_empty() {
         return Err("Access denied: No authorized folders configured.".to_string());
     }
-    if let Err(e) = check_path_authorized_in_folders(pa, &folders) {
-        return Err(format!("Access denied for Document A: {}", e));
-    }
-    if let Err(e) = check_path_authorized_in_folders(pb, &folders) {
-        return Err(format!("Access denied for Document B: {}", e));
-    }
+    let canon_a = check_path_authorized_in_folders(pa, &folders)
+        .map_err(|e| format!("Access denied for Document A: {}", e))?;
+    let canon_b = check_path_authorized_in_folders(pb, &folders)
+        .map_err(|e| format!("Access denied for Document B: {}", e))?;
 
-    let res = DocumentAssistant::compare(pa, pb)?;
+    let res = DocumentAssistant::compare(&canon_a, &canon_b)?;
     let art_id = format!("art_{}", uuid::Uuid::new_v4());
     let rec = ArtifactRecord {
         id: art_id,
@@ -1965,21 +1981,12 @@ pub fn remove_authorized_folder(
     let target = id
         .or(path)
         .ok_or_else(|| "Missing required parameter 'id' or 'path'".to_string())?;
-    let removed = state
+
+    // Atomically removes authorization and immediately prunes un-authorized documents from index
+    state
         .db
-        .remove_authorized_folder(&target)
-        .map_err(|e| e.to_string())?;
-
-    if removed {
-        // Immediately prune indexed documents and cached text/metadata that are outside remaining authorized folders
-        if let Ok(remaining_folders) = state.db.list_authorized_folders() {
-            let _ = state
-                .db
-                .prune_unauthorized_indexed_documents(&remaining_folders);
-        }
-    }
-
-    Ok(removed)
+        .remove_authorized_folder_and_prune(&target)
+        .map_err(|e| format!("Failed to remove and prune authorized folder: {}", e))
 }
 
 #[tauri::command]
@@ -2022,17 +2029,23 @@ pub fn execute_safe_file_op(
         return Err("Access denied: No authorized folders configured. Please authorize folders in Settings first.".to_string());
     }
 
-    if let Err(e) = check_path_authorized_in_folders(src, &folders) {
-        return Err(format!("Access denied for source path: {}", e));
-    }
+    let canonical_src = check_path_authorized_in_folders(src, &folders)
+        .map_err(|e| format!("Access denied for source path: {}", e))?;
 
-    if let Some(d) = dest {
-        if let Err(e) = check_path_authorized_in_folders(d, &folders) {
-            return Err(format!("Access denied for destination path: {}", e));
-        }
-    }
+    let canonical_dest = if let Some(d) = dest {
+        let cd = check_path_authorized_in_folders(d, &folders)
+            .map_err(|e| format!("Access denied for destination path: {}", e))?;
+        Some(cd)
+    } else {
+        None
+    };
 
-    FileAssistant::execute_safe_op(&operation, src, dest, confirm_destructive)
+    FileAssistant::execute_safe_op(
+        &operation,
+        &canonical_src,
+        canonical_dest.as_deref(),
+        confirm_destructive,
+    )
 }
 
 #[tauri::command]
@@ -2053,11 +2066,10 @@ pub fn detect_folder_duplicates(
         return Err("Access denied: No authorized folders configured.".to_string());
     }
 
-    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
-        return Err(format!("Access denied: {}", e));
-    }
+    let canonical_folder = check_path_authorized_in_folders(p, &folders)
+        .map_err(|e| format!("Access denied: {}", e))?;
 
-    FileAssistant::find_duplicates(p)
+    FileAssistant::find_duplicates(&canonical_folder)
 }
 
 #[tauri::command]
@@ -2082,11 +2094,10 @@ pub fn generate_study_notes(
     if folders.is_empty() {
         return Err("Access denied: No authorized folders configured.".to_string());
     }
-    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
-        return Err(format!("Access denied for study notes: {}", e));
-    }
+    let canonical_doc = check_path_authorized_in_folders(p, &folders)
+        .map_err(|e| format!("Access denied for study notes: {}", e))?;
 
-    FileAssistant::generate_study_notes(p, topic.as_deref())
+    FileAssistant::generate_study_notes(&canonical_doc, topic.as_deref())
 }
 
 #[tauri::command]
@@ -2100,11 +2111,10 @@ pub fn explain_document_passage(
     if folders.is_empty() {
         return Err("Access denied: No authorized folders configured.".to_string());
     }
-    if let Err(e) = check_path_authorized_in_folders(p, &folders) {
-        return Err(format!("Access denied for passage explainer: {}", e));
-    }
+    let canonical_doc = check_path_authorized_in_folders(p, &folders)
+        .map_err(|e| format!("Access denied for passage explainer: {}", e))?;
 
-    FileAssistant::explain_passage(p, &passage)
+    FileAssistant::explain_passage(&canonical_doc, &passage)
 }
 
 // -----------------------------------------------------------------------------
@@ -2126,6 +2136,8 @@ pub struct TodayEmailSummary {
     pub recent_subjects: Vec<String>,
     pub is_connected: bool,
     pub account_email: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2177,6 +2189,10 @@ pub struct TodayDashboardData {
     pub pending_approvals: Vec<PendingApprovalItem>,
     pub pending_approvals_count: usize,
     pub services: Vec<TodayServiceStatus>,
+    #[serde(default)]
+    pub calendar_error: Option<String>,
+    #[serde(default)]
+    pub email_error: Option<String>,
 }
 
 fn format_calendar_time_display(start_raw: &str, end_raw: Option<&str>) -> String {
@@ -2249,11 +2265,15 @@ pub async fn get_today_dashboard_data(
         .find(|a| a.connector_id == "github" && a.status == "connected");
 
     let mut upcoming_events = Vec::new();
+    let mut calendar_error: Option<String> = None;
+    let mut email_error: Option<String> = None;
+
     let mut email_summary = TodayEmailSummary {
         unread_count: 0,
         recent_subjects: Vec::new(),
         is_connected: google_account.is_some(),
         account_email: google_account.map(|a| a.account_identifier.clone()),
+        error: None,
     };
 
     if let Some(acc) = google_account {
@@ -2291,6 +2311,7 @@ pub async fn get_today_dashboard_data(
                 }
                 Err(e) => {
                     log::warn!("[Today] Calendar list error (partial degradation): {}", e);
+                    calendar_error = Some("Unable to load Google Calendar events. Check connection or retry.".to_string());
                 }
             }
 
@@ -2298,7 +2319,7 @@ pub async fn get_today_dashboard_data(
                 .execute_tool(
                     acc,
                     "gmail_list_messages",
-                    serde_json::json!({ "query": "is:unread", "max_results": 5 }),
+                    serde_json::json!({ "query": "in:inbox is:unread", "max_results": 5 }),
                     &state.vault,
                 )
                 .await
@@ -2349,6 +2370,11 @@ pub async fn get_today_dashboard_data(
                 }
                 Err(e) => {
                     log::warn!("[Today] Gmail list error (partial degradation): {}", e);
+                    let err_msg =
+                        "Unable to load unread inbox messages. Check connection or retry."
+                            .to_string();
+                    email_error = Some(err_msg.clone());
+                    email_summary.error = Some(err_msg);
                 }
             }
         }
@@ -2413,7 +2439,7 @@ pub async fn get_today_dashboard_data(
         })
         .collect();
     let pending_approvals_count = pending_approvals.len();
-    let pending_tasks_count = pending_approvals_count;
+    let pending_tasks_count = 0; // Distinct from pending approvals
 
     let services = vec![
         TodayServiceStatus {
@@ -2450,6 +2476,8 @@ pub async fn get_today_dashboard_data(
         pending_approvals,
         pending_approvals_count,
         services,
+        calendar_error,
+        email_error,
     })
 }
 
@@ -2743,10 +2771,7 @@ pub fn natural_language_to_routine(prompt: String) -> Result<NlRoutineSuggestion
             false,
             None,
         )
-    } else if lower.contains("monthly")
-        || lower.contains("first day of the month")
-        || lower.contains("1st of every month")
-    {
+    } else if lower.contains("first day of the month") || lower.contains("1st of every month") {
         (
             format!("{} {} 1 * *", minute, hour),
             format!("First day of every month at {:02}:{:02}", hour, minute),
@@ -2754,22 +2779,36 @@ pub fn natural_language_to_routine(prompt: String) -> Result<NlRoutineSuggestion
             false,
             None,
         )
+    } else if lower.contains("monthly")
+        || lower.contains("every month")
+        || lower.contains("each month")
+    {
+        (
+            format!("{} {} 1 * *", minute, hour),
+            format!("Monthly on the 1st at {:02}:{:02} (Schedule day unconfirmed)", hour, minute),
+            "inferred_day".to_string(),
+            true,
+            Some("Monthly recurrence detected. On which day of the month should this routine run? (e.g. '1st of the month', '15th', 'last day')".to_string()),
+        )
     } else if has_explicit_time {
         (
             format!("{} {} * * *", minute, hour),
-            format!("Every day at {:02}:{:02} (Inferred schedule)", hour, minute),
-            "inferred".to_string(),
-            false,
-            None,
+            format!("Every day at {:02}:{:02} (Recurrence unconfirmed)", hour, minute),
+            "inferred_recurrence".to_string(),
+            true,
+            Some(format!(
+                "You specified a time ({:02}:{:02}) without indicating recurrence. Should this routine repeat daily, on weekdays only, or run once?",
+                hour, minute
+            )),
         )
     } else {
         (
-                "0 9 * * 1-5".to_string(),
-                "Proposed: Every weekday at 9:00 AM (Schedule unconfirmed)".to_string(),
-                "needs_clarification".to_string(),
-                true,
-                Some("No recurring schedule was detected in your description. When would you like this routine to run? (e.g. 'every weekday at 9am' or 'every Friday at 5pm')".to_string()),
-            )
+            "0 9 * * 1-5".to_string(),
+            "Proposed: Every weekday at 9:00 AM (Schedule unconfirmed)".to_string(),
+            "needs_clarification".to_string(),
+            true,
+            Some("No recurring schedule was detected in your description. When would you like this routine to run? (e.g. 'every weekday at 9am' or 'every Friday at 5pm')".to_string()),
+        )
     };
 
     let (name, resources, requires_confirmation) = if lower.contains("receipt")
@@ -2821,6 +2860,9 @@ pub fn natural_language_to_routine(prompt: String) -> Result<NlRoutineSuggestion
             false,
         )
     };
+
+    let requires_confirmation =
+        requires_confirmation || needs_clarification || confidence.starts_with("inferred");
 
     let explanation = format!(
         "Runs on schedule '{}' ({}). Kyro will execute: \"{}\"",

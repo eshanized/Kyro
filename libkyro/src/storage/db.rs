@@ -774,6 +774,16 @@ impl Database {
             params![now],
         )?;
 
+        // Reconcile interrupted routine_runs so they are never left indefinitely in 'running'
+        let routine_count = conn.execute(
+            "UPDATE routine_runs
+             SET status = 'interrupted',
+                 completed_at = ?1,
+                 error = 'Process terminated unexpectedly during execution'
+             WHERE status = 'running'",
+            params![now],
+        )?;
+
         // Expire any lingering pending approvals from previous session
         conn.execute(
             "UPDATE approval_requests
@@ -784,7 +794,7 @@ impl Database {
             params![now],
         )?;
 
-        Ok(count)
+        Ok(count + routine_count)
     }
 
     // Conversations & Messages
@@ -2740,6 +2750,16 @@ impl Database {
         Ok(affected > 0)
     }
 
+    /// Atomically removes an authorized folder and immediately prunes documents that are no longer authorized.
+    pub fn remove_authorized_folder_and_prune(&self, id_or_path: &str) -> Result<bool> {
+        let removed = self.remove_authorized_folder(id_or_path)?;
+        if removed {
+            let remaining = self.list_authorized_folders()?;
+            self.prune_unauthorized_indexed_documents(&remaining)?;
+        }
+        Ok(removed)
+    }
+
     pub fn is_path_authorized(&self, path: &std::path::Path) -> Result<bool> {
         let folders = self.list_authorized_folders()?;
         Ok(Self::check_path_authorized_in_folders(&folders, path).is_ok())
@@ -2829,6 +2849,13 @@ impl Database {
     // --- Document Search Index ---
 
     pub fn get_indexed_document(&self, path: &str) -> Result<Option<DocumentIndexRecord>> {
+        // Fail-closed authorization check: never return cached extracted content if folder is not currently authorized
+        let p = std::path::Path::new(path);
+        let folders = self.list_authorized_folders().unwrap_or_default();
+        if folders.is_empty() || Self::check_path_authorized_in_folders(&folders, p).is_err() {
+            return Ok(None);
+        }
+
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT path, file_name, format, size_bytes, modified_at, sha256, extracted_text, indexed_at

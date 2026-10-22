@@ -13,6 +13,7 @@ import {
   Plug,
   ArrowRight,
   Shield,
+  AlertTriangle,
 } from "lucide-react";
 import { TodayDashboardData, RoutineRunRecord } from "../types/agent";
 
@@ -32,15 +33,18 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
   const [data, setData] = useState<TodayDashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [runningRoutineId, setRunningRoutineId] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   const loadDashboard = async (isManual = false) => {
     if (isManual) setRefreshing(true);
+    setLoadError(null);
     try {
       const res = await invoke<TodayDashboardData>("get_today_dashboard_data");
       setData(res);
-    } catch {
+    } catch (err: any) {
+      setLoadError(err?.toString() || "Failed to load dashboard data");
       // In dev or web mode where Tauri backend may be mocked
       setData({
         greeting: "Good morning",
@@ -156,6 +160,21 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
           </button>
         </div>
       </div>
+
+      {loadError && (
+        <div className="p-3 rounded-lg bg-red-950/40 border border-red-800/60 text-red-200 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>Dashboard sync warning: {loadError}</span>
+          </div>
+          <button
+            onClick={() => loadDashboard(true)}
+            className="px-2.5 py-1 bg-red-900/50 hover:bg-red-800/60 text-red-100 rounded text-xs transition"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {actionNotice && (
         <div className="p-3 rounded-lg bg-sky-950/40 border border-sky-800/60 text-sky-200 text-xs flex items-center justify-between">
@@ -320,7 +339,27 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
           </div>
 
           <div className="space-y-2 min-h-[140px] flex flex-col justify-center">
-            {data?.upcoming_events && data.upcoming_events.length > 0 ? (
+            {data?.calendar_error ? (
+              <div className="p-3.5 rounded-lg bg-amber-950/30 border border-amber-800/50 text-amber-200 text-xs space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-semibold block text-amber-100">Calendar Sync Failed</span>
+                    <p className="text-[11px] text-amber-300/90 mt-0.5">{data.calendar_error}</p>
+                  </div>
+                </div>
+                <div className="flex items-center justify-end">
+                  <button
+                    onClick={() => loadDashboard(true)}
+                    disabled={refreshing}
+                    className="px-2.5 py-1 bg-amber-900/40 hover:bg-amber-800/60 border border-amber-700/50 text-amber-200 rounded text-xs font-medium transition flex items-center gap-1.5"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
+                    Retry Calendar
+                  </button>
+                </div>
+              </div>
+            ) : data?.upcoming_events && data.upcoming_events.length > 0 ? (
               <div className="space-y-2">
                 {data.upcoming_events.map((ev) => (
                   <div
@@ -402,7 +441,29 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
           </div>
 
           <div className="space-y-2 min-h-[140px] flex flex-col justify-center">
-            {data?.email_summary?.is_connected ? (
+            {data?.email_error || data?.email_summary?.error ? (
+              <div className="p-3.5 rounded-lg bg-amber-950/30 border border-amber-800/50 text-amber-200 text-xs space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-semibold block text-amber-100">Inbox Sync Failed</span>
+                    <p className="text-[11px] text-amber-300/90 mt-0.5">
+                      {data?.email_error || data?.email_summary?.error}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center justify-end">
+                  <button
+                    onClick={() => loadDashboard(true)}
+                    disabled={refreshing}
+                    className="px-2.5 py-1 bg-amber-900/40 hover:bg-amber-800/60 border border-amber-700/50 text-amber-200 rounded text-xs font-medium transition flex items-center gap-1.5"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${refreshing ? "animate-spin" : ""}`} />
+                    Retry Inbox
+                  </button>
+                </div>
+              </div>
+            ) : data?.email_summary?.is_connected ? (
               <div className="space-y-2">
                 <div className="p-3 rounded-lg bg-[#181818] border border-neutral-800">
                   <div className="flex items-center justify-between mb-1">
