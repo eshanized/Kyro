@@ -62,3 +62,4 @@ Thumbs.db
 *.sln
 *.sw?
 *~
+coverage/

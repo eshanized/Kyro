@@ -139,10 +139,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const loadSettings = async () => {
     try {
       const meta = await invoke<ApiKeysMetadata>("get_api_keys");
-      setMetadata(meta);
-      setTelegramChatId(meta.telegram_chat_id || "");
+      if (meta) {
+        setMetadata(meta);
+        setTelegramChatId(meta.telegram_chat_id || "");
+      }
       const storedPolicy = await invoke<GovernancePolicy>("get_governance_policy");
-      setPolicy(storedPolicy);
+      if (storedPolicy) {
+        setPolicy(storedPolicy);
+      }
       const sb = await invoke<SandboxStatus>("get_sandbox_status");
       setSandbox(sb);
       await loadBrowserInfo();
@@ -441,7 +445,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <input
                     type="password"
                     placeholder={
-                      metadata.nvidia_configured
+                      metadata?.nvidia_configured
                         ? "•••••••••••••••••••••••• (Configured in Vault)"
                         : "nvapi-..."
                     }
@@ -857,7 +861,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     }`}
                   ></span>
                   <span className="font-mono text-neutral-300">
-                    Engine: {sandbox?.engine.toUpperCase() || "NONE"}
+                    Engine: {sandbox?.engine?.toUpperCase() || "NONE"}
                   </span>
                 </div>
                 <div className="text-neutral-400">{sandbox?.message}</div>
@@ -1032,7 +1036,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       Installed CLI System Tools
                     </div>
                     <div className="grid grid-cols-3 gap-2">
-                      {Object.entries(health.tools).map(([tool, installed]) => (
+                      {Object.entries(health.tools || {}).map(([tool, installed]) => (
                         <div
                           key={tool}
                           className="px-2.5 py-1.5 rounded-lg bg-[#000000] border border-neutral-800 flex items-center justify-between text-xs font-mono"

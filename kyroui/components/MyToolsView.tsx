@@ -420,8 +420,8 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
                 {duplicates.map((grp, idx) => (
                   <div key={idx} className="p-3 rounded-lg bg-[#181818] border border-neutral-800 space-y-2">
                     <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-neutral-200">{grp.evidence}</span>
-                      <span className="text-neutral-400 font-mono text-[10px]">{grp.file_hash.slice(0, 16)}...</span>
+                      <span className="font-semibold text-neutral-200">{grp.evidence || "Duplicate"}</span>
+                      <span className="text-neutral-400 font-mono text-[10px]">{(grp.file_hash || "").slice(0, 16)}...</span>
                     </div>
                     <div className="space-y-1">
                       {grp.files.map((f, fIdx) => (
@@ -562,11 +562,11 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
                 </div>
 
                 {/* Key Dates & Milestones */}
-                {studyNotes.key_dates_and_milestones.length > 0 && (
+                {(studyNotes.key_dates_and_milestones || []).length > 0 && (
                   <div className="space-y-1.5">
                     <h5 className="text-xs font-semibold text-neutral-300">Important Dates & Deadlines</h5>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {studyNotes.key_dates_and_milestones.map((d, dIdx) => (
+                      {(studyNotes.key_dates_and_milestones || []).map((d, dIdx) => (
                         <div key={dIdx} className="p-2 rounded bg-neutral-900 border border-neutral-800 text-xs text-neutral-200">
                           {d}
                         </div>
@@ -576,13 +576,13 @@ export const MyToolsView: React.FC<MyToolsViewProps> = ({
                 )}
 
                 {/* Revision Flashcards */}
-                {studyNotes.revision_flashcards.length > 0 && (
+                {(studyNotes.revision_flashcards || []).length > 0 && (
                   <div className="space-y-2">
                     <h5 className="text-xs font-semibold text-neutral-300">
-                      Revision Flashcards ({studyNotes.revision_flashcards.length})
+                      Revision Flashcards ({(studyNotes.revision_flashcards || []).length})
                     </h5>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {studyNotes.revision_flashcards.map((fc, idx) => (
+                      {(studyNotes.revision_flashcards || []).map((fc, idx) => (
                         <div
                           key={idx}
                           className="p-3 rounded-xl bg-[#161616] border border-neutral-800 flex flex-col justify-between space-y-2"

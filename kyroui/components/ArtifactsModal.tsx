@@ -134,9 +134,9 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
     }
   };
 
-  const getViewportBadge = (name: string, meta: any) => {
+  const getViewportBadge = (name?: string, meta?: any) => {
     if (meta?.viewport) return meta.viewport;
-    const match = name.match(/(\d+x\d+)/);
+    const match = (name || "").match(/(\d+x\d+)/);
     if (match) return match[1];
     return null;
   };
@@ -175,15 +175,17 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
   if (!isOpen) return null;
 
   const filteredArtifacts = artifacts.filter((a) => {
+    const name = a.name || "";
+    const filePath = a.file_path || "";
     const matchesSearch =
-      a.name.toLowerCase().includes(searchFilter.toLowerCase()) ||
-      a.file_path.toLowerCase().includes(searchFilter.toLowerCase());
+      name.toLowerCase().includes(searchFilter.toLowerCase()) ||
+      filePath.toLowerCase().includes(searchFilter.toLowerCase());
     const matchesType = typeFilter === "all" || a.artifact_type === typeFilter;
     return matchesSearch && matchesType;
   });
 
   const imageArtifacts = artifacts.filter(
-    (a) => a.artifact_type === "image" || a.mime_type.startsWith("image/")
+    (a) => a.artifact_type === "image" || (a.mime_type && a.mime_type.startsWith("image/"))
   );
 
   const getIcon = (type: string) => {
@@ -207,8 +209,8 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
 
   const isImage =
     selectedArtifact?.artifact_type === "image" ||
-    previewContent.startsWith("data:image/") ||
-    selectedArtifact?.mime_type.startsWith("image/");
+    (previewContent || "").startsWith("data:image/") ||
+    (selectedArtifact?.mime_type || "").startsWith("image/");
 
   const metadata = parseMetadata(selectedArtifact);
   const viewportBadge = selectedArtifact ? getViewportBadge(selectedArtifact.name, metadata) : null;

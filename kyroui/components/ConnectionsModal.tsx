@@ -648,7 +648,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
                       {/* Capabilities pills */}
                       <div className="flex flex-wrap gap-1.5 mb-4">
-                        {item.capabilities.map((cap) => (
+                        {(item.capabilities || []).map((cap) => (
                           <span
                             key={cap}
                             className="text-[10px] px-2 py-0.5 rounded-md bg-[#0a0a0a] border border-[#262626] text-neutral-400 font-mono"

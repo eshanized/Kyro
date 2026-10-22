@@ -6,7 +6,7 @@ import { Snipper } from "./hud/Snipper";
 import "./index.css";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-const RootComponent: React.FC = () => {
+export const RootComponent: React.FC = () => {
   const [windowLabel, setWindowLabel] = useState<string>("main");
 
   useEffect(() => {
@@ -34,8 +34,11 @@ const RootComponent: React.FC = () => {
   return <App />;
 };
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <RootComponent />
-  </React.StrictMode>
-);
+const rootEl = typeof document !== "undefined" ? document.getElementById("root") : null;
+if (rootEl) {
+  ReactDOM.createRoot(rootEl).render(
+    <React.StrictMode>
+      <RootComponent />
+    </React.StrictMode>
+  );
+}

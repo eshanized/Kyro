@@ -1432,8 +1432,8 @@ export const App: React.FC = () => {
               <div className="text-xs text-neutral-200">
                 <div className="font-semibold">Set-of-Marks (SoM) Grounding Active</div>
                 <div className="text-[11px] text-neutral-400">
-                  {groundedResult.marks.length} grounded element
-                  {groundedResult.marks.length === 1 ? "" : "s"} detected (
+                  {(groundedResult.marks || []).length} grounded element
+                  {(groundedResult.marks || []).length === 1 ? "" : "s"} detected (
                   {groundedResult.source}). Each tag carries the measurements that produced it; a
                   tag becomes stale when the screen changes.
                 </div>
@@ -1873,11 +1873,11 @@ export const App: React.FC = () => {
                       </div>
                     </div>
                   )}
-                  {step.tool_calls.map((tc, idx) => (
+                  {(step.tool_calls || []).map((tc, idx) => (
                     <ToolCallCard
                       key={`${step.step}-${tc.id || idx}`}
                       toolCall={tc}
-                      result={step.tool_results.find((r) => r.tool_call_id === tc.id)}
+                      result={(step.tool_results || []).find((r) => r.tool_call_id === tc.id)}
                     />
                   ))}
                 </React.Fragment>

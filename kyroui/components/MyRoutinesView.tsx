@@ -376,11 +376,11 @@ export const MyRoutinesView: React.FC<MyRoutinesViewProps> = ({
                 {suggestion.explanation}
               </div>
 
-              {suggestion.required_resources.length > 0 && (
+              {(suggestion.required_resources || []).length > 0 && (
                 <div className="flex items-center gap-2 pt-1 text-[11px] text-neutral-400">
                   <span>Required Access:</span>
                   <div className="flex flex-wrap gap-1">
-                    {suggestion.required_resources.map((res, idx) => (
+                    {(suggestion.required_resources || []).map((res, idx) => (
                       <span key={idx} className="px-2 py-0.5 rounded bg-neutral-900 text-neutral-300 border border-neutral-800">
                         {res}
                       </span>

@@ -95,11 +95,15 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
   const loadData = async () => {
     try {
       const s = await invoke<SkillRecord[]>("list_skills");
-      setSkills(s);
+      if (Array.isArray(s)) {
+        setSkills(s);
+        if (s.length > 0 && !routineTarget) {
+          setRoutineTarget(s[0].id);
+        }
+      }
       const r = await invoke<RoutineRecord[]>("list_routines");
-      setRoutines(r);
-      if (s.length > 0 && !routineTarget) {
-        setRoutineTarget(s[0].id);
+      if (Array.isArray(r)) {
+        setRoutines(r);
       }
     } catch (e) {
       console.error("Failed to load task and routine data:", e);

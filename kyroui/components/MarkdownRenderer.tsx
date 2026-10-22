@@ -80,6 +80,7 @@ export const CodeBlock: React.FC<{ code: string; language?: string }> = ({ code,
 };
 
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, className }) => {
+  const safeContent = typeof content === "string" ? content : (content ? JSON.stringify(content) : "");
   return (
     <div className={`markdown-content text-sm leading-relaxed max-w-full min-w-0 ${className || ""}`}>
       <Markdown
@@ -298,7 +299,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, cla
           },
         }}
       >
-        {content}
+        {safeContent}
       </Markdown>
     </div>
   );

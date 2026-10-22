@@ -108,9 +108,9 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   const loadDevServers = async () => {
     try {
       const servers = await invoke<DevServerState[]>("list_dev_servers");
-      setDevServers(servers);
+      setDevServers(Array.isArray(servers) ? servers : []);
     } catch {
-      // ignore
+      setDevServers([]);
     }
   };
 
@@ -527,7 +527,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                 <div className="flex items-center justify-between">
                   <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wide flex items-center gap-2">
                     <Server className="w-4 h-4 text-purple-400" />
-                    <span>Managed Development Servers ({devServers.length})</span>
+                    <span>Managed Development Servers ({(devServers || []).length})</span>
                   </div>
                   <button
                     onClick={loadDevServers}
@@ -537,13 +537,13 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                   </button>
                 </div>
 
-                {devServers.length === 0 ? (
+                {(devServers || []).length === 0 ? (
                   <div className="p-6 text-center border border-dashed border-neutral-800 rounded-xl text-neutral-400 text-xs">
                     No active development servers. Discover a project above and click &ldquo;Start Dev Server&rdquo;.
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {devServers.map((srv) => (
+                    {(devServers || []).map((srv) => (
                       <div
                         key={srv.id}
                         className="p-4 bg-[#141414] border border-neutral-800 rounded-xl space-y-3"
