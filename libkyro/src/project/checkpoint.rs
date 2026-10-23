@@ -25,6 +25,8 @@ pub struct FileDiff {
     pub deletions: usize,
     pub unified_diff: String,
     pub risk_assessment: String, // "low", "medium", "high"
+    #[serde(default)]
+    pub is_reverted: bool,
 }
 
 /// A reversible checkpoint capturing all changes made by an agent run.
@@ -160,6 +162,7 @@ impl CheckpointManager {
                 deletions,
                 unified_diff: diff_text,
                 risk_assessment: risk,
+                is_reverted: false,
             });
         }
     }
@@ -238,7 +241,13 @@ impl CheckpointManager {
         let mut reverted = Vec::new();
         let mut conflicts = Vec::new();
 
-        for file_diff in &checkpoint.modified_files {
+        for file_diff in &mut checkpoint.modified_files {
+            // If already marked as reverted from a prior attempt, record and skip
+            if file_diff.is_reverted {
+                reverted.push(file_diff.file_path.clone());
+                continue;
+            }
+
             let full_path = checkpoint.workspace_path.join(&file_diff.file_path);
 
             if !full_path.exists() {
@@ -248,9 +257,14 @@ impl CheckpointManager {
                         file_diff.file_path
                     ));
                     continue;
+                } else {
+                    // Newly created file by agent was already deleted/removed
+                    file_diff.is_reverted = true;
+                    reverted.push(file_diff.file_path.clone());
+                    continue;
                 }
             } else {
-                // Conflict check: verify current content matches new_content before reverting
+                // Conflict check: verify current content
                 let current_content = match fs::read_to_string(&full_path) {
                     Ok(c) => c,
                     Err(e) => {
@@ -258,6 +272,15 @@ impl CheckpointManager {
                         continue;
                     }
                 };
+
+                // Check if file is already restored to original content
+                if let Some(ref orig) = file_diff.original_content {
+                    if &current_content == orig {
+                        file_diff.is_reverted = true;
+                        reverted.push(file_diff.file_path.clone());
+                        continue;
+                    }
+                }
 
                 if current_content != file_diff.new_content {
                     conflicts.push(format!(
@@ -280,6 +303,7 @@ impl CheckpointManager {
                         ));
                         continue;
                     }
+                    file_diff.is_reverted = true;
                     reverted.push(file_diff.file_path.clone());
                 }
                 None => {
@@ -293,20 +317,24 @@ impl CheckpointManager {
                             continue;
                         }
                     }
+                    file_diff.is_reverted = true;
                     reverted.push(file_diff.file_path.clone());
                 }
             }
         }
 
-        let status = if conflicts.is_empty() {
+        let all_reverted = checkpoint.modified_files.iter().all(|f| f.is_reverted);
+
+        let status = if conflicts.is_empty() && all_reverted {
+            checkpoint.status = "rolled_back".to_string();
             "success".to_string()
         } else if !reverted.is_empty() {
+            checkpoint.status = "partial".to_string();
             "partial".to_string()
         } else {
+            checkpoint.status = "failed".to_string();
             "failed".to_string()
         };
-
-        checkpoint.status = "rolled_back".to_string();
 
         Ok(RollbackResult {
             checkpoint_id: checkpoint.checkpoint_id.clone(),
@@ -552,6 +580,62 @@ mod tests {
             fs::read_to_string(&file_path).unwrap(),
             user_diverged_content
         );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_multi_file_checkpoint_partial_conflict_retry_rollback() {
+        let temp = std::env::temp_dir().join(format!("kyro_chk_multi_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+
+        let file_a = temp.join("a.txt");
+        let file_b = temp.join("b.txt");
+
+        fs::write(&file_a, "A_initial").unwrap();
+        fs::write(&file_b, "B_initial").unwrap();
+
+        let mut chk = CheckpointManager::create_checkpoint(&temp, "Multi-file edit");
+
+        // Agent edits both files
+        fs::write(&file_a, "A_agent").unwrap();
+        CheckpointManager::record_change(&mut chk, "a.txt", Some("A_initial"), "A_agent");
+
+        fs::write(&file_b, "B_agent").unwrap();
+        CheckpointManager::record_change(&mut chk, "b.txt", Some("B_initial"), "B_agent");
+
+        // User diverges on file_b concurrently
+        fs::write(&file_b, "B_user_conflict").unwrap();
+
+        // 1. First rollback attempt: a.txt succeeds, b.txt conflicts -> status is "partial"
+        let res1 =
+            CheckpointManager::rollback(&mut chk).expect("Rollback handles partial conflict");
+        assert_eq!(res1.status, "partial");
+        assert_eq!(res1.files_reverted, vec!["a.txt".to_string()]);
+        assert_eq!(res1.conflicts_detected.len(), 1);
+        assert!(res1.conflicts_detected[0].contains("b.txt"));
+        // Checkpoint must NOT be marked fully rolled_back
+        assert_ne!(chk.status, "rolled_back");
+        assert_eq!(chk.status, "partial");
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "A_initial");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "B_user_conflict");
+
+        // 2. User resolves the conflict on b.txt (resets to agent's state or intended content)
+        fs::write(&file_b, "B_agent").unwrap();
+
+        // 3. Retry rollback on the same checkpoint
+        let res2 = CheckpointManager::rollback(&mut chk).expect("Retry rollback succeeds");
+        assert_eq!(res2.status, "success");
+        assert!(res2.conflicts_detected.is_empty());
+        assert!(res2.files_reverted.contains(&"a.txt".to_string()));
+        assert!(res2.files_reverted.contains(&"b.txt".to_string()));
+        assert_eq!(chk.status, "rolled_back");
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "A_initial");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "B_initial");
+
+        // 4. Subsequent rollback attempt must be rejected as already rolled back
+        let err3 = CheckpointManager::rollback(&mut chk).unwrap_err();
+        assert!(err3.contains("already been rolled back"));
 
         let _ = fs::remove_dir_all(&temp);
     }

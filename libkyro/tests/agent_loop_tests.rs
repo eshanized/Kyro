@@ -2103,3 +2103,103 @@ async fn test_agent_loop_run_step_with_connectors_and_custom_tools() {
     assert!(res.is_ok());
     assert_eq!(res.unwrap(), "Connector loop step completed.");
 }
+
+#[tokio::test]
+async fn test_agent_loop_exhausts_step_budget_fails_and_cleans_up() {
+    let tdir = TestDir::new("loop_step_limit");
+    let db = Database::init(tdir.path().to_path_buf()).unwrap();
+    let server = MockLlmServer::start().await;
+
+    let run_id = "run_step_budget_test";
+    let run = AgentRun {
+        id: run_id.to_string(),
+        conversation_id: None,
+        agent_id: "test-agent".to_string(),
+        model: "test-model".to_string(),
+        prompt: "Never-ending loop".to_string(),
+        status: "running".to_string(),
+        created_at: 1000,
+        started_at: Some(1000),
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    db.create_run(&run).unwrap();
+
+    // Enqueue 30 tool-call responses so it definitely exceeds max_steps (25)
+    for i in 1..=30 {
+        server
+            .enqueue_response(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": format!("Step {} thought", i),
+                        "tool_calls": [
+                            {
+                                "id": format!("tc_{}", i),
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": serde_json::json!({ "path": "nonexistent.txt" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .await;
+    }
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Never-ending loop"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step_with_connectors(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys prompt",
+            history,
+            db.clone(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    // 1. Must return an error, never Ok("")
+    assert!(
+        res.is_err(),
+        "Must return error when step budget is exhausted"
+    );
+    let err_msg = res.unwrap_err();
+    assert!(
+        err_msg.contains("step limit") || err_msg.contains("budget exhausted"),
+        "Expected step limit error, got: {}",
+        err_msg
+    );
+
+    // 2. Persisted run status in DB must reflect failure
+    let run_db = db.get_run(run_id).unwrap().unwrap();
+    assert_eq!(run_db.status, "failed");
+    assert!(run_db.error.unwrap().contains("step"));
+
+    // 3. Error event persisted in event timeline
+    let events = db.get_run_events(run_id, None).unwrap();
+    assert!(events.iter().any(|e| e.event_type == "error"));
+
+    // 4. Active run context was cleaned up
+    assert!(
+        !engine.is_run_active(run_id).await,
+        "Active run should have been cleaned up"
+    );
+}

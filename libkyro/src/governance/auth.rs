@@ -287,6 +287,165 @@ impl AuthorizationEngine {
         }
     }
 
+    /// Securely writes a file within an approved workspace root, hardening against
+    /// symlink replacement, directory substitution, and race conditions between validation and write.
+    pub fn secure_write_contained(
+        workspace_root: Option<&Path>,
+        path_str: &str,
+        content: &[u8],
+    ) -> Result<PathBuf, String> {
+        let safe_path = Self::validate_path_confinement(workspace_root, path_str, FileOp::Write)?;
+
+        let root = workspace_root
+            .ok_or_else(|| "Workspace root is required for contained file write".to_string())?;
+        let canonical_root = root.canonicalize().map_err(|e| {
+            format!(
+                "Failed to canonicalize workspace root '{}': {}",
+                root.display(),
+                e
+            )
+        })?;
+
+        // 1. Explicitly create parent directories and propagate any errors
+        if let Some(parent) = safe_path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create parent directories for '{}': {}",
+                        safe_path.display(),
+                        e
+                    )
+                })?;
+            }
+
+            // 2. Revalidate parent directory canonicalization at the filesystem operation boundary
+            let canonical_parent = parent.canonicalize().map_err(|e| {
+                format!(
+                    "Failed to revalidate parent directory '{}' after creation: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+
+            if !canonical_parent.starts_with(&canonical_root) {
+                return Err(format!(
+                    "Security denial: parent directory '{}' escapes workspace root '{}' via symlink or substitution",
+                    canonical_parent.display(),
+                    canonical_root.display()
+                ));
+            }
+
+            let parent_lower = canonical_parent.to_string_lossy().to_lowercase();
+            for &prohibited in Self::PROHIBITED_PATHS {
+                if parent_lower.contains(prohibited) {
+                    return Err(format!(
+                        "Security denial: parent directory resolves to prohibited system location '{}'",
+                        prohibited
+                    ));
+                }
+            }
+        }
+
+        // 3. Inspect existing destination to prevent symlink hijack attacks
+        if let Ok(meta) = std::fs::symlink_metadata(&safe_path) {
+            if meta.file_type().is_symlink() {
+                // If the target is a symlink, verify its target canonicalizes strictly inside canonical_root
+                let canonical_target = safe_path.canonicalize().map_err(|e| {
+                    format!(
+                        "Security denial: destination symlink '{}' cannot be resolved: {}",
+                        safe_path.display(),
+                        e
+                    )
+                })?;
+                if !canonical_target.starts_with(&canonical_root) {
+                    return Err(format!(
+                        "Security denial: destination symlink '{}' points outside approved workspace root '{}'",
+                        safe_path.display(),
+                        canonical_root.display()
+                    ));
+                }
+            }
+        }
+
+        // 4. Perform the write
+        std::fs::write(&safe_path, content)
+            .map_err(|e| format!("Failed to write file '{}': {}", safe_path.display(), e))?;
+
+        // 5. Post-write verification: ensure the written file is genuinely within canonical root
+        let written_canon = safe_path.canonicalize().map_err(|e| {
+            format!(
+                "Failed to verify written file '{}': {}",
+                safe_path.display(),
+                e
+            )
+        })?;
+        if !written_canon.starts_with(&canonical_root) {
+            // Rollback the escaped file immediately
+            let _ = std::fs::remove_file(&written_canon);
+            return Err(format!(
+                "Security violation: written file escaped approved workspace root '{}'",
+                canonical_root.display()
+            ));
+        }
+
+        Ok(safe_path)
+    }
+
+    /// Securely reads a file within an approved workspace root, ensuring that
+    /// symlink replacement cannot read files outside the approved root.
+    pub fn secure_read_contained(
+        workspace_root: Option<&Path>,
+        path_str: &str,
+    ) -> Result<String, String> {
+        let safe_path = Self::validate_path_confinement(workspace_root, path_str, FileOp::Read)?;
+        let root = workspace_root
+            .ok_or_else(|| "Workspace root is required for contained file read".to_string())?;
+        let canonical_root = root.canonicalize().map_err(|e| {
+            format!(
+                "Failed to canonicalize workspace root '{}': {}",
+                root.display(),
+                e
+            )
+        })?;
+
+        // Revalidate canonicalization at the read boundary
+        let canon = safe_path.canonicalize().map_err(|e| {
+            format!(
+                "Failed to canonicalize target path '{}': {}",
+                safe_path.display(),
+                e
+            )
+        })?;
+        if !canon.starts_with(&canonical_root) {
+            return Err(format!(
+                "Security denial: path '{}' resolves outside approved workspace root '{}'",
+                path_str,
+                canonical_root.display()
+            ));
+        }
+
+        let canon_lower = canon.to_string_lossy().to_lowercase();
+        for &prohibited in Self::PROHIBITED_PATHS {
+            if canon_lower.contains(prohibited) {
+                return Err(format!(
+                    "Security denial: target resolves to prohibited system location '{}'",
+                    prohibited
+                ));
+            }
+        }
+
+        let mut content = std::fs::read_to_string(&canon)
+            .map_err(|e| format!("Failed to read file '{}': {}", path_str, e))?;
+
+        const MAX_READ_BYTES: usize = 512 * 1024;
+        if content.len() > MAX_READ_BYTES {
+            content.truncate(MAX_READ_BYTES);
+            content.push_str("\n...[Content truncated at 512KB limit]");
+        }
+
+        Ok(content)
+    }
+
     /// Evaluate an authorization request through the centralized policy matrix
     pub fn evaluate(
         db: &Database,

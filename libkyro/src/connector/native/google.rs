@@ -491,6 +491,39 @@ impl GoogleAdapter {
             }
         }
     }
+
+    /// Resolves a NaiveDateTime in the given timezone deterministically, handling daylight saving transitions:
+    /// - Exact matches (`LocalResult::Single`) return immediately.
+    /// - Ambiguous times (e.g. fall-back where the same local time occurs twice) deterministically select
+    ///   the earlier offset (`earliest`).
+    /// - Missing times (e.g. spring-forward where a local time does not exist) advance in 15-minute intervals
+    ///   up to 3 hours until the next valid local time is found.
+    pub fn resolve_local_datetime_deterministic(
+        tz: chrono_tz::Tz,
+        naive: &chrono::NaiveDateTime,
+    ) -> Result<chrono::DateTime<chrono_tz::Tz>, String> {
+        use chrono::TimeZone;
+        match tz.from_local_datetime(naive) {
+            chrono::LocalResult::Single(dt) => Ok(dt),
+            chrono::LocalResult::Ambiguous(earliest, _) => Ok(earliest),
+            chrono::LocalResult::None => {
+                for step in 1..=12 {
+                    let shifted = naive
+                        .checked_add_signed(chrono::Duration::minutes(step * 15))
+                        .ok_or_else(|| "Datetime arithmetic overflow".to_string())?;
+                    match tz.from_local_datetime(&shifted) {
+                        chrono::LocalResult::Single(dt) => return Ok(dt),
+                        chrono::LocalResult::Ambiguous(earliest, _) => return Ok(earliest),
+                        chrono::LocalResult::None => continue,
+                    }
+                }
+                Err(format!(
+                    "Failed to resolve local time '{}' in timezone '{}' across DST transition gap",
+                    naive, tz
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -938,15 +971,46 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     }
                 }
 
-                let res = self
-                    .send_and_read_bounded(
-                        self.client.get(url).headers(headers),
-                        "Calendar events list",
-                    )
-                    .await?;
+                // Paginate events to ensure full coverage up to the safety limit
+                let mut page_token: Option<String> = None;
+                let mut all_items: Vec<Value> = Vec::new();
+                let mut page_count = 0;
+                const MAX_CALENDAR_PAGES: usize = 10;
+                let mut pagination_truncated = false;
 
-                let items = res["items"].as_array().cloned().unwrap_or_default();
-                let events: Vec<Value> = items
+                loop {
+                    let mut page_url = url.clone();
+                    if let Some(ref pt) = page_token {
+                        page_url.query_pairs_mut().append_pair("pageToken", pt);
+                    }
+
+                    let res = self
+                        .send_and_read_bounded(
+                            self.client.get(page_url).headers(headers.clone()),
+                            "Calendar events list",
+                        )
+                        .await?;
+
+                    if let Some(arr) = res["items"].as_array() {
+                        all_items.extend(arr.iter().cloned());
+                    }
+
+                    page_token = res["nextPageToken"]
+                        .as_str()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    page_count += 1;
+
+                    if page_token.is_none() {
+                        break;
+                    }
+                    if page_count >= MAX_CALENDAR_PAGES {
+                        pagination_truncated = true;
+                        break;
+                    }
+                }
+
+                let events: Vec<Value> = all_items
                     .iter()
                     .map(|item| {
                         json!({
@@ -961,10 +1025,18 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     })
                     .collect();
 
-                let result = json!({
+                let mut result = json!({
                     "total_events": events.len(),
                     "events": events,
+                    "pages_retrieved": page_count,
+                    "has_more": pagination_truncated,
                 });
+                if pagination_truncated {
+                    result["warning"] = json!(format!(
+                        "Calendar events list safety limit reached ({} pages) with additional events remaining.",
+                        MAX_CALENDAR_PAGES
+                    ));
+                }
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }
             "calendar_create_event" => {
@@ -1076,28 +1148,15 @@ impl NativeConnectorAdapter for GoogleAdapter {
                         )
                     })?;
 
-                use chrono::TimeZone;
-                let resolve_local_dt = |h: u32| -> Result<chrono::DateTime<chrono_tz::Tz>, String> {
-                    let ndt = naive_date
-                        .and_hms_opt(h, 0, 0)
-                        .ok_or_else(|| format!("Invalid time {}:00", h))?;
-                    match tz.from_local_datetime(&ndt) {
-                        chrono::LocalResult::Single(dt) => Ok(dt),
-                        chrono::LocalResult::Ambiguous(earliest, _) => Ok(earliest),
-                        chrono::LocalResult::None => {
-                            // Gap during spring-forward DST transition: advance by 1 hour
-                            let shifted = ndt
-                                .checked_add_signed(chrono::Duration::hours(1))
-                                .ok_or("Invalid datetime")?;
-                            tz.from_local_datetime(&shifted).single().ok_or_else(|| {
-                                "Failed to resolve local time across DST transition".to_string()
-                            })
-                        }
-                    }
-                };
+                let start_ndt = naive_date
+                    .and_hms_opt(start_hour, 0, 0)
+                    .ok_or_else(|| format!("Invalid time {}:00", start_hour))?;
+                let end_ndt = naive_date
+                    .and_hms_opt(end_hour, 0, 0)
+                    .ok_or_else(|| format!("Invalid time {}:00", end_hour))?;
 
-                let work_start_local = resolve_local_dt(start_hour)?;
-                let work_end_local = resolve_local_dt(end_hour)?;
+                let work_start_local = Self::resolve_local_datetime_deterministic(tz, &start_ndt)?;
+                let work_end_local = Self::resolve_local_datetime_deterministic(tz, &end_ndt)?;
 
                 let time_min = work_start_local.with_timezone(&chrono::Utc).to_rfc3339();
                 let time_max = work_end_local.with_timezone(&chrono::Utc).to_rfc3339();
@@ -1172,11 +1231,11 @@ impl NativeConnectorAdapter for GoogleAdapter {
                     } else if let Some(d_str) = start_val["date"].as_str() {
                         chrono::NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
                             .ok()
-                            .and_then(|nd| {
-                                tz.from_local_datetime(&nd.and_hms_opt(0, 0, 0)?)
-                                    .single()
-                                    .map(|d| d.timestamp_millis())
+                            .and_then(|nd| nd.and_hms_opt(0, 0, 0))
+                            .and_then(|ndt| {
+                                Self::resolve_local_datetime_deterministic(tz, &ndt).ok()
                             })
+                            .map(|d| d.timestamp_millis())
                     } else {
                         None
                     };
@@ -1189,11 +1248,11 @@ impl NativeConnectorAdapter for GoogleAdapter {
                         // Google Calendar all-day event end dates are exclusive (midnight of end date)
                         chrono::NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
                             .ok()
-                            .and_then(|nd| {
-                                tz.from_local_datetime(&nd.and_hms_opt(0, 0, 0)?)
-                                    .single()
-                                    .map(|d| d.timestamp_millis())
+                            .and_then(|nd| nd.and_hms_opt(0, 0, 0))
+                            .and_then(|ndt| {
+                                Self::resolve_local_datetime_deterministic(tz, &ndt).ok()
                             })
+                            .map(|d| d.timestamp_millis())
                     } else {
                         None
                     };

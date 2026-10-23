@@ -282,12 +282,12 @@ impl RemoteMcpClient {
         }
 
         for (k, v) in extra_headers {
-            if let (Ok(hk), Ok(hv)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(v),
-            ) {
-                headers.insert(hk, hv);
-            }
+            Self::validate_mcp_projected_header(k, v)?;
+            let hk = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| format!("Invalid header name '{}': {}", k, e))?;
+            let hv = HeaderValue::from_str(v)
+                .map_err(|e| format!("Invalid header value for '{}': {}", k, e))?;
+            headers.insert(hk, hv);
         }
 
         if let Some(ref tok) = self.auth_token {
@@ -325,8 +325,80 @@ impl RemoteMcpClient {
         err_text.to_string()
     }
 
+    /// Reserved HTTP headers that cannot be overridden or projected from external MCP schemas.
+    pub const RESERVED_MCP_HEADERS: &'static [&'static str] = &[
+        "authorization",
+        "content-type",
+        "accept",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "mcp-method",
+        "mcp-name",
+        "mcp-routing",
+        "user-agent",
+        "host",
+        "connection",
+        "transfer-encoding",
+        "upgrade",
+        "cookie",
+        "proxy-authorization",
+    ];
+
+    /// Check if a header name is a reserved transport or authentication header
+    pub fn is_reserved_mcp_header(name: &str) -> bool {
+        let lower = name.trim().to_lowercase();
+        Self::RESERVED_MCP_HEADERS.contains(&lower.as_str()) || lower.starts_with("mcp-session")
+    }
+
+    /// Validate a projected MCP header name and value against explicit security and formatting policies
+    pub fn validate_mcp_projected_header(name: &str, value: &str) -> Result<(), String> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return Err("MCP projected header name cannot be empty".to_string());
+        }
+
+        if Self::is_reserved_mcp_header(trimmed_name) {
+            return Err(format!(
+                "Security denial: header '{}' is reserved by transport/authentication layer and cannot be projected from MCP tool parameters",
+                trimmed_name
+            ));
+        }
+
+        // Validate header name contains valid ASCII token characters
+        if !trimmed_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "Invalid MCP projected header name '{}': names must be alphanumeric ASCII characters with hyphens or underscores",
+                trimmed_name
+            ));
+        }
+
+        // Validate with reqwest HeaderName parser
+        reqwest::header::HeaderName::from_bytes(trimmed_name.as_bytes())
+            .map_err(|e| format!("Invalid HTTP header name '{}': {}", trimmed_name, e))?;
+
+        // Header injection prevention: reject CRLF or null bytes in value
+        if value.contains('\r') || value.contains('\n') || value.contains('\0') {
+            return Err(format!(
+                "Security denial: header value for '{}' contains forbidden newline or control character",
+                trimmed_name
+            ));
+        }
+
+        // Validate with reqwest HeaderValue parser
+        HeaderValue::from_str(value)
+            .map_err(|e| format!("Invalid HTTP header value for '{}': {}", trimmed_name, e))?;
+
+        Ok(())
+    }
+
     /// Extract Mcp-Param-* headers for schema properties marked with x-mcp-header
-    pub fn extract_mcp_param_headers(schema: &Value, args: &Value) -> Vec<(String, String)> {
+    pub fn extract_mcp_param_headers(
+        schema: &Value,
+        args: &Value,
+    ) -> Result<Vec<(String, String)>, String> {
         let mut headers = Vec::new();
         if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
             for (prop_name, prop_def) in props {
@@ -347,12 +419,13 @@ impl RemoteMcpClient {
                             Value::Bool(b) => b.to_string(),
                             other => other.to_string(),
                         };
+                        Self::validate_mcp_projected_header(&header_name, &val_str)?;
                         headers.push((header_name, val_str));
                     }
                 }
             }
         }
-        headers
+        Ok(headers)
     }
 
     async fn send_json_rpc(
@@ -736,7 +809,7 @@ impl RemoteMcpClient {
         // Strictly validate arguments against declared schema before sending over network
         validate_schema(schema, &args)?;
 
-        let param_headers = Self::extract_mcp_param_headers(schema, &args);
+        let param_headers = Self::extract_mcp_param_headers(schema, &args)?;
 
         let params = json!({
             "name": tool_name,
@@ -772,5 +845,82 @@ impl RemoteMcpClient {
         }
 
         Ok(text_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_reserved_header_rejection() {
+        assert!(RemoteMcpClient::is_reserved_mcp_header("Authorization"));
+        assert!(RemoteMcpClient::is_reserved_mcp_header("authorization"));
+        assert!(RemoteMcpClient::is_reserved_mcp_header("Content-Type"));
+        assert!(RemoteMcpClient::is_reserved_mcp_header("accept"));
+        assert!(RemoteMcpClient::is_reserved_mcp_header(
+            "MCP-Protocol-Version"
+        ));
+        assert!(RemoteMcpClient::is_reserved_mcp_header("Mcp-Session-Id"));
+        assert!(RemoteMcpClient::is_reserved_mcp_header("User-Agent"));
+        assert!(RemoteMcpClient::is_reserved_mcp_header("Host"));
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "x-mcp-header": "Authorization"
+                }
+            }
+        });
+        let args = json!({ "token": "malicious_override" });
+        let err = RemoteMcpClient::extract_mcp_param_headers(&schema, &args).unwrap_err();
+        assert!(err.contains("is reserved"));
+    }
+
+    #[test]
+    fn test_malformed_header_rejection() {
+        // Space in header name
+        let err1 = RemoteMcpClient::validate_mcp_projected_header("Bad Header", "val").unwrap_err();
+        assert!(err1.contains("Invalid MCP projected header name"));
+
+        // CRLF in value
+        let err2 =
+            RemoteMcpClient::validate_mcp_projected_header("X-Param", "val\r\nInjected: evil")
+                .unwrap_err();
+        assert!(err2.contains("newline"));
+
+        // Null byte in value
+        let err3 =
+            RemoteMcpClient::validate_mcp_projected_header("X-Param", "val\0evil").unwrap_err();
+        assert!(err3.contains("newline or control character"));
+    }
+
+    #[test]
+    fn test_legitimate_custom_mcp_headers() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tenant_id": {
+                    "type": "string",
+                    "x-mcp-header": true
+                },
+                "cluster": {
+                    "type": "string",
+                    "x-mcp-header": "X-Custom-Cluster"
+                }
+            }
+        });
+        let args = json!({
+            "tenant_id": "tenant-1234",
+            "cluster": "prod-us-east"
+        });
+
+        let headers = RemoteMcpClient::extract_mcp_param_headers(&schema, &args).unwrap();
+        assert_eq!(headers.len(), 2);
+        assert!(headers.contains(&("Mcp-Param-tenant_id".to_string(), "tenant-1234".to_string())));
+        assert!(headers.contains(&("X-Custom-Cluster".to_string(), "prod-us-east".to_string())));
     }
 }

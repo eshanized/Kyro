@@ -64,6 +64,27 @@ pub struct ActiveRunContext {
     pub base_url: Option<String>,
 }
 
+/// RAII Drop guard to ensure active run context cleanup on all exit paths
+struct ActiveRunGuard {
+    run_id: String,
+    active_runs: Arc<TokioMutex<HashMap<String, ActiveRunContext>>>,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.active_runs.try_lock() {
+            map.remove(&self.run_id);
+        } else {
+            let active_runs = self.active_runs.clone();
+            let run_id = self.run_id.clone();
+            tokio::spawn(async move {
+                let mut map = active_runs.lock().await;
+                map.remove(&run_id);
+            });
+        }
+    }
+}
+
 pub struct AgentLoopEngine {
     router: ModelRouter,
     active_runs: Arc<TokioMutex<HashMap<String, ActiveRunContext>>>,
@@ -180,6 +201,12 @@ impl AgentLoopEngine {
         } else {
             true
         }
+    }
+
+    /// Returns whether a run has an active in-memory execution context
+    pub async fn is_run_active(&self, run_id: &str) -> bool {
+        let map = self.active_runs.lock().await;
+        map.contains_key(run_id)
     }
 
     /// Returns whether a run has been requested to be cancelled
@@ -408,6 +435,10 @@ The program is started as an explicit executable plus argument vector; free-form
         let token = cancel_token.unwrap_or_default();
         self.register_run(run_id, token.clone(), model, api_key, base_url)
             .await;
+        let _run_guard = ActiveRunGuard {
+            run_id: run_id.to_string(),
+            active_runs: self.active_runs.clone(),
+        };
 
         if token.is_cancelled() || self.is_run_cancelled(run_id).await {
             return Err("Agent run was cancelled by user before execution started".to_string());
@@ -463,9 +494,14 @@ The program is started as an explicit executable plus argument vector; free-form
 
         let max_steps = 25;
         let mut final_content = String::new();
+        let mut is_completed = false;
 
         for step in 1..=max_steps {
             if token.is_cancelled() {
+                {
+                    let mut map = self.active_runs.lock().await;
+                    map.remove(run_id);
+                }
                 let _ = db.update_run_status(
                     run_id,
                     "cancelled",
@@ -479,12 +515,16 @@ The program is started as an explicit executable plus argument vector; free-form
             // Wait if human takeover is active
             while TakeoverController::is_active() {
                 if token.is_cancelled() {
+                    {
+                        let mut map = self.active_runs.lock().await;
+                        map.remove(run_id);
+                    }
                     return Err("Agent run cancelled during human takeover".to_string());
                 }
                 sleep(Duration::from_millis(400)).await;
             }
 
-            let resp = self
+            let resp = match self
                 .router
                 .complete(
                     model,
@@ -495,7 +535,38 @@ The program is started as an explicit executable plus argument vector; free-form
                     &tools,
                     Some(&token),
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    {
+                        let mut map = self.active_runs.lock().await;
+                        map.remove(run_id);
+                    }
+                    let _ = db.update_run_status(
+                        run_id,
+                        "failed",
+                        None,
+                        Some(chrono::Utc::now().timestamp_millis()),
+                        Some(&e),
+                    );
+                    let seq = db.get_next_event_seq(run_id).unwrap_or(step as i64);
+                    let err_event = RunEvent {
+                        id: format!("evt_{}_{}", run_id, seq),
+                        run_id: run_id.to_string(),
+                        seq,
+                        event_type: "error".to_string(),
+                        payload_json: serde_json::json!({
+                            "step": step,
+                            "error": &e,
+                        })
+                        .to_string(),
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                    };
+                    let _ = db.append_run_event(&err_event);
+                    return Err(e);
+                }
+            };
 
             // Record thought in event timeline
             let seq = db.get_next_event_seq(run_id).unwrap_or(1);
@@ -516,6 +587,7 @@ The program is started as an explicit executable plus argument vector; free-form
 
             if resp.tool_calls.is_empty() {
                 final_content = resp.content.clone();
+                is_completed = true;
                 on_event(AgentStepEvent {
                     run_id: run_id.to_string(),
                     conversation_id: run_conversation_id.clone(),
@@ -711,6 +783,42 @@ The program is started as an explicit executable plus argument vector; free-form
                 tool_results,
                 is_finished: false,
             });
+        }
+
+        if !is_completed {
+            {
+                let mut map = self.active_runs.lock().await;
+                map.remove(run_id);
+            }
+            let err_msg = format!(
+                "Agent reached maximum step limit ({}) without completing the task",
+                max_steps
+            );
+            let _ = db.update_run_status(
+                run_id,
+                "failed",
+                None,
+                Some(chrono::Utc::now().timestamp_millis()),
+                Some(&err_msg),
+            );
+            let seq = db
+                .get_next_event_seq(run_id)
+                .unwrap_or(max_steps as i64 + 1);
+            let err_event = RunEvent {
+                id: format!("evt_{}_{}", run_id, seq),
+                run_id: run_id.to_string(),
+                seq,
+                event_type: "error".to_string(),
+                payload_json: serde_json::json!({
+                    "step": max_steps,
+                    "error": &err_msg,
+                    "reason": "step_limit_exceeded"
+                })
+                .to_string(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+            };
+            let _ = db.append_run_event(&err_event);
+            return Err(err_msg);
         }
 
         // Clean up active run context
@@ -1144,89 +1252,71 @@ The program is started as an explicit executable plus argument vector; free-form
             }
             "read_file" => {
                 let path = tc.arguments["path"].as_str().unwrap_or_default();
-                let safe_path = match AuthorizationEngine::validate_path_confinement(
-                    workspace_root,
-                    path,
-                    crate::governance::FileOp::Read,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => return (format!("Filesystem access denied: {}", e), true, None),
-                };
-
-                match std::fs::read_to_string(&safe_path) {
-                    Ok(mut content) => {
-                        const MAX_READ_BYTES: usize = 512 * 1024;
-                        if content.len() > MAX_READ_BYTES {
-                            content.truncate(MAX_READ_BYTES);
-                            content.push_str("\n...[Content truncated at 512KB limit]");
-                        }
-                        (content, false, None)
-                    }
-                    Err(e) => (format!("Failed to read file '{}': {}", path, e), true, None),
+                match AuthorizationEngine::secure_read_contained(workspace_root, path) {
+                    Ok(content) => (content, false, None),
+                    Err(e) => (format!("Filesystem access denied: {}", e), true, None),
                 }
             }
             "write_file" => {
                 let path = tc.arguments["path"].as_str().unwrap_or_default();
                 let content = tc.arguments["content"].as_str().unwrap_or_default();
-                let safe_path = match AuthorizationEngine::validate_path_confinement(
+                let safe_path = match AuthorizationEngine::secure_write_contained(
                     workspace_root,
                     path,
-                    crate::governance::FileOp::Write,
+                    content.as_bytes(),
                 ) {
                     Ok(p) => p,
                     Err(e) => return (format!("Filesystem access denied: {}", e), true, None),
                 };
 
-                if let Some(parent) = safe_path.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                match std::fs::write(&safe_path, content) {
-                    Ok(_) => {
-                        // Register write_file into artifacts registry
-                        let file_name = safe_path
-                            .file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "file.txt".to_string());
-                        let conv_id = db
-                            .get_run(run_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|r| r.conversation_id);
-                        let ext = safe_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        let art_type = match ext {
-                            "rs" | "ts" | "tsx" | "js" | "py" | "sh" | "c" | "cpp" | "go" => "code",
-                            "md" | "txt" => "markdown",
-                            "json" => "json",
-                            "png" | "jpg" | "jpeg" => "image",
-                            _ => "document",
-                        };
-                        let rec = crate::storage::ArtifactRecord {
-                            id: format!("art_{}", uuid::Uuid::new_v4()),
-                            run_id: Some(run_id.to_string()),
-                            conversation_id: conv_id,
-                            name: file_name,
-                            file_path: safe_path.to_string_lossy().to_string(),
-                            artifact_type: art_type.to_string(),
-                            mime_type: "text/plain".to_string(),
-                            size_bytes: content.len() as i64,
-                            created_at: chrono::Utc::now().timestamp_millis(),
-                            metadata_json: None,
-                        };
-                        let _ = db.create_artifact(&rec);
-
-                        (
-                            format!(
-                                "Successfully wrote {} bytes to '{}'",
-                                content.len(),
-                                safe_path.display()
-                            ),
-                            false,
-                            None,
-                        )
-                    }
-                    Err(e) => (
-                        format!("Failed to write file '{}': {}", safe_path.display(), e),
-                        true,
+                // Register write_file into artifacts registry
+                let file_name = safe_path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file.txt".to_string());
+                let conv_id = db
+                    .get_run(run_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.conversation_id);
+                let ext = safe_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let art_type = match ext {
+                    "rs" | "ts" | "tsx" | "js" | "py" | "sh" | "c" | "cpp" | "go" => "code",
+                    "md" | "txt" => "markdown",
+                    "json" => "json",
+                    "png" | "jpg" | "jpeg" => "image",
+                    _ => "document",
+                };
+                let rec = crate::storage::ArtifactRecord {
+                    id: format!("art_{}", uuid::Uuid::new_v4()),
+                    run_id: Some(run_id.to_string()),
+                    conversation_id: conv_id,
+                    name: file_name,
+                    file_path: safe_path.to_string_lossy().to_string(),
+                    artifact_type: art_type.to_string(),
+                    mime_type: "text/plain".to_string(),
+                    size_bytes: content.len() as i64,
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                    metadata_json: None,
+                };
+                match db.create_artifact(&rec) {
+                    Ok(_) => (
+                        format!(
+                            "Successfully wrote {} bytes to '{}'",
+                            content.len(),
+                            safe_path.display()
+                        ),
+                        false,
+                        None,
+                    ),
+                    Err(err) => (
+                        format!(
+                            "Partial success: Wrote {} bytes to '{}', but failed to persist artifact metadata in database: {}. File can be recovered via artifact reconciliation.",
+                            content.len(),
+                            safe_path.display(),
+                            err
+                        ),
+                        false,
                         None,
                     ),
                 }

@@ -1392,3 +1392,357 @@ fn test_revoked_folder_and_prune_removes_authorization_and_indexed_data() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn test_calendar_timezone_dst_deterministic_resolution() {
+    use chrono::{NaiveDate, Offset};
+
+    // 1. Normal unambiguous time
+    let tz_ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+    let dt_normal = NaiveDate::from_ymd_opt(2026, 6, 15)
+        .unwrap()
+        .and_hms_opt(9, 0, 0)
+        .unwrap();
+    let res_normal =
+        GoogleAdapter::resolve_local_datetime_deterministic(tz_ny, &dt_normal).unwrap();
+    assert_eq!(res_normal.to_rfc3339(), "2026-06-15T09:00:00-04:00");
+
+    // 2. Spring-forward gap in America/New_York (2026-03-08: clocks jump 02:00 -> 03:00)
+    // 02:30 does not exist locally; advancing in 15-min increments finds 03:00
+    let dt_gap_ny = NaiveDate::from_ymd_opt(2026, 3, 8)
+        .unwrap()
+        .and_hms_opt(2, 30, 0)
+        .unwrap();
+    let res_gap_ny =
+        GoogleAdapter::resolve_local_datetime_deterministic(tz_ny, &dt_gap_ny).unwrap();
+    assert_eq!(res_gap_ny.to_rfc3339(), "2026-03-08T03:00:00-04:00");
+
+    // 3. Fall-back ambiguous in America/New_York (2026-11-01: clocks repeat 01:00 -> 02:00)
+    // 01:30 occurs twice (-04:00 and -05:00); earliest (-04:00) must be selected deterministically
+    let dt_ambig_ny = NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(1, 30, 0)
+        .unwrap();
+    let res_ambig_ny =
+        GoogleAdapter::resolve_local_datetime_deterministic(tz_ny, &dt_ambig_ny).unwrap();
+    assert_eq!(res_ambig_ny.to_rfc3339(), "2026-11-01T01:30:00-04:00");
+    assert_eq!(res_ambig_ny.offset().fix().local_minus_utc(), -4 * 3600);
+
+    // 4. Spring-forward gap in Europe/London (2026-03-29: clocks jump 01:00 -> 02:00)
+    let tz_london: chrono_tz::Tz = "Europe/London".parse().unwrap();
+    let dt_gap_london = NaiveDate::from_ymd_opt(2026, 3, 29)
+        .unwrap()
+        .and_hms_opt(1, 30, 0)
+        .unwrap();
+    let res_gap_london =
+        GoogleAdapter::resolve_local_datetime_deterministic(tz_london, &dt_gap_london).unwrap();
+    assert_eq!(res_gap_london.to_rfc3339(), "2026-03-29T02:00:00+01:00");
+
+    // 5. Spring-forward gap in Australia/Sydney (2026-10-04: clocks jump 02:00 -> 03:00)
+    let tz_sydney: chrono_tz::Tz = "Australia/Sydney".parse().unwrap();
+    let dt_gap_sydney = NaiveDate::from_ymd_opt(2026, 10, 4)
+        .unwrap()
+        .and_hms_opt(2, 30, 0)
+        .unwrap();
+    let res_gap_sydney =
+        GoogleAdapter::resolve_local_datetime_deterministic(tz_sydney, &dt_gap_sydney).unwrap();
+    assert_eq!(res_gap_sydney.to_rfc3339(), "2026-10-04T03:00:00+11:00");
+}
+
+#[tokio::test]
+async fn test_calendar_list_events_multi_page_pagination() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mock_base = format!("http://127.0.0.1:{}", port);
+
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+
+            let mut buf = [0u8; 8192];
+            let n = match socket.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or_default();
+
+            let (status, body) = if first_line.contains("pageToken=tok_page2") {
+                // Page 2: final page
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "items": [
+                            {
+                                "id": "event_3",
+                                "summary": "Design Sync",
+                                "start": { "dateTime": "2026-10-23T15:00:00Z" },
+                                "end": { "dateTime": "2026-10-23T16:00:00Z" }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                )
+            } else {
+                // Page 1: returns 2 items + nextPageToken
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "items": [
+                            {
+                                "id": "event_1",
+                                "summary": "Standup",
+                                "start": { "dateTime": "2026-10-23T09:00:00Z" },
+                                "end": { "dateTime": "2026-10-23T09:30:00Z" }
+                            },
+                            {
+                                "id": "event_2",
+                                "summary": "Planning",
+                                "start": { "dateTime": "2026-10-23T10:00:00Z" },
+                                "end": { "dateTime": "2026-10-23T11:00:00Z" }
+                            }
+                        ],
+                        "nextPageToken": "tok_page2"
+                    })
+                    .to_string(),
+                )
+            };
+
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let (_dir, _db, vault) = temp_db("cal_paged");
+    let adapter = GoogleAdapter::new();
+    let account = ConnectedAccountRecord {
+        id: "conn_cal_paged".to_string(),
+        connector_id: "google".to_string(),
+        account_identifier: "user@example.com".to_string(),
+        display_name: "Google (User)".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "cred_cal_paged".to_string(),
+        config_json: serde_json::json!({ "base_url": mock_base }).to_string(),
+        created_at: 0,
+        updated_at: 0,
+        last_connected_at: None,
+        last_error: None,
+        expires_at: None,
+    };
+    vault
+        .set_secret("cred_cal_paged", "mock_bearer_token")
+        .unwrap();
+
+    let res_raw = adapter
+        .execute_tool(
+            &account,
+            "calendar_list_events",
+            serde_json::json!({ "max_results": 10 }),
+            &vault,
+        )
+        .await
+        .expect("calendar_list_events failed");
+
+    let val: serde_json::Value = serde_json::from_str(&res_raw).unwrap();
+    assert_eq!(val["total_events"].as_u64().unwrap(), 3);
+    assert_eq!(val["pages_retrieved"].as_u64().unwrap(), 2);
+    assert!(!val["has_more"].as_bool().unwrap());
+    assert!(val.get("warning").is_none());
+
+    let events = val["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["summary"], "Standup");
+    assert_eq!(events[1]["summary"], "Planning");
+    assert_eq!(events[2]["summary"], "Design Sync");
+}
+
+#[tokio::test]
+async fn test_calendar_list_events_pagination_safety_limit_warning() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mock_base = format!("http://127.0.0.1:{}", port);
+
+    // Infinite pagination server
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+
+            let mut buf = [0u8; 8192];
+            let _n = match socket.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+
+            let body = serde_json::json!({
+                "items": [
+                    {
+                        "id": "event_repeat",
+                        "summary": "Infinite Event",
+                        "start": { "dateTime": "2026-10-23T09:00:00Z" },
+                        "end": { "dateTime": "2026-10-23T09:30:00Z" }
+                    }
+                ],
+                "nextPageToken": "keep_going_forever"
+            })
+            .to_string();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let (_dir, _db, vault) = temp_db("cal_limit");
+    let adapter = GoogleAdapter::new();
+    let account = ConnectedAccountRecord {
+        id: "conn_cal_limit".to_string(),
+        connector_id: "google".to_string(),
+        account_identifier: "user@example.com".to_string(),
+        display_name: "Google (User)".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "cred_cal_limit".to_string(),
+        config_json: serde_json::json!({ "base_url": mock_base }).to_string(),
+        created_at: 0,
+        updated_at: 0,
+        last_connected_at: None,
+        last_error: None,
+        expires_at: None,
+    };
+    vault
+        .set_secret("cred_cal_limit", "mock_bearer_token")
+        .unwrap();
+
+    let res_raw = adapter
+        .execute_tool(
+            &account,
+            "calendar_list_events",
+            serde_json::json!({ "max_results": 1 }),
+            &vault,
+        )
+        .await
+        .expect("calendar_list_events should succeed with truncated warning");
+
+    let val: serde_json::Value = serde_json::from_str(&res_raw).unwrap();
+    assert_eq!(val["pages_retrieved"].as_u64().unwrap(), 10);
+    assert!(val["has_more"].as_bool().unwrap());
+    assert!(val["warning"]
+        .as_str()
+        .unwrap()
+        .contains("Calendar events list safety limit reached (10 pages)"));
+    assert_eq!(val["total_events"].as_u64().unwrap(), 10);
+}
+
+#[tokio::test]
+async fn test_calendar_find_meeting_times_all_day_event_under_dst() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mock_base = format!("http://127.0.0.1:{}", port);
+
+    // Mock server returns an all-day conference on 2026-03-08 (DST change day in America/New_York)
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+
+            let mut buf = [0u8; 8192];
+            let _n = match socket.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+
+            let body = serde_json::json!({
+                "items": [
+                    {
+                        "id": "conf_all_day",
+                        "summary": "Annual Offsite",
+                        "start": { "date": "2026-03-08" },
+                        "end": { "date": "2026-03-09" }
+                    }
+                ]
+            })
+            .to_string();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let (_dir, _db, vault) = temp_db("cal_allday_dst");
+    let adapter = GoogleAdapter::new();
+    let account = ConnectedAccountRecord {
+        id: "conn_cal_allday".to_string(),
+        connector_id: "google".to_string(),
+        account_identifier: "user@example.com".to_string(),
+        display_name: "Google (User)".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "cred_cal_allday".to_string(),
+        config_json: serde_json::json!({ "base_url": mock_base }).to_string(),
+        created_at: 0,
+        updated_at: 0,
+        last_connected_at: None,
+        last_error: None,
+        expires_at: None,
+    };
+    vault
+        .set_secret("cred_cal_allday", "mock_bearer_token")
+        .unwrap();
+
+    let res_raw = adapter
+        .execute_tool(
+            &account,
+            "calendar_find_meeting_times",
+            serde_json::json!({
+                "date": "2026-03-08",
+                "timezone": "America/New_York",
+                "work_start_hour": 9,
+                "work_end_hour": 17,
+                "duration_minutes": 30
+            }),
+            &vault,
+        )
+        .await
+        .expect("find meeting times should succeed across DST transition");
+
+    let val: serde_json::Value = serde_json::from_str(&res_raw).unwrap();
+    // The all-day event covers 09:00 - 17:00, so busy_slots has it and has_availability is false
+    assert!(!val["has_availability"].as_bool().unwrap());
+    let busy = val["busy_slots"].as_array().unwrap();
+    assert_eq!(busy.len(), 1);
+    assert_eq!(busy[0]["summary"], "Annual Offsite");
+}

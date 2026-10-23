@@ -472,6 +472,136 @@ fn a_write_inside_the_workspace_is_allowed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn secure_write_contained_rejects_parent_symlink_escape_attack() {
+    let (dir, _db) = temp_db("symlink_parent_attack");
+    let workspace = dir.join("workspace");
+    let outside = dir.join("outside_target");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    #[cfg(unix)]
+    {
+        // Adversarial setup: symlink inside workspace pointing to an outside directory
+        let symlink_dir = workspace.join("sub_link");
+        std::os::unix::fs::symlink(&outside, &symlink_dir).unwrap();
+
+        // Attempting to write into sub_link/payload.txt must fail closed
+        let res = AuthorizationEngine::secure_write_contained(
+            Some(&workspace),
+            "sub_link/payload.txt",
+            b"exploit",
+        );
+        assert!(
+            res.is_err(),
+            "Must reject writing through symlink that escapes workspace"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("escapes workspace root") || err.contains("Security denial"),
+            "Got: {}",
+            err
+        );
+        assert!(
+            !outside.join("payload.txt").exists(),
+            "Payload must not have been written outside"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn secure_write_contained_rejects_destination_symlink_escape_attack() {
+    let (dir, _db) = temp_db("symlink_dest_attack");
+    let workspace = dir.join("workspace");
+    let outside = dir.join("outside_target");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    #[cfg(unix)]
+    {
+        let outside_file = outside.join("victim.txt");
+        std::fs::write(&outside_file, "original content").unwrap();
+
+        let symlink_file = workspace.join("target.txt");
+        std::os::unix::fs::symlink(&outside_file, &symlink_file).unwrap();
+
+        let res = AuthorizationEngine::secure_write_contained(
+            Some(&workspace),
+            "target.txt",
+            b"overwritten",
+        );
+        assert!(
+            res.is_err(),
+            "Must reject writing to symlink targeting outside workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "original content",
+            "Victim file outside workspace must not be overwritten"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn secure_write_contained_propagates_parent_creation_failure() {
+    let (dir, _db) = temp_db("parent_fail");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // Create a regular file where a directory component would be
+    let obstacle = workspace.join("not_a_dir");
+    std::fs::write(&obstacle, "file content").unwrap();
+
+    // Attempting to write to not_a_dir/child.txt must explicitly propagate parent creation error
+    let res = AuthorizationEngine::secure_write_contained(
+        Some(&workspace),
+        "not_a_dir/child.txt",
+        b"content",
+    );
+    assert!(
+        res.is_err(),
+        "Must fail when parent directory creation fails"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("Failed to create parent directories"),
+        "Got: {}",
+        err
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn secure_write_contained_succeeds_for_legitimate_nested_path() {
+    let (dir, _db) = temp_db("legit_nested");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let res = AuthorizationEngine::secure_write_contained(
+        Some(&workspace),
+        "src/components/Button.tsx",
+        b"export const Button = () => null;",
+    );
+    assert!(
+        res.is_ok(),
+        "Legitimate nested write must succeed: {:?}",
+        res
+    );
+    let written = res.unwrap();
+    assert!(written.exists());
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "export const Button = () => null;"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------
 // Browser navigation boundaries
 // ---------------------------------------------------------------------

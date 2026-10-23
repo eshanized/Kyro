@@ -187,6 +187,104 @@ fn test_database_run_events_atomicity_and_sequencing() {
     assert_eq!(delta[0].seq, 2);
 }
 
+#[tokio::test]
+async fn test_concurrent_event_writers_atomic_sequencing_and_uniqueness() {
+    let (db, _td) = create_test_db();
+    let run_id = "run_concurrent_writers";
+
+    // Setup conversation and run
+    db.create_conversation("conv_writers", "Concurrent Test", "test-model")
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let run = AgentRun {
+        id: run_id.to_string(),
+        conversation_id: Some("conv_writers".to_string()),
+        agent_id: "apex".to_string(),
+        model: "test-model".to_string(),
+        prompt: "Concurrent writer test".to_string(),
+        status: "running".to_string(),
+        created_at: now,
+        started_at: Some(now),
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    db.create_run(&run).unwrap();
+
+    // Spawn 10 concurrent tasks each appending 10 events
+    let mut handles = Vec::new();
+    for task_idx in 0..10 {
+        let db_cloned = db.clone();
+        handles.push(tokio::spawn(async move {
+            for event_idx in 0..10 {
+                let payload = json!({
+                    "task": task_idx,
+                    "event": event_idx
+                })
+                .to_string();
+                db_cloned
+                    .append_new_run_event(run_id, "test_event", &payload)
+                    .expect("Concurrent event append must succeed");
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Verify all 100 events persisted
+    let events = db.get_run_events(run_id, None).unwrap();
+    assert_eq!(events.len(), 100);
+
+    // Verify sequences are strictly contiguous and unique 1..=100
+    let mut seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
+    seqs.sort();
+    let expected: Vec<i64> = (1..=100).collect();
+    assert_eq!(
+        seqs, expected,
+        "Event sequences must be strictly unique and contiguous"
+    );
+}
+
+#[test]
+fn test_artifact_record_reconciliation_recovery_path() {
+    let (db, td) = create_test_db();
+    let file_path = td.path().join("orphaned_report.md");
+    std::fs::write(
+        &file_path,
+        "# Orphaned Analysis Report\nContent preserved on disk.",
+    )
+    .unwrap();
+
+    // Verify file is not yet in the artifact registry
+    let initial_arts = db.list_artifacts(None, None).unwrap();
+    assert!(initial_arts
+        .iter()
+        .all(|a| a.file_path != file_path.to_string_lossy()));
+
+    // Run reconciliation recovery
+    let rec = db
+        .reconcile_file_as_artifact(&file_path, None, None)
+        .expect("Artifact reconciliation must succeed for existing on-disk file");
+
+    assert_eq!(rec.name, "orphaned_report.md");
+    assert_eq!(rec.artifact_type, "markdown");
+    assert_eq!(
+        rec.size_bytes,
+        std::fs::metadata(&file_path).unwrap().len() as i64
+    );
+
+    // Verify artifact is now discoverable in database
+    let queried = db
+        .get_artifact(&rec.id)
+        .unwrap()
+        .expect("Artifact must exist");
+    assert_eq!(queried.file_path, file_path.to_string_lossy());
+    assert!(queried.metadata_json.unwrap().contains("reconciled"));
+}
+
 #[test]
 fn test_database_approval_requests_expiration_and_consumption() {
     let (db, _td) = create_test_db();

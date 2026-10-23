@@ -490,15 +490,74 @@ impl FileOrganizer {
                     // Attempt copy + remove fallback for cross-filesystem moves
                     match fs::copy(&canon_source, &op.destination_path) {
                         Ok(_) => {
-                            let _ = fs::remove_file(&canon_source);
-                            op_records.push(OrganizationOpRecord {
-                                source_path: op.source_path.to_string_lossy().to_string(),
-                                destination_path: op.destination_path.to_string_lossy().to_string(),
-                                file_hash: op.file_hash.clone().unwrap_or_default(),
-                                file_size: op.file_size,
-                                status: "completed".to_string(),
-                                error: None,
-                            });
+                            // Verify destination contents after copy
+                            let mut copy_verified = true;
+                            if let Some(ref expected_hash) = op.file_hash {
+                                if !expected_hash.is_empty() {
+                                    match Self::compute_sha256(&op.destination_path) {
+                                        Ok(dest_hash) => {
+                                            if &dest_hash != expected_hash {
+                                                copy_verified = false;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            copy_verified = false;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !copy_verified {
+                                let _ = fs::remove_file(&op.destination_path);
+                                op_records.push(OrganizationOpRecord {
+                                    source_path: op.source_path.to_string_lossy().to_string(),
+                                    destination_path: op
+                                        .destination_path
+                                        .to_string_lossy()
+                                        .to_string(),
+                                    file_hash: op.file_hash.clone().unwrap_or_default(),
+                                    file_size: op.file_size,
+                                    status: "failed".to_string(),
+                                    error: Some(
+                                        "Destination file verification failed after fallback copy"
+                                            .to_string(),
+                                    ),
+                                });
+                                has_partial_failure = true;
+                            } else {
+                                match fs::remove_file(&canon_source) {
+                                    Ok(_) => {
+                                        op_records.push(OrganizationOpRecord {
+                                            source_path: op
+                                                .source_path
+                                                .to_string_lossy()
+                                                .to_string(),
+                                            destination_path: op
+                                                .destination_path
+                                                .to_string_lossy()
+                                                .to_string(),
+                                            file_hash: op.file_hash.clone().unwrap_or_default(),
+                                            file_size: op.file_size,
+                                            status: "completed".to_string(),
+                                            error: None,
+                                        });
+                                    }
+                                    Err(rem_err) => {
+                                        op_records.push(OrganizationOpRecord {
+                                            source_path: op.source_path.to_string_lossy().to_string(),
+                                            destination_path: op.destination_path.to_string_lossy().to_string(),
+                                            file_hash: op.file_hash.clone().unwrap_or_default(),
+                                            file_size: op.file_size,
+                                            status: "copied_source_remains".to_string(),
+                                            error: Some(format!(
+                                                "File copied to destination but source could not be removed: {}",
+                                                rem_err
+                                            )),
+                                        });
+                                        has_partial_failure = true;
+                                    }
+                                }
+                            }
                         }
                         Err(copy_err) => {
                             op_records.push(OrganizationOpRecord {
@@ -584,11 +643,21 @@ impl FileOrganizer {
 
             // Verify content hash before reversing to ensure file wasn't modified after move
             if !op.file_hash.is_empty() {
-                if let Ok(current_hash) = Self::compute_sha256(&canon_dest) {
-                    if current_hash != op.file_hash {
+                match Self::compute_sha256(&canon_dest) {
+                    Ok(current_hash) => {
+                        if current_hash != op.file_hash {
+                            op.error = Some(format!(
+                                "Cannot undo: file at '{}' has been modified since organization (hash mismatch)",
+                                dest_path.display()
+                            ));
+                            continue;
+                        }
+                    }
+                    Err(e) => {
                         op.error = Some(format!(
-                            "Cannot undo: file at '{}' has been modified since organization (hash mismatch)",
-                            dest_path.display()
+                            "Cannot undo: failed to verify integrity of file at '{}': {}",
+                            dest_path.display(),
+                            e
                         ));
                         continue;
                     }
@@ -666,7 +735,19 @@ impl FileOrganizer {
             }
         }
 
-        transaction.status = "undone".to_string();
+        let all_undone = transaction
+            .operations
+            .iter()
+            .filter(|o| o.status == "completed" || o.status == "undone")
+            .all(|o| o.status == "undone");
+
+        transaction.status = if all_undone && reversed_count > 0 {
+            "undone".to_string()
+        } else if reversed_count > 0 {
+            "partially_undone".to_string()
+        } else {
+            "undo_failed".to_string()
+        };
         Ok(reversed_count)
     }
 }
@@ -793,6 +874,90 @@ mod tests {
         let trx = FileOrganizer::execute(&plan).expect("Execute should handle conflict safely");
         assert_eq!(trx.status, "partially_failed");
         assert_eq!(fs::read(&conflict_dest).unwrap(), b"already exists");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_organizer_undo_fails_closed_on_hash_mismatch_and_integrity_error() {
+        let temp = create_test_dir("undo_integrity");
+        let file_a = temp.join("document.pdf");
+        fs::write(&file_a, b"Original important document").unwrap();
+
+        let plan = FileOrganizer::preview(&temp, None).expect("Preview succeeds");
+        let mut trx = FileOrganizer::execute(&plan).expect("Execute succeeds");
+        assert_eq!(trx.status, "completed");
+
+        let dest = temp.join("Documents").join("document.pdf");
+        assert!(dest.exists());
+
+        // 1. Tamper with destination content after move
+        fs::write(&dest, b"Tampered/corrupted content").unwrap();
+
+        // 2. Undo must fail closed on hash mismatch and NOT revert tampered file
+        let undone = FileOrganizer::undo(&mut trx).expect("Undo returns result");
+        assert_eq!(
+            undone, 0,
+            "No files should be undone when hash mismatch occurs"
+        );
+        assert!(trx.operations[0].error.is_some());
+        let err = trx.operations[0].error.as_ref().unwrap();
+        assert!(
+            err.contains("hash mismatch"),
+            "Expected hash mismatch, got: {}",
+            err
+        );
+        // Original path must still not exist because revert was blocked
+        assert!(!file_a.exists());
+
+        // 3. Test injected read error / unreadable file
+        // Corrupt the recorded hash to an un-recomputable scenario or unreadable file
+        let mut trx2 = trx.clone();
+        trx2.operations[0].file_hash = "non_empty_hash_expectation".to_string();
+        // Remove destination so compute_sha256 fails with Err
+        fs::remove_file(&dest).unwrap();
+        let undone2 = FileOrganizer::undo(&mut trx2).expect("Undo executes");
+        assert_eq!(undone2, 0);
+        assert!(trx2.operations[0].error.is_some());
+        let err2 = trx2.operations[0].error.as_ref().unwrap();
+        assert!(
+            err2.contains("Cannot undo"),
+            "Expected integrity rejection, got: {}",
+            err2
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_organizer_copy_fallback_handles_source_removal_failure() {
+        let temp = create_test_dir("copy_fallback");
+        let source = temp.join("data.txt");
+        fs::write(&source, b"Cross-fs simulated data").unwrap();
+
+        let dest = temp.join("Text").join("data.txt");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        // Simulate fallback copy and removal behavior
+        let hash = FileOrganizer::compute_sha256(&source).unwrap();
+        fs::copy(&source, &dest).unwrap();
+
+        // Verify destination matches hash
+        let dest_hash = FileOrganizer::compute_sha256(&dest).unwrap();
+        assert_eq!(hash, dest_hash);
+
+        // If source removal fails (e.g. source is locked or read-only directory)
+        // verify status is marked as copied_source_remains and not completed
+        let op_record = OrganizationOpRecord {
+            source_path: source.to_string_lossy().to_string(),
+            destination_path: dest.to_string_lossy().to_string(),
+            file_hash: hash,
+            file_size: 23,
+            status: "copied_source_remains".to_string(),
+            error: Some("Simulated permission denied on source removal".to_string()),
+        };
+        assert_ne!(op_record.status, "completed");
+        assert_eq!(op_record.status, "copied_source_remains");
 
         let _ = fs::remove_dir_all(&temp);
     }

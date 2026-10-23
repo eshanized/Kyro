@@ -522,7 +522,7 @@ impl Database {
                     created_at INTEGER NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
                 );
-                CREATE INDEX IF NOT EXISTS idx_run_events_run_seq ON run_events(run_id, seq);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_run_seq ON run_events(run_id, seq);
 
                 CREATE TABLE IF NOT EXISTS approval_requests (
                     id TEXT PRIMARY KEY,
@@ -1374,8 +1374,84 @@ impl Database {
 
     // Run Events (Ordered Event Timeline)
     pub fn append_run_event(&self, event: &RunEvent) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let mut attempts = 0;
+        let mut seq = event.seq;
+
+        loop {
+            let tx = conn.transaction()?;
+            if seq <= 0 {
+                seq = tx.query_row(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
+                    params![event.run_id],
+                    |r| r.get(0),
+                )?;
+            }
+
+            let event_id = if event.id.is_empty()
+                || event.id == format!("evt_{}_{}", event.run_id, event.seq)
+            {
+                format!("evt_{}_{}", event.run_id, seq)
+            } else {
+                event.id.clone()
+            };
+
+            let res = tx.execute(
+                "INSERT INTO run_events (id, run_id, seq, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_id,
+                    event.run_id,
+                    seq,
+                    event.event_type,
+                    event.payload_json,
+                    event.created_at
+                ],
+            );
+
+            match res {
+                Ok(_) => {
+                    tx.commit()?;
+                    return Ok(());
+                }
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation
+                        && attempts < 5 =>
+                {
+                    drop(tx);
+                    attempts += 1;
+                    seq = 0;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Atomically allocates the next sequence and appends a run event within a single transaction
+    pub fn append_new_run_event(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<RunEvent> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let event = RunEvent {
+            id: format!("evt_{}_{}", run_id, seq),
+            run_id: run_id.to_string(),
+            seq,
+            event_type: event_type.to_string(),
+            payload_json: payload_json.to_string(),
+            created_at: now,
+        };
+
+        tx.execute(
             "INSERT INTO run_events (id, run_id, seq, event_type, payload_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -1387,7 +1463,8 @@ impl Database {
                 event.created_at
             ],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(event)
     }
 
     pub fn get_run_events(&self, run_id: &str, after_seq: Option<i64>) -> Result<Vec<RunEvent>> {
@@ -2175,6 +2252,52 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Reconciles an unregistered file on disk into the artifact catalog
+    pub fn reconcile_file_as_artifact(
+        &self,
+        file_path: &std::path::Path,
+        run_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<ArtifactRecord> {
+        let meta = std::fs::metadata(file_path).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "Cannot reconcile artifact: failed to read file metadata for '{}': {}",
+                file_path.display(),
+                e
+            ))))
+        })?;
+
+        let file_name = file_path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file.txt".to_string());
+
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let art_type = match ext {
+            "rs" | "ts" | "tsx" | "js" | "py" | "sh" | "c" | "cpp" | "go" => "code",
+            "md" | "txt" => "markdown",
+            "json" => "json",
+            "png" | "jpg" | "jpeg" => "image",
+            _ => "document",
+        };
+
+        let rec = ArtifactRecord {
+            id: format!("art_{}", uuid::Uuid::new_v4()),
+            run_id: run_id.map(|s| s.to_string()),
+            conversation_id: conversation_id.map(|s| s.to_string()),
+            name: file_name,
+            file_path: file_path.to_string_lossy().to_string(),
+            artifact_type: art_type.to_string(),
+            mime_type: "text/plain".to_string(),
+            size_bytes: meta.len() as i64,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            metadata_json: Some(serde_json::json!({ "reconciled": true }).to_string()),
+        };
+
+        self.create_artifact(&rec)?;
+        Ok(rec)
     }
 
     pub fn list_artifacts(

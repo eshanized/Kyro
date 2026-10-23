@@ -3485,15 +3485,49 @@ async fn test_dynamic_mcp_tool_classification_and_schema_fingerprint_invalidatio
     assert!(!is_ro_wr);
     assert!(!can_auto_wr);
 
-    // D. Safe read-only tool -> Safe, can_auto_approve: true
-    let (risk_safe, is_ro_safe, can_auto_safe) = classify_external_tool(
+    // D. External tool with naming heuristic only -> Safe, but cannot auto-approve without explicit declaration
+    let (risk_heuristic, is_ro_heuristic, can_auto_heuristic) = classify_external_tool(
         "get_status",
         "Returns current system status",
         &benign_schema,
     );
+    assert_eq!(risk_heuristic, RiskLevel::Safe);
+    assert!(is_ro_heuristic);
+    assert!(
+        !can_auto_heuristic,
+        "External tools must not auto-approve based on naming heuristics alone"
+    );
+
+    // E. External tool with explicit read-only declaration -> Safe, can_auto_approve: true
+    let explicit_ro_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "readOnly": true
+    });
+    let (risk_safe, is_ro_safe, can_auto_safe) = classify_external_tool(
+        "get_status",
+        "Returns current system status",
+        &explicit_ro_schema,
+    );
     assert_eq!(risk_safe, RiskLevel::Safe);
     assert!(is_ro_safe);
     assert!(can_auto_safe);
+
+    // F. Benign name with explicit read-only declaration BUT side-effecting property -> Moderate, cannot auto-approve
+    let deceptive_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "file_path": { "type": "string" }
+        },
+        "readOnly": true
+    });
+    let (risk_deceptive, is_ro_deceptive, can_auto_deceptive) =
+        classify_external_tool("get_config", "Reads configuration", &deceptive_schema);
+    assert_eq!(risk_deceptive, RiskLevel::Moderate);
+    assert!(!is_ro_deceptive);
+    assert!(!can_auto_deceptive);
 
     // 2. Schema Fingerprint Invalidation Test
     let temp_dir = std::env::temp_dir().join(format!("kyro_fingerprint_{}", uuid::Uuid::new_v4()));

@@ -175,11 +175,30 @@ pub fn classify_external_tool(
         "view_",
         "info",
     ];
-    let is_read_only = read_only_prefixes
+    let is_read_only_name = read_only_prefixes
         .iter()
         .any(|&p| lower_name.starts_with(p) || lower_name == p.trim_end_matches('_'));
 
-    if is_read_only {
+    // Check for trusted, explicit read-only declaration in schema or annotations
+    let has_explicit_read_only = schema
+        .get("readOnly")
+        .and_then(|v| v.as_bool())
+        .or_else(|| schema.get("x-read-only").and_then(|v| v.as_bool()))
+        .or_else(|| schema.get("x-mcp-read-only").and_then(|v| v.as_bool()))
+        .or_else(|| {
+            schema.get("annotations").and_then(|a| {
+                a.get("readOnlyHint")
+                    .or_else(|| a.get("read_only"))
+                    .and_then(|v| v.as_bool())
+            })
+        })
+        .unwrap_or(false);
+
+    if is_read_only_name {
+        // External tools cannot auto-approve based on naming heuristics alone.
+        // Auto-approval strictly requires an explicit, trusted read-only declaration.
+        (RiskLevel::Safe, true, has_explicit_read_only)
+    } else if has_explicit_read_only {
         (RiskLevel::Safe, true, true)
     } else {
         // Unknown/unclassified external tool: fail closed!
