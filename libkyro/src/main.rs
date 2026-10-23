@@ -3,6 +3,7 @@
 
 use kyro_lib::{
     agent::AgentLoopEngine,
+    agent::AgentRegistry,
     commands::*,
     connector::ConnectorManager,
     mcp::McpManager,
@@ -12,20 +13,43 @@ use kyro_lib::{
     AppState,
 };
 use std::sync::{Arc, Mutex};
+use tokio::sync::RwLock as TokioRwLock;
 
 fn main() {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("kyro");
 
-    let db = Database::init(config_dir).expect("Failed to initialize Kyro SQLite database");
+    let db = Database::init(config_dir.clone()).expect("Failed to initialize Kyro SQLite database");
     let vault = Vault::new(db.clone());
     let browser =
         Arc::new(kyro_lib::browser::BrowserAutomationManager::new().with_database(db.clone()));
     let dev_servers = Arc::new(kyro_lib::project::DevServerManager::new());
-    let engine = Arc::new(AgentLoopEngine::with_resources(
+    // The agent registry is the canonical profile source (Markdown manifests);
+    // the engine and the command layer share one instance. Runtime-disabled
+    // built-in ids persist in the settings store so masks survive restarts.
+    let disabled_ids: Vec<String> = db
+        .get_setting("agent_disabled_profile_ids")
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let registry = Arc::new(TokioRwLock::new(
+        match AgentRegistry::load_with_disabled(&config_dir, &disabled_ids) {
+            Ok(reg) => reg,
+            Err(e) => {
+                log::warn!(
+                    "[AgentRegistry] Falling back to embedded agent profiles: {}",
+                    e
+                );
+                AgentRegistry::embedded_only()
+            }
+        },
+    ));
+    let engine = Arc::new(AgentLoopEngine::with_registry(
         browser.clone(),
         dev_servers.clone(),
+        registry,
     ));
     let mcp_manager = McpManager::new(db.clone(), vault.clone());
     let connector_manager = Arc::new(ConnectorManager::new(
@@ -103,6 +127,15 @@ fn main() {
             create_bot,
             delete_bot,
             get_roster_statuses,
+            list_agent_profiles,
+            get_agent_profile_document,
+            save_agent_profile,
+            create_agent_profile,
+            delete_agent_profile,
+            reset_agent_profile,
+            set_agent_profile_enabled,
+            get_selected_agent,
+            save_selected_agent,
             get_takeover_status,
             request_takeover,
             resume_takeover,
@@ -180,6 +213,9 @@ fn main() {
             get_audit_baseline,
             compare_visual_baseline,
             create_multi_agent_workspace,
+            run_multi_agent_workspace,
+            cancel_multi_agent_workspace,
+            list_multi_agent_workspaces,
             reconcile_multi_agent_workspace,
             export_routine,
             import_routine,
