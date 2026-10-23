@@ -120,19 +120,18 @@ describe("Frontend Climax to 95%+ Coverage Suite", () => {
       });
     });
 
-    it("handles multi-agent workspace creation error alert", async () => {
-      const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
-      (invoke as any).mockRejectedValueOnce(new Error("Workspace directory lock error"));
+    it("surfaces multi-agent workspace creation errors inline", async () => {
+      // The workspace tab lists durable state twice on open (effect + handler).
+      (invoke as any).mockRejectedValue(new Error("Workspace directory lock error"));
 
       render(<DevWorkbenchModal isOpen={true} onClose={vi.fn()} initialTab="workspace" />);
 
-      const initBtn = screen.getByText("Initialize Specialist Workspace");
+      const initBtn = screen.getByText("Plan Workspace");
       fireEvent.click(initBtn);
 
       await waitFor(() => {
-        expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to initialize multi-agent workspace"));
+        expect(screen.getByText(/Failed to initialize multi-agent workspace/i)).toBeInTheDocument();
       });
-      alertSpy.mockRestore();
     });
   });
 
