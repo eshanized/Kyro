@@ -178,10 +178,10 @@ describe("Frontend 95%+ Target Finalization Suite", () => {
       fireEvent.click(connectBtn);
 
       await waitFor(() => {
-        expect(screen.getByPlaceholderText(/Optional confidential client secret/i)).toBeInTheDocument();
+        expect(screen.getByPlaceholderText(/GitHub OAuth App Client Secret/i)).toBeInTheDocument();
       });
 
-      const secretInput = screen.getByPlaceholderText(/Optional confidential client secret/i);
+      const secretInput = screen.getByPlaceholderText(/GitHub OAuth App Client Secret/i);
       fireEvent.change(secretInput, { target: { value: "secret_client_test" } });
       expect(secretInput).toHaveValue("secret_client_test");
 
@@ -190,7 +190,7 @@ describe("Frontend 95%+ Target Finalization Suite", () => {
       fireEvent.click(cancelBtn);
 
       await waitFor(() => {
-        expect(screen.queryByPlaceholderText(/Optional confidential client secret/i)).not.toBeInTheDocument();
+        expect(screen.queryByPlaceholderText(/GitHub OAuth App Client Secret/i)).not.toBeInTheDocument();
       });
     });
   });
