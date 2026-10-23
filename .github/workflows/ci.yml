@@ -48,8 +48,15 @@ jobs:
         with:
           node-version: 22
 
-      - name: Symlink Node.js to /usr/local/bin
-        run: sudo ln -sf $(which node) /usr/local/bin/node
+      - name: Provision Node.js and npm in trusted system PATH
+        run: |
+          sudo chmod 755 /usr/local/bin || true
+          sudo ln -sf $(which node) /usr/bin/node
+          sudo ln -sf $(which npm) /usr/bin/npm
+          sudo ln -sf $(which npx) /usr/bin/npx
+          sudo ln -sf $(which node) /usr/local/bin/node || true
+          sudo ln -sf $(which npm) /usr/local/bin/npm || true
+          sudo ln -sf $(which npx) /usr/local/bin/npx || true
 
       - name: Install Linux system dependencies
         run: |
