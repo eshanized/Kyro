@@ -1342,6 +1342,38 @@ impl Database {
         }
     }
 
+    /// Number of runs whose `parent_run_id` is `parent_id`, regardless of
+    /// status. Delegation fan-out budgets count every child a run has ever
+    /// created (concurrent or sequential), which keeps the accounting durable
+    /// across restarts.
+    pub fn count_child_runs(&self, parent_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM agent_runs WHERE parent_run_id = ?1")?;
+        stmt.query_row(params![parent_id], |r| r.get(0))
+    }
+
+    /// Length of the delegation chain above `run_id`: 0 for a top-level run,
+    /// 1 when the run itself was delegated once, and so on. Walks the durable
+    /// `agent_runs` linkage rather than parsing run id strings.
+    pub fn delegation_depth(&self, run_id: &str) -> usize {
+        let mut depth = 0usize;
+        let mut cursor = Some(run_id.to_string());
+        while depth < 64 {
+            let parent = cursor
+                .as_deref()
+                .and_then(|id| self.get_run(id).ok().flatten())
+                .and_then(|r| r.parent_run_id);
+            match parent {
+                None => break,
+                Some(p) => {
+                    depth += 1;
+                    cursor = Some(p);
+                }
+            }
+        }
+        depth
+    }
+
     pub fn list_runs(&self, limit: usize) -> Result<Vec<AgentRun>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
