@@ -418,21 +418,42 @@ fn test_multi_agent_roster_and_delegation() {
     let initial_statuses = MultiBotOrchestrator::get_roster_statuses(&db);
     assert!(initial_statuses.iter().all(|s| s.state == "idle"));
 
-    // Set bot task
-    MultiBotOrchestrator::set_bot_task("forge-devops", Some("Running container security audit"));
+    // Two concurrent delegations to the same teammate, keyed by owning run.
+    MultiBotOrchestrator::set_bot_task(
+        "forge-devops",
+        "run_t1",
+        Some("Running container security audit"),
+    );
+    MultiBotOrchestrator::set_bot_task(
+        "forge-devops",
+        "run_t2",
+        Some("Extracting build diagnostics"),
+    );
     let updated_statuses = MultiBotOrchestrator::get_roster_statuses(&db);
     let forge_status = updated_statuses
         .iter()
         .find(|s| s.id == "forge-devops")
         .unwrap();
     assert_eq!(forge_status.state, "busy");
+    assert_eq!(forge_status.active_tasks.len(), 2);
     assert_eq!(
         forge_status.current_task,
         Some("Running container security audit".to_string())
     );
 
-    // Clear bot task
-    MultiBotOrchestrator::set_bot_task("forge-devops", None);
+    // Clearing one run's task keeps the other teammates/runs busy.
+    MultiBotOrchestrator::set_bot_task("forge-devops", "run_t1", None);
+    let partly_cleared = MultiBotOrchestrator::get_roster_statuses(&db);
+    let forge_partial = partly_cleared
+        .iter()
+        .find(|s| s.id == "forge-devops")
+        .unwrap();
+    assert_eq!(forge_partial.state, "busy");
+    assert_eq!(forge_partial.active_tasks.len(), 1);
+    assert_eq!(forge_partial.active_tasks[0].run_id, "run_t2".to_string());
+
+    // Dropping the last task of a teammate returns it to idle.
+    MultiBotOrchestrator::clear_run_tasks("run_t2");
     let cleared_statuses = MultiBotOrchestrator::get_roster_statuses(&db);
     let forge_cleared = cleared_statuses
         .iter()
@@ -440,6 +461,7 @@ fn test_multi_agent_roster_and_delegation() {
         .unwrap();
     assert_eq!(forge_cleared.state, "idle");
     assert_eq!(forge_cleared.current_task, None);
+    assert!(forge_cleared.active_tasks.is_empty());
 
     std::fs::remove_dir_all(temp_dir).ok();
 }
