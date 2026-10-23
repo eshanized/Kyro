@@ -507,37 +507,27 @@ mod tests {
         let trusted_dir = root.join("trusted");
         std::fs::create_dir_all(&untrusted_dir).unwrap();
         std::fs::create_dir_all(&trusted_dir).unwrap();
-        std::fs::set_permissions(
-            &untrusted_dir,
-            std::fs::Permissions::from_mode(0o777),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &trusted_dir,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&untrusted_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&trusted_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         for dir in [&untrusted_dir, &trusted_dir] {
             let executable = dir.join("npm");
             std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(
-                &executable,
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let resolver = ExecutableResolver::with_search_dirs(
-            ExecutableResolver::trusted_search_dirs(vec![
+        let resolver =
+            ExecutableResolver::with_search_dirs(ExecutableResolver::trusted_search_dirs(vec![
                 untrusted_dir.clone(),
                 trusted_dir.clone(),
-            ]),
-        );
+            ]));
         let resolved = resolver
             .resolve(&ProgramSpec::new("npm"))
             .expect("the trusted npm candidate should be selected");
-        assert_eq!(resolved.path, trusted_dir.join("npm").canonicalize().unwrap());
+        assert_eq!(
+            resolved.path,
+            trusted_dir.join("npm").canonicalize().unwrap()
+        );
         assert!(!resolver.search_dirs().contains(&untrusted_dir));
 
         std::fs::remove_dir_all(&root).ok();
