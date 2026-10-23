@@ -1,6 +1,10 @@
 use crate::agent::router::{ModelCapabilities, ModelRouter};
 use crate::agent::vision::{VisualAnalysisContext, VisualAnalysisResult, VisualAnalyzer};
-use crate::agent::{router::DEFAULT_NEMOTRON_MODEL, AgentLoopEngine, AgentStepEvent, ChatMessage};
+use crate::agent::{
+    registry::{AgentRegistry, ValidationState, DEFAULT_AGENT_ID},
+    router::DEFAULT_NEMOTRON_MODEL,
+    AgentLoopEngine, AgentStepEvent, CancellationToken, ChatMessage, ProfileOrigin, RegistryEntry,
+};
 use crate::audit::regression::{VisualBaseline, VisualRegressionEngine, VisualRegressionResult};
 use crate::computer_use::{
     capture_region, capture_screen, list_windows, ComputerAction, InputController,
@@ -16,7 +20,7 @@ use crate::grounding::{GroundedScreenResult, SetOfMarksEngine};
 use crate::mcp::McpManager;
 use crate::memory::{AppIndexer, InstalledApp, MemoryStore};
 use crate::multibot::workspace::{
-    MultiAgentOrchestrator, MultiAgentWorkspace, ReconciliationOutcome,
+    MultiAgentOrchestrator, MultiAgentWorkspace, ReconciliationOutcome, WorkflowSpec,
 };
 use crate::multibot::{BotStatus, MultiBotOrchestrator};
 use crate::project::checkpoint::{
@@ -525,8 +529,358 @@ pub fn delete_bot(state: State<AppState>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_roster_statuses(state: State<AppState>) -> Vec<BotStatus> {
-    MultiBotOrchestrator::get_roster_statuses(&state.db)
+pub async fn get_roster_statuses(state: State<'_, AppState>) -> Result<Vec<BotStatus>, String> {
+    // Stage C: profiles from the agent registry are the canonical roster; the
+    // runtime task map keys live delegations by (agent, run).
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    let profiles = registry.active_profiles();
+    Ok(MultiBotOrchestrator::get_roster_statuses_for(&profiles))
+}
+
+// -----------------------------------------------------------------------------
+// Agent Profile Registry (Markdown manifests are authoritative)
+// -----------------------------------------------------------------------------
+
+/// Settings key persisting the runtime-disabled built-in agent ids.
+const AGENT_DISABLED_IDS_SETTING: &str = "agent_disabled_profile_ids";
+
+/// A roster-facing description of one agent profile in the registry, including
+/// invalid manifests the user must fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProfileRecord {
+    pub id: String,
+    pub name: String,
+    pub avatar: String,
+    pub role: String,
+    pub description: String,
+    pub model_id: Option<String>,
+    pub origin: ProfileOrigin,
+    pub enabled: bool,
+    /// Runtime disable mask (built-ins only; custom profiles carry the flag in
+    /// their manifest file).
+    pub runtime_disabled: bool,
+    pub schema_version: u64,
+    pub version_label: String,
+    pub aliases: Vec<String>,
+    pub validation_error: Option<String>,
+    pub source_path: Option<String>,
+    pub instructions: String,
+    pub tools_mode: String,
+    pub tools_allow: Vec<String>,
+    pub delegation_enabled: bool,
+    pub delegation_max_depth: u32,
+    pub delegation_max_children: u32,
+    pub max_steps: u32,
+    pub is_builtin: bool,
+}
+
+fn agent_profile_record(id: &str, entry: &RegistryEntry) -> AgentProfileRecord {
+    let validation_error = match &entry.validation {
+        ValidationState::Ok => None,
+        ValidationState::Invalid(msg) => Some(msg.clone()),
+    };
+    let source_path = entry
+        .source_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    // Prefer the validated snapshot; fall back to a parseable-but-flagged
+    // manifest so the user can still see what the file declares; last resort
+    // is the bare id with the validation reason.
+    match (&entry.doc, &entry.snapshot) {
+        (_, Some(s)) => AgentProfileRecord {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            avatar: s.avatar.clone(),
+            role: s.role.clone(),
+            description: s.description.clone(),
+            model_id: match s.model.mode.as_str() {
+                "fixed" => s.model.model.clone(),
+                _ => None,
+            },
+            origin: s.origin,
+            enabled: s.enabled,
+            runtime_disabled: entry.runtime_disabled,
+            schema_version: s.schema_version,
+            version_label: s.version_label(),
+            aliases: s.aliases.clone(),
+            validation_error,
+            source_path,
+            instructions: s.instructions.clone(),
+            tools_mode: s.tools.mode.clone(),
+            tools_allow: s.tools.allow.clone(),
+            delegation_enabled: s.delegation.enabled,
+            delegation_max_depth: s.delegation.max_depth,
+            delegation_max_children: s.delegation.max_children,
+            max_steps: s.limits.max_steps,
+            is_builtin: s.is_builtin(),
+        },
+        (Some(doc), None) => AgentProfileRecord {
+            id: doc.frontmatter.id.clone(),
+            name: doc.frontmatter.name.clone(),
+            avatar: doc.frontmatter.avatar.clone(),
+            role: doc.frontmatter.role.clone(),
+            description: doc.frontmatter.description.clone(),
+            model_id: match doc.frontmatter.model.mode.as_str() {
+                "fixed" => doc.frontmatter.model.model.clone(),
+                _ => None,
+            },
+            origin: entry.origin,
+            enabled: doc.frontmatter.enabled && !entry.runtime_disabled,
+            runtime_disabled: entry.runtime_disabled,
+            schema_version: doc.frontmatter.schema_version,
+            version_label: String::new(),
+            aliases: doc.frontmatter.aliases.clone(),
+            validation_error,
+            source_path,
+            instructions: doc.instructions.clone(),
+            tools_mode: doc.frontmatter.tools.mode.clone(),
+            tools_allow: doc.frontmatter.tools.allow.clone(),
+            delegation_enabled: doc.frontmatter.delegation.enabled,
+            delegation_max_depth: doc.frontmatter.delegation.max_depth,
+            delegation_max_children: doc.frontmatter.delegation.max_children,
+            max_steps: doc.frontmatter.limits.max_steps,
+            is_builtin: AgentRegistry::is_builtin_id(&doc.frontmatter.id),
+        },
+        (None, None) => AgentProfileRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            avatar: "bot".to_string(),
+            role: String::new(),
+            description: String::new(),
+            model_id: None,
+            origin: entry.origin,
+            enabled: false,
+            runtime_disabled: false,
+            schema_version: 1,
+            version_label: String::new(),
+            aliases: Vec::new(),
+            validation_error,
+            source_path,
+            instructions: String::new(),
+            tools_mode: "inherit".to_string(),
+            tools_allow: Vec::new(),
+            delegation_enabled: true,
+            delegation_max_depth: 3,
+            delegation_max_children: 4,
+            max_steps: 25,
+            is_builtin: AgentRegistry::is_builtin_id(id),
+        },
+    }
+}
+
+fn registry_records(registry: &crate::agent::AgentRegistry) -> Vec<AgentProfileRecord> {
+    registry
+        .list_entries()
+        .iter()
+        .map(|(id, entry)| agent_profile_record(id, entry))
+        .collect()
+}
+
+#[tauri::command]
+pub async fn list_agent_profiles(
+    state: State<'_, AppState>,
+) -> Result<Vec<AgentProfileRecord>, String> {
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    let records = registry_records(&registry);
+    Ok(records)
+}
+
+/// Raw Markdown manifest of a profile for the editor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProfileDocument {
+    pub id: String,
+    pub document: String,
+    pub source_path: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_agent_profile_document(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<AgentProfileDocument, String> {
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    let entry = registry
+        .get(&id)
+        .ok_or_else(|| format!("Unknown agent profile '{}'", id))?
+        .clone();
+    let document = match &entry.doc {
+        Some(m) => m.source_content.clone(),
+        None => {
+            if let Some(path) = &entry.source_path {
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("Failed to read manifest {:?}: {}", path, e))?
+            } else {
+                AgentRegistry::builtin_default_content(&id)
+                    .unwrap_or("")
+                    .to_string()
+            }
+        }
+    };
+    Ok(AgentProfileDocument {
+        id,
+        document,
+        source_path: entry
+            .source_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+    })
+}
+
+#[tauri::command]
+pub async fn save_agent_profile(
+    state: State<'_, AppState>,
+    id: String,
+    document: String,
+) -> Result<AgentProfileRecord, String> {
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    registry.save_profile(&id, &document)?;
+    let record = registry
+        .get(&id)
+        .map(|entry| agent_profile_record(&id, entry))
+        .ok_or_else(|| format!("Agent '{}' vanished right after save", id))?;
+    Ok(record)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAgentProfileRequest {
+    pub id: String,
+    pub name: String,
+    pub avatar: String,
+    pub role: String,
+    pub description: String,
+    pub instructions: String,
+}
+
+/// Scaffold + activate a new custom profile manifest. The id must be unique,
+/// lowercase, and not collide with a built-in id (use the built-in's editor to
+/// override it instead).
+#[tauri::command]
+pub async fn create_agent_profile(
+    state: State<'_, AppState>,
+    request: CreateAgentProfileRequest,
+) -> Result<AgentProfileRecord, String> {
+    let id = request.id.trim().to_lowercase().replace(' ', "-");
+    if id.is_empty() || !crate::multibot::workspace::id_component_ok(&id) {
+        return Err(
+            "Invalid agent id: use lowercase letters, digits, '-' or '_' (max 64 chars)"
+                .to_string(),
+        );
+    }
+    let name = request.name.trim().to_string();
+    let role = request.role.trim().to_string();
+    if name.is_empty() || role.is_empty() {
+        return Err("Name and role are required".to_string());
+    }
+    let instructions = if request.instructions.trim().is_empty() {
+        format!(
+            "# Identity\n\nYou are {}, a Kyro teammate agent.\n\n# Responsibilities\n\n- {}",
+            name, role
+        )
+    } else {
+        request.instructions.trim().to_string()
+    };
+    let frontmatter = crate::agent::manifest::AgentManifestFrontmatter {
+        schema_version: crate::agent::manifest::MANIFEST_SCHEMA_VERSION,
+        id: id.clone(),
+        name,
+        description: request.description.trim().to_string(),
+        avatar: if request.avatar.is_empty() {
+            "bot".to_string()
+        } else {
+            request.avatar.clone()
+        },
+        role,
+        enabled: true,
+        aliases: Vec::new(),
+        model: crate::agent::manifest::ModelConfig::default(),
+        tools: crate::agent::manifest::ToolPolicy::default(),
+        context: crate::agent::manifest::ContextPolicy::default(),
+        delegation: crate::agent::manifest::DelegationPolicy::default(),
+        limits: crate::agent::manifest::LimitsConfig::default(),
+    };
+    let document = crate::agent::manifest::render_manifest(&crate::agent::AgentManifest {
+        frontmatter,
+        instructions,
+        source_path: None,
+        source_content: String::new(),
+    });
+
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    if AgentRegistry::is_builtin_id(&id) {
+        return Err(format!(
+            "'{}' is a built-in agent id; open its profile and edit it instead",
+            id
+        ));
+    }
+    if registry.get(&id).is_some() {
+        return Err(format!("An agent profile with id '{}' already exists", id));
+    }
+    registry.save_profile(&id, &document)?;
+    let record = registry
+        .get(&id)
+        .map(|entry| agent_profile_record(&id, entry))
+        .ok_or_else(|| format!("Agent '{}' vanished right after save", id))?;
+    Ok(record)
+}
+
+#[tauri::command]
+pub async fn delete_agent_profile(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ProfileOrigin, String> {
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    registry.delete_profile(&id)
+}
+
+#[tauri::command]
+pub async fn reset_agent_profile(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<AgentProfileRecord, String> {
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    if !AgentRegistry::is_builtin_id(&id) {
+        return Err(format!(
+            "'{}' is not a built-in agent profile; just delete it instead",
+            id
+        ));
+    }
+    registry.reset_builtin(&id)?;
+    let record = registry
+        .get(&id)
+        .map(|entry| agent_profile_record(&id, entry))
+        .ok_or_else(|| format!("Agent '{}' vanished right after reset", id))?;
+    Ok(record)
+}
+
+/// Toggle an agent's runtime availability. Custom profiles carry the flag in
+/// their manifest; built-ins get a runtime mask persisted to the settings store
+/// so it survives restarts.
+#[tauri::command]
+pub async fn set_agent_profile_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let disabled_after: Vec<String>;
+    {
+        let mut registry = state.engine.registry.write().await;
+        registry.ensure_fresh();
+        registry.set_runtime_disabled(&id, !enabled)?;
+        disabled_after = registry.runtime_disabled_ids();
+    }
+    let payload = serde_json::to_string(&disabled_after)
+        .map_err(|e| format!("Failed to serialize disabled ids: {}", e))?;
+    state
+        .db
+        .set_setting(AGENT_DISABLED_IDS_SETTING, &payload)
+        .map_err(|e| e.to_string())
 }
 
 // Human Takeover & Governance Matrix
@@ -698,8 +1052,11 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
 
     let effective_run_id = run_id.unwrap_or_else(|| format!("run_{}", uuid::Uuid::new_v4()));
     let selected_model = model.unwrap_or_else(|| DEFAULT_NEMOTRON_MODEL.to_string());
-    let default_prompt = build_default_system_prompt();
-    let sys = system_prompt.unwrap_or(default_prompt);
+    // Deprecated client-supplied prompt: the engine composes the authoritative
+    // system prompt from the agent profile (Stage C). The argument is kept for
+    // wire compatibility with older frontends.
+    let _ = system_prompt;
+    let sys = String::new();
 
     // Persist durable agent run
     let now = chrono::Utc::now().timestamp_millis();
@@ -712,6 +1069,12 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
 
     let effective_bot_id = bot_id.unwrap_or_else(|| "apex-orchestrator".to_string());
 
+    // Stage C: resolve the requested agent (id/alias/legacy id) to its
+    // canonical profile so persisted run records always reference an agent the
+    // registry can actually execute.
+    let resolved_profile = state.engine.resolve_agent(Some(&effective_bot_id)).await?;
+    let effective_bot_id = resolved_profile.id.clone();
+
     let run_record = AgentRun {
         id: effective_run_id.clone(),
         conversation_id: conversation_id.clone(),
@@ -723,7 +1086,13 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         started_at: Some(now),
         completed_at: None,
         error: None,
-        config_json: None,
+        config_json: Some(
+            serde_json::json!({
+                "profile_version": resolved_profile.version_label(),
+                "profile_origin": resolved_profile.origin,
+            })
+            .to_string(),
+        ),
         parent_run_id: None,
     };
     state
@@ -1823,6 +2192,58 @@ pub async fn save_selected_model(
     Ok(effective_model)
 }
 
+/// The user's active agent profile id, persisted in the settings store. The
+/// value is validated against the current registry; unknown or disabled ids
+/// resolve back to the bundled default instead of erroring so the app always
+/// has an active teammate.
+#[tauri::command]
+pub async fn get_selected_agent(state: State<'_, AppState>) -> Result<String, String> {
+    let saved = state
+        .db
+        .get_setting("selected_agent")
+        .map_err(|e| e.to_string())?;
+
+    if let Some(id) = saved {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            // Accept only profiles the registry can actually run right now;
+            // anything else (deleted, disabled, invalid) falls back.
+            let mut registry = state.engine.registry.write().await;
+            registry.ensure_fresh();
+            match registry.resolve_lenient(&id) {
+                Ok(snapshot) if snapshot.enabled => return Ok(snapshot.id),
+                _ => {}
+            }
+        }
+    }
+    Ok(DEFAULT_AGENT_ID.to_string())
+}
+
+#[tauri::command]
+pub async fn save_selected_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<String, String> {
+    let trimmed = agent_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Agent identifier cannot be empty".to_string());
+    }
+
+    let mut registry = state.engine.registry.write().await;
+    registry.ensure_fresh();
+    let snapshot = registry
+        .resolve_lenient(&trimmed)
+        .map_err(|e| e.to_string())?;
+    drop(registry);
+
+    state
+        .db
+        .set_setting("selected_agent", &snapshot.id)
+        .map_err(|e| e.to_string())?;
+
+    Ok(snapshot.id)
+}
+
 // -----------------------------------------------------------------------------
 // Developer Workflows: Checkpoints, Safe Rollback & Build Doctor
 // -----------------------------------------------------------------------------
@@ -1915,28 +2336,142 @@ pub async fn compare_visual_baseline(
 
 #[tauri::command]
 pub async fn create_multi_agent_workspace(
+    state: State<'_, AppState>,
     parent_run_id: String,
     project_path: String,
     objective: String,
+    workflow_id: Option<String>,
+    custom_workflow: Option<WorkflowSpec>,
 ) -> Result<MultiAgentWorkspace, String> {
-    Ok(MultiAgentOrchestrator::create_workspace(
+    // Load the plan: an explicit custom DAG wins, otherwise the requested (or
+    // default bundled) workflow manifest is used.
+    let spec = match custom_workflow {
+        Some(spec) => spec,
+        None => {
+            let mut registry = state.engine.registry.write().await;
+            registry.ensure_fresh();
+            let config_root = registry
+                .config_root()
+                .ok_or_else(|| "Agent registry is not backed by a user directory".to_string())?
+                .to_path_buf();
+            drop(registry);
+            crate::multibot::workspace::load_workflow(
+                &config_root,
+                workflow_id.as_deref().unwrap_or("software-change"),
+            )?
+        }
+    };
+
+    let ws = MultiAgentOrchestrator::create_workspace(
         &parent_run_id,
         Path::new(&project_path),
+        &spec,
         &objective,
-    ))
+    )?;
+
+    // Fail fast when any referenced agent profile is missing or disabled —
+    // plans never silently substitute agents.
+    {
+        let registry = state.engine.registry.read().await;
+        MultiAgentOrchestrator::validate_against_registry(&ws, &registry)?;
+    }
+
+    let config_root = state
+        .engine
+        .config_root()
+        .await
+        .ok_or_else(|| "Agent registry is not backed by a user directory".to_string())?;
+    MultiAgentOrchestrator::save_workspace(&config_root, &ws)?;
+    Ok(ws)
+}
+
+/// Execute a workspace plan to a terminal state: bounded-concurrency DAG
+/// scheduling with retry budgets, isolated worktree runs and durable progress.
+/// Any referenced agent stops being enabled mid-run and the run fails
+/// honestly for the tasks it cannot start.
+#[tauri::command]
+pub async fn run_multi_agent_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<MultiAgentWorkspace, String> {
+    let config_root = state
+        .engine
+        .config_root()
+        .await
+        .ok_or_else(|| "Agent registry is not backed by a user directory".to_string())?;
+    let mut ws = MultiAgentOrchestrator::load_workspace(&config_root, &workspace_id)?;
+    if matches!(
+        ws.status.as_str(),
+        "completed" | "failed" | "failed_partial" | "cancelled" | "reconciled"
+    ) {
+        // Terminal workspaces are returned as-is; the frontend can trigger a
+        // fresh plan instead of silently double-running finished work.
+        return Ok(ws);
+    }
+
+    // Recover interrupted progress against the durable run table first.
+    MultiAgentOrchestrator::recover_workspace(&mut ws, &state.db);
+
+    let token = CancellationToken::default();
+    MultiAgentOrchestrator::run_workspace(
+        &state.engine,
+        &token,
+        &mut ws,
+        &state.db,
+        None, // production default provider configuration
+    )
+    .await?;
+    Ok(ws)
+}
+
+#[tauri::command]
+pub async fn cancel_multi_agent_workspace(workspace_id: String) -> Result<bool, String> {
+    Ok(MultiAgentOrchestrator::cancel_workspace(&workspace_id))
+}
+
+#[tauri::command]
+pub async fn list_multi_agent_workspaces(
+    state: State<'_, AppState>,
+) -> Result<Vec<MultiAgentWorkspace>, String> {
+    let config_root = state
+        .engine
+        .config_root()
+        .await
+        .ok_or_else(|| "Agent registry is not backed by a user directory".to_string())?;
+    let mut out = Vec::new();
+    for id in MultiAgentOrchestrator::list_workspace_ids(&config_root) {
+        if let Ok(mut ws) = MultiAgentOrchestrator::load_workspace(&config_root, &id) {
+            MultiAgentOrchestrator::recover_workspace(&mut ws, &state.db);
+            out.push(ws);
+        }
+    }
+    Ok(out)
 }
 
 #[tauri::command]
 pub async fn reconcile_multi_agent_workspace(
+    state: State<'_, AppState>,
     project_root: String,
     worktree_path: String,
     workspace_id: String,
 ) -> Result<ReconciliationOutcome, String> {
-    MultiAgentOrchestrator::reconcile_changes(
+    let outcome = MultiAgentOrchestrator::reconcile_changes(
         Path::new(&project_root),
         Path::new(&worktree_path),
         &workspace_id,
-    )
+    )?;
+    // Record the review outcome on the durable workspace when one exists and
+    // produced integrable work. A workspace that fully failed (nothing ran
+    // successfully) keeps its failed status — "reconciled" is never fake
+    // success.
+    if let Some(config_root) = state.engine.config_root().await {
+        if let Ok(mut ws) = MultiAgentOrchestrator::load_workspace(&config_root, &workspace_id) {
+            if matches!(ws.status.as_str(), "completed" | "failed_partial") {
+                let _ = MultiAgentOrchestrator::mark_reconciled(&config_root, &mut ws);
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 // -----------------------------------------------------------------------------
