@@ -22,6 +22,9 @@
 | | `AskAlways` | Every desktop input action requires explicit confirmation. |
 | **Filesystem** | `WorkspaceConstrained` | Restricts reads and writes to canonical paths within allowed directory trees. Prevents directory traversal (`../`) and symlink escapes. |
 | **MCP Tools** | `PrivilegedExternal` | MCP tools are treated as untrusted external code. Each call is classified dynamically (`classify_external_tool`), fingerprinted cryptographically, and inspected against governance settings. External modifying/execution tools cannot be auto-approved (`can_auto_approve: false`). |
+| **Code Experiments** | `IsolatedSandbox` | Mandatory execution in ephemeral Docker/Podman container with read-only root, temporary tmpfs, dropped capabilities, no network by default, and strict CPU/memory quotas. Fails closed if container runtime is unavailable; never falls back to host. Pinned image allowlist enforced (`APPROVED_SANDBOX_IMAGES`). |
+| **Deep Local RAG** | `LocalLoopbackOnly` | Retrieved context is untrusted user content and never changes authorization rules. Semantic embedding queries strictly require local loopback endpoints (`127.0.0.1`, `localhost`). External embedding calls are blocked to prevent cloud data exfiltration. Chunks strictly scoped to authorized folders. |
+| **Habit Learning** | `PrivacyGatedOptIn` | Disabled by default. Only analyzes successful, completed runs. Passwords, secrets, tokens, API keys, private keys, and MFA checkpoints are strictly filtered out and never learned. Newly suggested routines are never auto-scheduled or executed without explicit human review (`enabled = false`). |
 
 ---
 

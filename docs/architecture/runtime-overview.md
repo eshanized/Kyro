@@ -99,6 +99,8 @@ graph TD
   - `vault.rs`: Credential and API key management via OS Keyring and authenticated AES-256-GCM encrypted database fallback, with namespaced connector account secrets.
   - `organizer.rs`: Safe file organizer engine with extension rules, SHA-256 duplicate detection, destination collision handling, path containment verification, and manifest-backed reversible rollback.
   - `documents.rs`: Local document assistant engine for plain-text and PDF parsing, FlateDecode decompression, Tj/TJ text operator extraction, deterministic date & action item parsing, and document diffing.
+  - `chunking.rs`: Format-aware chunking engine for Markdown (heading breadcrumbs + accurate line ranges), source code (symbol boundaries for functions, structs, classes), and plain text.
+  - `retrieval.rs`: Deep Local RAG subsystem with hybrid BM25-style lexical scoring + cosine similarity semantic retrieval, loopback-only local embedding validation (`127.0.0.1`, `localhost`), and authorized folder query-time enforcement.
   - `templates.rs`: Extensible template packs, schema versioning, secret sanitization, and pre-packaged starters.
 - `project/`:
   - `discovery.rs`: Dynamic project root resolution, candidate ranking, bounded search traversal, exclusion filters (`node_modules`, `.git`, `dist`, `build`, etc.), OS Desktop path resolution via `dirs::desktop_dir()`.
@@ -121,8 +123,10 @@ graph TD
   - `scheduler.rs`: Routine background worker for cron/periodic execution.
   - `self_healing.rs`: Parameter substitution and coordinate recalibration.
   - `portable_routine.rs`: Portable routine serialization format `kyro.routine.v1` with secret redaction on export and untrusted capability validation on import.
+  - `habit_learning.rs`: Local habit learning and automatic routine suggestion engine. Privacy-gated (disabled by default), sensitive-pattern filtering, deterministic action normalization, confidence scoring, and safe human-reviewed routine creation (`enabled = false`).
 - `sandbox/`:
-  - `docker.rs`: Container isolation detection and CLI execution.
+  - `docker.rs`: Container isolation detection, hardened arguments (`--read-only`, `--tmpfs`, `--cap-drop=ALL`, `pids-limit=100`), and allowlisted image validation.
+  - `experiment.rs`: Sandboxed code-execution agents for safe experiments. Disposable workspace isolation, bounded stdout/stderr capture (64KB), cancellation token integration, automated artifact extraction, and experiment diff comparison.
 - `connector/`:
   - `manager.rs`: `ConnectorManager` coordinating native adapters, remote HTTP MCP endpoints, local stdio MCP servers, OAuth lifecycle transitions, and per-action governance policy enforcement.
   - `auth.rs`: PKCE OAuth 2.0 flow coordinator with ephemeral loopback callback listener, single-flight token refresh, and Vault integration.
