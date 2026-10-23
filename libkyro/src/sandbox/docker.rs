@@ -1,6 +1,32 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
+/// Approved container images for sandbox execution.
+///
+/// Images are strictly pinned to versioned tags to avoid mutable tag drift and unexpected image downloads.
+pub const APPROVED_SANDBOX_IMAGES: &[&str] = &[
+    "alpine:3.20",
+    "alpine:3.19",
+    "python:3.12-alpine",
+    "node:20-alpine",
+    "rust:1.80-alpine",
+    "debian:bookworm-slim",
+];
+
+/// Validates whether a container image is permitted by the security allowlist.
+pub fn is_approved_sandbox_image(image: &str) -> bool {
+    APPROVED_SANDBOX_IMAGES.contains(&image)
+}
+
+/// Normalizes an image tag, mapping legacy unpinned tags like `alpine:latest` to the pinned default `alpine:3.20`.
+pub fn normalize_sandbox_image(image: &str) -> &str {
+    if image == "alpine:latest" || image == "alpine" {
+        "alpine:3.20"
+    } else {
+        image
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxStatus {
     pub available: bool,
@@ -44,14 +70,22 @@ impl DockerSandbox {
         SandboxStatus {
             available: false,
             engine: "none".to_string(),
-            message: "Neither Docker nor Podman is currently running. Execution will fall back to local host with permission gate.".to_string(),
+            message: "Neither Docker nor Podman is currently running. Sandboxed execution is unavailable and will fail closed.".to_string(),
         }
     }
 
     pub fn run_in_sandbox(image: &str, command: &str) -> Result<ContainerExecResult, String> {
         let probe = Self::probe();
         if !probe.available {
-            return Err("Container sandbox engine is not available on this system".to_string());
+            return Err("Container sandbox engine is not available on this system. Execution failed closed.".to_string());
+        }
+
+        let normalized_image = normalize_sandbox_image(image);
+        if !is_approved_sandbox_image(normalized_image) {
+            return Err(format!(
+                "Image '{}' is not in the approved sandbox allowlist: {:?}",
+                image, APPROVED_SANDBOX_IMAGES
+            ));
         }
 
         let binary = &probe.engine;
@@ -62,7 +96,12 @@ impl DockerSandbox {
                 "--network=none", // Isolated network by default for security
                 "--memory=512m",
                 "--cpus=1.0",
-                image,
+                "--pids-limit=100",
+                "--security-opt=no-new-privileges",
+                "--cap-drop=ALL",
+                "--read-only",
+                "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
+                normalized_image,
                 "sh",
                 "-c",
                 command,

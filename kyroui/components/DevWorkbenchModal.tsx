@@ -21,6 +21,12 @@ import {
   Smartphone,
   Tablet,
   Monitor,
+  FlaskConical,
+  Trash2,
+  GitCompare,
+  Shield,
+  Clock,
+  Cpu,
 } from "lucide-react";
 import {
   DiscoveryResult,
@@ -32,12 +38,15 @@ import {
   VisualRegressionResult,
   MultiAgentWorkspace,
   ReconciliationOutcome,
+  CodeExperimentRecord,
+  ExperimentSpec,
+  ExperimentComparisonResult,
 } from "../types/agent";
 
 interface DevWorkbenchModalProps {
   isOpen: boolean;
   onClose: () => void;
-  initialTab?: "projects" | "checkpoints" | "doctor" | "audit" | "workspace";
+  initialTab?: "projects" | "checkpoints" | "doctor" | "audit" | "workspace" | "experiments";
 }
 
 export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
@@ -46,7 +55,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   initialTab = "projects",
 }) => {
   const [activeTab, setActiveTab] = useState<
-    "projects" | "checkpoints" | "doctor" | "audit" | "workspace"
+    "projects" | "checkpoints" | "doctor" | "audit" | "workspace" | "experiments"
   >(initialTab);
 
   // --- Projects & Dev Servers State ---
@@ -99,11 +108,154 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   const [isCreatingWorkspace, setIsCreatingWorkspace] = useState<boolean>(false);
   const [isReconciling, setIsReconciling] = useState<boolean>(false);
 
+  // --- Sandboxed Experiments State ---
+  const [experiments, setExperiments] = useState<CodeExperimentRecord[]>([]);
+  const [selectedExperiment, setSelectedExperiment] = useState<CodeExperimentRecord | null>(null);
+  const [isExperimentLoading, setIsExperimentLoading] = useState<boolean>(false);
+  const [isRunningExperiment, setIsRunningExperiment] = useState<boolean>(false);
+  const [experimentError, setExperimentError] = useState<string | null>(null);
+  const [experimentNotice, setExperimentNotice] = useState<string | null>(null);
+
+  // New Experiment Form
+  const [expName, setExpName] = useState<string>("isolated-benchmark");
+  const [expRuntime, setExpRuntime] = useState<string>("python");
+  const [expCustomImage, setExpCustomImage] = useState<string>("");
+  const [expScript, setExpScript] = useState<string>(
+    `# Isolated code experiment\nimport sys\nprint("Python version:", sys.version)\nprint("Math calculation:", sum([i**2 for i in range(1000)]))\n`
+  );
+  const [expWorkspace, setExpWorkspace] = useState<string>("");
+  const [expNetwork, setExpNetwork] = useState<string>("none");
+  const [expCpu, setExpCpu] = useState<number>(1.0);
+  const [expMemoryMb, setExpMemoryMb] = useState<number>(512);
+  const [expTimeoutSec, setExpTimeoutSec] = useState<number>(60);
+
+  // Comparison State
+  const [compareIdA, setCompareIdA] = useState<string>("");
+  const [compareIdB, setCompareIdB] = useState<string>("");
+  const [comparisonResult, setComparisonResult] = useState<ExperimentComparisonResult | null>(null);
+  const [isComparing, setIsComparing] = useState<boolean>(false);
+
   useEffect(() => {
     if (isOpen) {
       loadDevServers();
+      if (activeTab === "experiments") {
+        loadExperiments();
+      }
     }
-  }, [isOpen]);
+  }, [isOpen, activeTab]);
+
+  const loadExperiments = async () => {
+    setIsExperimentLoading(true);
+    try {
+      const list = await invoke<CodeExperimentRecord[]>("list_experiments", { limit: 50 });
+      setExperiments(Array.isArray(list) ? list : []);
+      if (selectedExperiment) {
+        const updated = list.find((e) => e.id === selectedExperiment.id);
+        if (updated) setSelectedExperiment(updated);
+      }
+    } catch (err: any) {
+      setExperimentError(String(err));
+    } finally {
+      setIsExperimentLoading(false);
+    }
+  };
+
+  const handleCreateAndRunExperiment = async (runNow: boolean) => {
+    setExperimentError(null);
+    setExperimentNotice(null);
+    setIsRunningExperiment(true);
+    try {
+      const spec: ExperimentSpec = {
+        name: expName.trim() || "unnamed-experiment",
+        runtime: expRuntime,
+        custom_image: expCustomImage.trim() ? expCustomImage.trim() : null,
+        script: expScript,
+        argv: null,
+        workspace_path: expWorkspace.trim() ? expWorkspace.trim() : null,
+        network_mode: expNetwork,
+        limits: {
+          cpu: Number(expCpu) || 1.0,
+          memory_mb: Number(expMemoryMb) || 512,
+          pids_limit: 100,
+          timeout_seconds: Number(expTimeoutSec) || 60,
+          max_output_bytes: 65536,
+        },
+      };
+
+      const created = await invoke<CodeExperimentRecord>("create_experiment", { spec });
+      setExperiments((prev) => [created, ...prev]);
+      setSelectedExperiment(created);
+
+      if (runNow) {
+        setExperimentNotice(`Running experiment ${created.id}...`);
+        const executed = await invoke<CodeExperimentRecord>("run_experiment", {
+          experimentId: created.id,
+          runId: null,
+        });
+        setSelectedExperiment(executed);
+        setExperiments((prev) =>
+          prev.map((e) => (e.id === executed.id ? executed : e))
+        );
+        setExperimentNotice(`Experiment ${executed.status}: Exit code ${executed.exit_code ?? "N/A"}`);
+      } else {
+        setExperimentNotice(`Experiment created (${created.id})`);
+      }
+    } catch (err: any) {
+      setExperimentError(String(err));
+    } finally {
+      setIsRunningExperiment(false);
+    }
+  };
+
+  const handleRerunExperiment = async (expId: string) => {
+    setExperimentError(null);
+    setExperimentNotice(`Running experiment ${expId}...`);
+    setIsRunningExperiment(true);
+    try {
+      const executed = await invoke<CodeExperimentRecord>("run_experiment", {
+        experimentId: expId,
+        runId: null,
+      });
+      setSelectedExperiment(executed);
+      setExperiments((prev) =>
+        prev.map((e) => (e.id === executed.id ? executed : e))
+      );
+      setExperimentNotice(`Experiment ${executed.status}: Exit code ${executed.exit_code ?? "N/A"}`);
+    } catch (err: any) {
+      setExperimentError(String(err));
+    } finally {
+      setIsRunningExperiment(false);
+    }
+  };
+
+  const handleDeleteExperiment = async (expId: string) => {
+    try {
+      await invoke("delete_experiment", { experimentId: expId });
+      setExperiments((prev) => prev.filter((e) => e.id !== expId));
+      if (selectedExperiment?.id === expId) {
+        setSelectedExperiment(null);
+      }
+    } catch (err: any) {
+      setExperimentError(String(err));
+    }
+  };
+
+  const handleCompareExperiments = async () => {
+    if (!compareIdA || !compareIdB) return;
+    setIsComparing(true);
+    setExperimentError(null);
+    try {
+      const res = await invoke<ExperimentComparisonResult>("compare_experiments", {
+        expAId: compareIdA,
+        expBId: compareIdB,
+      });
+      setComparisonResult(res);
+    } catch (err: any) {
+      setExperimentError(String(err));
+    } finally {
+      setIsComparing(false);
+    }
+  };
 
   const loadDevServers = async () => {
     try {
@@ -408,6 +560,16 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
             }`}
           >
             <Users className="w-4 h-4" /> Multi-Agent Workspace
+          </button>
+          <button
+            onClick={() => setActiveTab("experiments")}
+            className={`py-3 px-4 text-xs font-medium border-b-2 transition flex items-center gap-2 ${
+              activeTab === "experiments"
+                ? "border-purple-500 text-purple-300 bg-purple-950/20"
+                : "border-transparent text-neutral-400 hover:text-neutral-200"
+            }`}
+          >
+            <FlaskConical className="w-4 h-4" /> Sandboxed Experiments
           </button>
         </div>
 
@@ -1187,6 +1349,438 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                   )}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* TAB 6: Sandboxed Experiments */}
+          {activeTab === "experiments" && (
+            <div className="space-y-6">
+              {/* Header Banner */}
+              <div className="p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <FlaskConical className="w-5 h-5 text-purple-400" />
+                    <h3 className="text-sm font-semibold text-neutral-100">
+                      Sandboxed Code-Execution Agents
+                    </h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-purple-950/60 text-purple-300 border border-purple-800/60 flex items-center gap-1">
+                      <Shield className="w-3 h-3" /> Fail-Closed Security
+                    </span>
+                    <button
+                      onClick={loadExperiments}
+                      disabled={isExperimentLoading}
+                      className="p-1.5 text-neutral-400 hover:text-neutral-100 rounded-lg hover:bg-neutral-800 transition"
+                      title="Refresh experiments"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isExperimentLoading ? "animate-spin" : ""}`} />
+                    </button>
+                  </div>
+                </div>
+                <p className="text-xs text-neutral-400">
+                  Run untrusted code, automated benchmarks, and agent patches inside ephemeral Docker/Podman containers with read-only root, no network by default, and strict CPU/memory quotas. Host execution fallback is strictly blocked.
+                </p>
+                {experimentError && (
+                  <div className="p-3 bg-red-950/40 border border-red-800/60 rounded-lg text-xs text-red-300 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                    <span>{experimentError}</span>
+                  </div>
+                )}
+                {experimentNotice && (
+                  <div className="p-3 bg-purple-950/40 border border-purple-800/60 rounded-lg text-xs text-purple-300 flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 flex-shrink-0" />
+                    <span>{experimentNotice}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Main Content: Form & List */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                {/* Left: Spec Configuration Form */}
+                <div className="lg:col-span-6 space-y-4">
+                  <div className="p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-4">
+                    <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wide flex items-center gap-2">
+                      <Terminal className="w-4 h-4 text-purple-400" />
+                      <span>Configure Experiment</span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1">Experiment Name</label>
+                        <input
+                          type="text"
+                          value={expName}
+                          onChange={(e) => setExpName(e.target.value)}
+                          placeholder="e.g. test-fibonacci"
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1">Runtime</label>
+                        <select
+                          value={expRuntime}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setExpRuntime(val);
+                            if (val === "python") {
+                              setExpScript('# Isolated Python experiment\nimport sys\nprint("Python version:", sys.version)\nprint("Math calculation:", sum([i**2 for i in range(1000)]))\n');
+                            } else if (val === "node") {
+                              setExpScript('// Isolated Node experiment\nconsole.log("Node version:", process.version);\nconsole.log("Sum:", Array.from({length: 1000}, (_, i) => i * i).reduce((a, b) => a + b, 0));\n');
+                            } else if (val === "rust") {
+                              setExpScript('// Isolated Rust experiment\nfn main() {\n    let sum: u64 = (0..1000).map(|i| i * i).sum();\n    println!("Rust sum: {}", sum);\n}\n');
+                            } else if (val === "bash") {
+                              setExpScript('#!/bin/sh\necho "Running in isolated alpine container"\nuname -a\n');
+                            } else if (val === "debian") {
+                              setExpScript('#!/bin/sh\necho "Running in isolated debian container"\ncat /etc/os-release\n');
+                            }
+                          }}
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        >
+                          <option value="python">Python (python:3.11-slim)</option>
+                          <option value="node">Node.js (node:20-slim)</option>
+                          <option value="rust">Rust (rust:1.80-slim)</option>
+                          <option value="bash">Bash / Alpine (alpine:3.20)</option>
+                          <option value="debian">Debian (debian:12-slim)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1">Network Mode</label>
+                        <select
+                          value={expNetwork}
+                          onChange={(e) => setExpNetwork(e.target.value)}
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        >
+                          <option value="none">none (Airgapped / Isolated)</option>
+                          <option value="bridge">bridge (Outbound allowed)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1">Optional Pinned Custom Image</label>
+                        <input
+                          type="text"
+                          value={expCustomImage}
+                          onChange={(e) => setExpCustomImage(e.target.value)}
+                          placeholder="e.g. python:3.11-slim (allowlisted)"
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] text-neutral-400 block mb-1">Optional Workspace Dir</label>
+                      <input
+                        type="text"
+                        value={expWorkspace}
+                        onChange={(e) => setExpWorkspace(e.target.value)}
+                        placeholder="e.g. /path/to/project (read-only copy)"
+                        className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-3">
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1 flex items-center gap-1">
+                          <Cpu className="w-3 h-3 text-neutral-500" /> CPU Cores
+                        </label>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="0.1"
+                          max="8.0"
+                          value={expCpu}
+                          onChange={(e) => setExpCpu(parseFloat(e.target.value) || 1.0)}
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1 flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-neutral-500" /> Timeout (s)
+                        </label>
+                        <input
+                          type="number"
+                          min="5"
+                          max="300"
+                          value={expTimeoutSec}
+                          onChange={(e) => setExpTimeoutSec(parseInt(e.target.value, 10) || 60)}
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-neutral-400 block mb-1">Memory (MB)</label>
+                        <input
+                          type="number"
+                          min="64"
+                          max="4096"
+                          step="64"
+                          value={expMemoryMb}
+                          onChange={(e) => setExpMemoryMb(parseInt(e.target.value, 10) || 512)}
+                          className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-[11px] text-neutral-400">Script / Code Payload</label>
+                        <span className="text-[10px] text-neutral-500 font-mono">Max output bounded to 64 KB</span>
+                      </div>
+                      <textarea
+                        rows={7}
+                        value={expScript}
+                        onChange={(e) => setExpScript(e.target.value)}
+                        className="w-full p-3 bg-neutral-950 border border-neutral-800 rounded-lg font-mono text-xs text-neutral-200 leading-relaxed focus:outline-none focus:border-purple-600"
+                        spellCheck={false}
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-end gap-2 pt-2">
+                      <button
+                        onClick={() => handleCreateAndRunExperiment(false)}
+                        disabled={isRunningExperiment}
+                        className="px-3 py-1.5 rounded-lg border border-neutral-700 text-neutral-300 hover:text-white hover:bg-neutral-800 text-xs transition disabled:opacity-50"
+                      >
+                        Save Spec Only
+                      </button>
+                      <button
+                        onClick={() => handleCreateAndRunExperiment(true)}
+                        disabled={isRunningExperiment}
+                        className="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium text-xs flex items-center gap-1.5 transition disabled:opacity-50"
+                      >
+                        {isRunningExperiment ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>Running in Sandbox...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-3.5 h-3.5" />
+                            <span>Run Isolated Experiment</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Right: History & Selected Details */}
+                <div className="lg:col-span-6 space-y-4">
+                  <div className="p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-3">
+                    <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wide flex items-center justify-between">
+                      <span>Experiment Runs ({experiments.length})</span>
+                      {selectedExperiment && (
+                        <button
+                          onClick={() => handleRerunExperiment(selectedExperiment.id)}
+                          disabled={isRunningExperiment}
+                          className="text-[11px] text-purple-400 hover:text-purple-300 flex items-center gap-1"
+                        >
+                          <RotateCcw className="w-3 h-3" /> Rerun Selected
+                        </button>
+                      )}
+                    </div>
+
+                    {experiments.length === 0 ? (
+                      <div className="p-6 text-center text-xs text-neutral-500 border border-dashed border-neutral-800 rounded-lg">
+                        No experiments run yet. Configure and launch a sandboxed code experiment above.
+                      </div>
+                    ) : (
+                      <div className="max-h-52 overflow-y-auto space-y-2 pr-1">
+                        {experiments.map((exp) => (
+                          <div
+                            key={exp.id}
+                            onClick={() => setSelectedExperiment(exp)}
+                            className={`p-2.5 rounded-lg border cursor-pointer transition flex items-center justify-between text-xs ${
+                              selectedExperiment?.id === exp.id
+                                ? "bg-purple-950/20 border-purple-700/60"
+                                : "bg-neutral-900/60 border-neutral-800 hover:border-neutral-700"
+                            }`}
+                          >
+                            <div className="space-y-0.5">
+                              <div className="font-medium text-neutral-200 flex items-center gap-2">
+                                <span>{exp.name}</span>
+                                <span className="text-[10px] font-mono text-neutral-500">({exp.runtime})</span>
+                              </div>
+                              <div className="text-[10px] text-neutral-400 font-mono">
+                                ID: {exp.id.slice(0, 18)}... • {new Date(exp.created_at * 1000).toLocaleTimeString()}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] uppercase font-mono font-bold ${
+                                  exp.status === "succeeded"
+                                    ? "bg-green-950/60 text-green-300 border border-green-800/60"
+                                    : exp.status === "running"
+                                    ? "bg-blue-950/60 text-blue-300 border border-blue-800/60 animate-pulse"
+                                    : exp.status === "timed_out"
+                                    ? "bg-amber-950/60 text-amber-300 border border-amber-800/60"
+                                    : exp.status === "cancelled"
+                                    ? "bg-neutral-800 text-neutral-300 border border-neutral-700"
+                                    : "bg-red-950/60 text-red-300 border border-red-800/60"
+                                }`}
+                              >
+                                {exp.status}
+                                {exp.exit_code !== null && exp.exit_code !== undefined && ` (${exp.exit_code})`}
+                              </span>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteExperiment(exp.id);
+                                }}
+                                className="p-1 text-neutral-500 hover:text-red-400 rounded transition"
+                                title="Delete record"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Selected Experiment Inspector */}
+                    {selectedExperiment && (
+                      <div className="p-3 bg-neutral-950 border border-neutral-800 rounded-lg space-y-3 mt-3">
+                        <div className="flex items-center justify-between border-b border-neutral-800 pb-2">
+                          <span className="text-xs font-semibold text-neutral-200">
+                            Details: {selectedExperiment.name}
+                          </span>
+                          <span className="text-[10px] font-mono text-neutral-400">
+                            Image: {selectedExperiment.image}
+                          </span>
+                        </div>
+
+                        {selectedExperiment.result_summary && (
+                          <p className="text-xs text-neutral-300 bg-neutral-900/60 p-2 rounded border border-neutral-800">
+                            {selectedExperiment.result_summary}
+                          </p>
+                        )}
+
+                        {selectedExperiment.error && (
+                          <div className="text-xs text-red-300 bg-red-950/30 p-2 rounded border border-red-800/60">
+                            Error: {selectedExperiment.error}
+                          </div>
+                        )}
+
+                        {/* Stdout / Stderr logs */}
+                        <div className="space-y-2">
+                          <div>
+                            <div className="text-[10px] text-neutral-400 font-mono uppercase mb-1">Standard Output</div>
+                            <pre className="p-2 bg-neutral-900 border border-neutral-800 rounded font-mono text-[10px] text-neutral-300 max-h-32 overflow-y-auto whitespace-pre-wrap">
+                              {selectedExperiment.stdout_tail || "(no stdout recorded)"}
+                            </pre>
+                          </div>
+                          {selectedExperiment.stderr_tail && (
+                            <div>
+                              <div className="text-[10px] text-red-400 font-mono uppercase mb-1">Standard Error</div>
+                              <pre className="p-2 bg-neutral-900 border border-neutral-800 rounded font-mono text-[10px] text-red-300 max-h-24 overflow-y-auto whitespace-pre-wrap">
+                                {selectedExperiment.stderr_tail}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+
+                        {selectedExperiment.artifact_ids_json && selectedExperiment.artifact_ids_json !== "[]" && (
+                          <div className="text-xs text-neutral-400">
+                            <span className="font-semibold text-neutral-300">Generated Artifacts: </span>
+                            <span className="font-mono text-purple-300">{selectedExperiment.artifact_ids_json}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Sequential / Side-by-Side Experiment Comparison */}
+              <div className="p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-4">
+                <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wide flex items-center gap-2">
+                  <GitCompare className="w-4 h-4 text-purple-400" />
+                  <span>Compare Experiment Runs</span>
+                </div>
+                <p className="text-xs text-neutral-400">
+                  Select two completed or interrupted experiments to compare exit codes, output matching, and summary differences.
+                </p>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                  <div>
+                    <label className="text-[11px] text-neutral-400 block mb-1">Baseline Experiment (A)</label>
+                    <select
+                      value={compareIdA}
+                      onChange={(e) => setCompareIdA(e.target.value)}
+                      className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                    >
+                      <option value="">Select Experiment A...</option>
+                      {experiments.map((e) => (
+                        <option key={e.id} value={e.id}>
+                          {e.name} ({e.status})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-neutral-400 block mb-1">Comparison Experiment (B)</label>
+                    <select
+                      value={compareIdB}
+                      onChange={(e) => setCompareIdB(e.target.value)}
+                      className="w-full px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded-lg text-xs text-neutral-200 font-mono"
+                    >
+                      <option value="">Select Experiment B...</option>
+                      {experiments.map((e) => (
+                        <option key={e.id} value={e.id}>
+                          {e.name} ({e.status})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <button
+                      onClick={handleCompareExperiments}
+                      disabled={isComparing || !compareIdA || !compareIdB}
+                      className="w-full py-1.5 px-3 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-medium flex items-center justify-center gap-2 transition disabled:opacity-50"
+                    >
+                      <GitCompare className={`w-3.5 h-3.5 ${isComparing ? "animate-spin" : ""}`} />
+                      <span>Compare Runs</span>
+                    </button>
+                  </div>
+                </div>
+
+                {comparisonResult && (
+                  <div className="p-4 bg-neutral-950 border border-neutral-800 rounded-lg space-y-3">
+                    <div className="flex items-center gap-4 text-xs">
+                      <div>
+                        <span className="text-neutral-400">Exit Codes: </span>
+                        <span
+                          className={`font-semibold ${
+                            comparisonResult.exit_codes_match ? "text-green-400" : "text-amber-400"
+                          }`}
+                        >
+                          {comparisonResult.exit_codes_match ? "Match" : "Differ"}
+                        </span>
+                        <span className="text-neutral-500 font-mono ml-1">
+                          (A: {comparisonResult.exp_a_exit_code ?? "N/A"} vs B: {comparisonResult.exp_b_exit_code ?? "N/A"})
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-neutral-400">Stdout Output: </span>
+                        <span
+                          className={`font-semibold ${
+                            comparisonResult.stdout_match ? "text-green-400" : "text-amber-400"
+                          }`}
+                        >
+                          {comparisonResult.stdout_match ? "Identical" : "Differences detected"}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-xs text-neutral-300 font-mono whitespace-pre-wrap bg-neutral-900/80 p-3 rounded border border-neutral-800">
+                      {comparisonResult.summary_diff}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
