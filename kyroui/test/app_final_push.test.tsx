@@ -288,7 +288,7 @@ describe("App.tsx Final Coverage Maximization", () => {
     });
     fireEvent.click(screen.getByText("Teammate Roster"));
     await waitFor(() => {
-      expect(screen.getByText(/Teammate Roster & Multi-Agent State/i)).toBeInTheDocument();
+      expect(screen.getByText(/Teammate Roster & Agent Profiles/i)).toBeInTheDocument();
     });
     const xBtn3 = document.querySelector(".lucide-x")?.closest("button");
     if (xBtn3) fireEvent.click(xBtn3);
