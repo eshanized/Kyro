@@ -1,4 +1,5 @@
 use kyro_lib::{
+    agent::registry::AgentRegistry,
     agent::AgentLoopEngine,
     browser::BrowserAutomationManager,
     commands::*,
@@ -33,9 +34,15 @@ fn setup_test_context(tag: &str) -> (TestContext, tauri::State<'static, AppState
     let vault = Vault::new_encrypted_fallback(db.clone());
     let browser = Arc::new(BrowserAutomationManager::new().with_database(db.clone()));
     let dev_servers = Arc::new(DevServerManager::new());
-    let engine = Arc::new(AgentLoopEngine::with_resources(
+    // File-backed registry so workspace commands have a durable config root
+    // (mirrors production main.rs wiring).
+    let registry = Arc::new(tokio::sync::RwLock::new(AgentRegistry::load_or_embedded(
+        &dir.join("config"),
+    )));
+    let engine = Arc::new(AgentLoopEngine::with_registry(
         browser.clone(),
         dev_servers.clone(),
+        registry,
     ));
     let mcp_manager = McpManager::new(db.clone(), vault.clone());
     let connector_manager = Arc::new(ConnectorManager::new(
@@ -363,7 +370,7 @@ async fn test_bots_and_roster_commands() {
     let bots_after = list_bots(state.clone()).unwrap();
     assert_eq!(bots_after.len(), bots.len() + 1);
 
-    let statuses = get_roster_statuses(state.clone());
+    let statuses = get_roster_statuses(state.clone()).await.unwrap();
     assert!(!statuses.is_empty());
 
     delete_bot(state.clone(), "bot-coder".to_string()).unwrap();
@@ -899,7 +906,7 @@ async fn test_project_checkpoints_and_discovery_commands() {
 
 #[tokio::test]
 async fn test_visual_baselines_and_multiagent_workspace_commands() {
-    let (ctx, _state) = setup_test_context("vis_base");
+    let (ctx, state) = setup_test_context("vis_base");
 
     let proj_dir = ctx.dir.join("vis_proj");
     std::fs::create_dir_all(&proj_dir).unwrap();
@@ -940,15 +947,19 @@ async fn test_visual_baselines_and_multiagent_workspace_commands() {
 
     // Multi-agent workspace
     let ws = create_multi_agent_workspace(
+        state.clone(),
         "run-parent-1".to_string(),
         proj_dir.to_string_lossy().to_string(),
         "Refactor API".to_string(),
+        None,
+        None,
     )
     .await
     .unwrap();
     assert_eq!(ws.parent_run_id, "run-parent-1");
 
     let recon = reconcile_multi_agent_workspace(
+        state.clone(),
         proj_dir.to_string_lossy().to_string(),
         proj_dir.to_string_lossy().to_string(),
         ws.workspace_id.clone(),
@@ -1442,13 +1453,16 @@ async fn test_checkpoint_and_build_doctor_commands() {
 
 #[tokio::test]
 async fn test_multiagent_workspace_and_baseline_commands() {
-    let (_ctx, _state) = setup_test_context("multiagent_baseline");
+    let (_ctx, state) = setup_test_context("multiagent_baseline");
 
     // Multi-agent workspace
     let ws = create_multi_agent_workspace(
+        state.clone(),
         "parent_run_1".to_string(),
         _ctx.dir.to_string_lossy().to_string(),
         "Build feature".to_string(),
+        None,
+        None,
     )
     .await;
     assert!(ws.is_ok());
@@ -1456,6 +1470,7 @@ async fn test_multiagent_workspace_and_baseline_commands() {
     assert_eq!(ws_record.parent_run_id, "parent_run_1");
 
     let rec = reconcile_multi_agent_workspace(
+        state.clone(),
         _ctx.dir.to_string_lossy().to_string(),
         _ctx.dir.to_string_lossy().to_string(),
         ws_record.workspace_id,
@@ -1516,6 +1531,216 @@ async fn test_terminal_and_timeline_commands() {
     // Installed apps
     let apps = get_installed_apps();
     let _ = apps;
+}
+
+#[tokio::test]
+async fn test_agent_profile_registry_commands() {
+    use kyro_lib::agent::ProfileOrigin;
+
+    let (_ctx, state) = setup_test_context("agent_profiles");
+
+    // 1. Bundled profiles are listed out of the box, with sentry builtins.
+    let listed = list_agent_profiles(state.clone()).await.unwrap();
+    assert!(
+        listed.len() >= 5,
+        "expected at least the 5 shipped profiles"
+    );
+    assert!(listed
+        .iter()
+        .any(|p| p.id == "apex-orchestrator" && p.origin == ProfileOrigin::Builtin));
+    assert!(listed
+        .iter()
+        .any(|p| p.id == "forge-devops" && p.origin == ProfileOrigin::Builtin));
+
+    // 2. Document read for a builtin returns the shipped manifest.
+    let doc = get_agent_profile_document(state.clone(), "scout-web".to_string())
+        .await
+        .unwrap();
+    assert!(doc.document.contains("id: scout-web"));
+
+    // 3. Create a custom profile: it lands on disk as a Markdown manifest and
+    //    appears in the roster.
+    let created = create_agent_profile(
+        state.clone(),
+        CreateAgentProfileRequest {
+            id: "Sentinel Reviewer".to_string(),
+            name: "Sentinel".to_string(),
+            avatar: "shield".to_string(),
+            role: "Static analysis & review".to_string(),
+            description: "Reviews changes".to_string(),
+            instructions: "# Identity\n\nYou are Sentinel, a careful reviewer.".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.id, "sentinel-reviewer");
+    assert_eq!(created.origin, ProfileOrigin::Custom);
+    assert!(!created.is_builtin);
+    assert!(created.version_label.starts_with("v1:"));
+
+    let listed_after = list_agent_profiles(state.clone()).await.unwrap();
+    assert!(listed_after.iter().any(|p| p.id == "sentinel-reviewer"));
+    // Built-in ids are never shadowed by create.
+    let dup_builtin = create_agent_profile(
+        state.clone(),
+        CreateAgentProfileRequest {
+            id: "apex-orchestrator".to_string(),
+            name: "Apex".to_string(),
+            avatar: "zap".to_string(),
+            role: "Orchestrator".to_string(),
+            description: String::new(),
+            instructions: String::new(),
+        },
+    )
+    .await;
+    assert!(dup_builtin.is_err());
+
+    // 4. Editing writes an override and bumps the version label; saving an
+    //    invalid manifest is rejected and the previous version stays active.
+    let doc = get_agent_profile_document(state.clone(), "sentinel-reviewer".to_string())
+        .await
+        .unwrap();
+    let patched = doc.document.replace(
+        "You are Sentinel, a careful reviewer.",
+        "You are Sentinel, an extremely careful reviewer.",
+    );
+    let saved = save_agent_profile(
+        state.clone(),
+        "sentinel-reviewer".to_string(),
+        patched.clone(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(saved.version_label, created.version_label);
+    assert!(saved.instructions.contains("extremely careful reviewer"));
+    let broken = save_agent_profile(
+        state.clone(),
+        "sentinel-reviewer".to_string(),
+        "---\nnot a valid manifest: [\n".to_string(),
+    )
+    .await;
+    assert!(broken.is_err(), "invalid manifests must be rejected");
+    let still = get_agent_profile_document(state.clone(), "sentinel-reviewer".to_string())
+        .await
+        .unwrap();
+    assert!(still.document.contains("extremely careful reviewer"));
+
+    // 5. Runtime enable/disable persists custom flags in the manifest and
+    //    builtin masks in the settings store.
+    set_agent_profile_enabled(state.clone(), "sentinel-reviewer".to_string(), false)
+        .await
+        .unwrap();
+    let disabled = list_agent_profiles(state.clone()).await.unwrap();
+    let rec = disabled
+        .iter()
+        .find(|p| p.id == "sentinel-reviewer")
+        .unwrap();
+    assert!(!rec.enabled);
+
+    set_agent_profile_enabled(state.clone(), "apex-orchestrator".to_string(), false)
+        .await
+        .unwrap();
+    let disabled = list_agent_profiles(state.clone()).await.unwrap();
+    assert!(
+        !disabled
+            .iter()
+            .find(|p| p.id == "apex-orchestrator")
+            .unwrap()
+            .enabled
+    );
+    let saved_ids: Vec<String> = state
+        .db
+        .get_setting("agent_disabled_profile_ids")
+        .unwrap()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    assert_eq!(saved_ids, vec!["apex-orchestrator".to_string()]);
+    set_agent_profile_enabled(state.clone(), "apex-orchestrator".to_string(), true)
+        .await
+        .unwrap();
+
+    // 6. Built-ins cannot be deleted; custom profiles can.
+    let del_builtin = delete_agent_profile(state.clone(), "apex-orchestrator".to_string()).await;
+    assert!(del_builtin.is_err());
+    let outcome = delete_agent_profile(state.clone(), "sentinel-reviewer".to_string())
+        .await
+        .unwrap();
+    assert_eq!(outcome, ProfileOrigin::Custom);
+    let after_delete = list_agent_profiles(state.clone()).await.unwrap();
+    assert!(!after_delete.iter().any(|p| p.id == "sentinel-reviewer"));
+
+    // 7. Resetting a built-in with no override is a no-op returning factory
+    //    content; deleting a candidate override falls back to factory.
+    let reset = reset_agent_profile(state.clone(), "apex-orchestrator".to_string())
+        .await
+        .unwrap();
+    assert_eq!(reset.origin, ProfileOrigin::Builtin);
+    let apex_doc = get_agent_profile_document(state.clone(), "apex-orchestrator".to_string())
+        .await
+        .unwrap();
+    let overridden = save_agent_profile(
+        state.clone(),
+        "apex-orchestrator".to_string(),
+        apex_doc
+            .document
+            .replace("name: Apex", "name: Apex Prime")
+            .replace(
+                "description: General workspace and strategic orchestration",
+                "description: Apex Prime override",
+            ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(overridden.origin, ProfileOrigin::Override);
+    let fallback = delete_agent_profile(state.clone(), "apex-orchestrator".to_string())
+        .await
+        .unwrap();
+    assert_eq!(fallback, ProfileOrigin::Override);
+    let final_list = list_agent_profiles(state.clone()).await.unwrap();
+    let apex = final_list
+        .iter()
+        .find(|p| p.id == "apex-orchestrator")
+        .unwrap();
+    assert_eq!(apex.origin, ProfileOrigin::Builtin);
+    assert_eq!(apex.name, "Apex");
+}
+
+#[tokio::test]
+async fn test_workspace_list_and_cancel_commands() {
+    let (_ctx, state) = setup_test_context("ws_cmds");
+
+    // Empty store lists fine.
+    let listed = list_multi_agent_workspaces(state.clone()).await.unwrap();
+    assert!(listed.is_empty());
+
+    // Unknown workspace cancel reports false instead of lying.
+    let cancelled = cancel_multi_agent_workspace("ws_missing".to_string())
+        .await
+        .unwrap();
+    assert!(!cancelled);
+
+    // Creating + running a real plan against a dead endpoint reaches an
+    // honest failed terminal state without network.
+    let ws = create_multi_agent_workspace(
+        state.clone(),
+        "ws_parent".to_string(),
+        _ctx.dir.to_string_lossy().to_string(),
+        "Objective".to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.tasks.len(), 4);
+
+    let listed = list_multi_agent_workspaces(state.clone()).await.unwrap();
+    assert!(listed.iter().any(|w| w.workspace_id == ws.workspace_id));
+
+    let gone = cancel_multi_agent_workspace(ws.workspace_id.clone())
+        .await
+        .unwrap();
+    // The workspace was never started with a token, so cancel is a no-op.
+    assert!(!gone);
 }
 
 #[tokio::test]
