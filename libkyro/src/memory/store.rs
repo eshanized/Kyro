@@ -71,8 +71,14 @@ impl MemoryStore {
         entries
     }
 
-    /// Compiles a relevant, bounded context block to inject into system prompt
-    pub fn build_context_block(db: &Database, active_agent_id: &str, task_prompt: &str) -> String {
+    /// Compiles a relevant, bounded context block to inject into system prompt,
+    /// filtered strictly by the profile's declared memory scopes.
+    pub fn build_context_block_scoped(
+        db: &Database,
+        active_agent_id: &str,
+        task_prompt: &str,
+        allowed_scopes: &[String],
+    ) -> String {
         let now = chrono::Utc::now().timestamp_millis();
         let keywords = Self::tokenize(task_prompt);
         let prompt_lower = task_prompt.to_lowercase();
@@ -89,45 +95,49 @@ impl MemoryStore {
         };
 
         // 1. User preferences (scope: "preference", owner: "user")
-        if let Ok(prefs) = db.get_memories_for_scope("preference", "user") {
-            let ranked = Self::rank_memories(&keywords, prefs, now);
-            if !ranked.is_empty() {
-                let mut pref_section = String::from("User Preferences:\n");
-                let mut added_any = false;
-                for p in ranked {
-                    let line = format!("- {}: {}\n", p.key, p.value);
-                    if pref_section.len() + line.len() > 1000 {
-                        break;
+        if allowed_scopes.iter().any(|s| s == "preference") {
+            if let Ok(prefs) = db.get_memories_for_scope("preference", "user") {
+                let ranked = Self::rank_memories(&keywords, prefs, now);
+                if !ranked.is_empty() {
+                    let mut pref_section = String::from("User Preferences:\n");
+                    let mut added_any = false;
+                    for p in ranked {
+                        let line = format!("- {}: {}\n", p.key, p.value);
+                        if pref_section.len() + line.len() > 1000 {
+                            break;
+                        }
+                        pref_section.push_str(&line);
+                        added_any = true;
                     }
-                    pref_section.push_str(&line);
-                    added_any = true;
+                    if added_any {
+                        let _ = append_entry(&pref_section, &mut block);
+                    }
                 }
-                if added_any {
-                    let _ = append_entry(&pref_section, &mut block);
-                }
+            } else if let Ok(Some(prefs_str)) = db.get_setting("user_preferences") {
+                let line = format!("User Preferences:\n{}\n", prefs_str);
+                let _ = append_entry(&line, &mut block);
             }
-        } else if let Ok(Some(prefs_str)) = db.get_setting("user_preferences") {
-            let line = format!("User Preferences:\n{}\n", prefs_str);
-            let _ = append_entry(&line, &mut block);
         }
 
         // 2. Agent-specific memory (scope: "agent", owner: active_agent_id)
         // Strictly isolated: only memories owned by this specific bot ID are queried
-        if let Ok(agent_mem) = db.get_memories_for_scope("agent", active_agent_id) {
-            let ranked = Self::rank_memories(&keywords, agent_mem, now);
-            if !ranked.is_empty() {
-                let mut agent_section = format!("\nAgent Facts (@{}):\n", active_agent_id);
-                let mut added_any = false;
-                for m in ranked {
-                    let line = format!("- {}: {}\n", m.key, m.value);
-                    if agent_section.len() + line.len() > 1000 {
-                        break;
+        if allowed_scopes.iter().any(|s| s == "agent") {
+            if let Ok(agent_mem) = db.get_memories_for_scope("agent", active_agent_id) {
+                let ranked = Self::rank_memories(&keywords, agent_mem, now);
+                if !ranked.is_empty() {
+                    let mut agent_section = format!("\nAgent Facts (@{}):\n", active_agent_id);
+                    let mut added_any = false;
+                    for m in ranked {
+                        let line = format!("- {}: {}\n", m.key, m.value);
+                        if agent_section.len() + line.len() > 1000 {
+                            break;
+                        }
+                        agent_section.push_str(&line);
+                        added_any = true;
                     }
-                    agent_section.push_str(&line);
-                    added_any = true;
-                }
-                if added_any {
-                    let _ = append_entry(&agent_section, &mut block);
+                    if added_any {
+                        let _ = append_entry(&agent_section, &mut block);
+                    }
                 }
             }
         }
@@ -183,6 +193,16 @@ impl MemoryStore {
         }
 
         block
+    }
+
+    /// Compiles a relevant, bounded context block to inject into system prompt
+    pub fn build_context_block(db: &Database, active_agent_id: &str, task_prompt: &str) -> String {
+        Self::build_context_block_scoped(
+            db,
+            active_agent_id,
+            task_prompt,
+            &["preference".to_string(), "agent".to_string()],
+        )
     }
 
     /// Explicitly save a memory fact

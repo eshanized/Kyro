@@ -25,7 +25,7 @@ If applicable, add screenshots or paste terminal/console logs to help explain yo
 **Desktop Environment:**
  - OS: [e.g. Ubuntu 22.04 / macOS Sonoma / Windows 11]
  - Desktop Environment: [e.g. GNOME, KDE, Wayland, X11]
- - Kyro Version: [e.g. 0.1.1 or commit hash]
+ - Kyro Version: [e.g. 0.1.2 or commit hash]
  - Rust Version: [e.g. `rustc --version`]
  - Node.js Version: [e.g. `node --version`]
 

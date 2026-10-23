@@ -60,11 +60,11 @@ const AVATAR_ICONS: Record<string, React.ComponentType<{ className?: string }>> 
 
 const ORIGIN_LABELS: Record<ProfileOrigin, { label: string; tone: string }> = {
   builtin: {
-    label: "Shipped default",
+    label: "Built-in",
     tone: "bg-neutral-800 text-neutral-300 border border-neutral-700",
   },
   override: {
-    label: "Overridden",
+    label: "Override",
     tone: "bg-purple-950/50 text-purple-300 border border-purple-800/60",
   },
   custom: {
@@ -160,6 +160,13 @@ export const TeammateRosterModal: React.FC<TeammateRosterModalProps> = ({
       await invoke("set_agent_profile_enabled", { id: p.id, enabled: !p.enabled });
       await loadProfiles();
       setError(null);
+      if (selectedBotId === p.id && p.enabled) {
+        // Disabling currently active teammate; fallback cleanly to Apex
+        const defaultProfile = profiles.find((prof) => prof.id === "apex-orchestrator");
+        if (defaultProfile) {
+          onSelectBot(defaultProfile);
+        }
+      }
     } catch (err: any) {
       setError("Failed to toggle " + p.name + ": " + err);
     }
@@ -173,6 +180,13 @@ export const TeammateRosterModal: React.FC<TeammateRosterModalProps> = ({
       // bundled default, deleting a custom profile removes it entirely.
       await loadProfiles();
       setError(null);
+      if (selectedBotId === id) {
+        // Deleted currently active teammate; fallback cleanly to Apex
+        const defaultProfile = profiles.find((prof) => prof.id === "apex-orchestrator");
+        if (defaultProfile) {
+          onSelectBot(defaultProfile);
+        }
+      }
     } catch (err: any) {
       setError("Failed to delete teammate: " + err);
     } finally {

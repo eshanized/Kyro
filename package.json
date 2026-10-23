@@ -1,6 +1,6 @@
 {
   "name": "kyro",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local-first autonomous desktop AI agent built with Tauri v2, Rust, and React 19",
   "private": true,
   "type": "module",

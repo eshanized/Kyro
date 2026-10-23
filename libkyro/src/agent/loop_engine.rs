@@ -1,5 +1,7 @@
 use super::cancellation::CancellationToken;
-use super::registry::{AgentRegistry, ProfileSnapshot, ResolveError};
+use super::registry::{
+    canonical_tool_name, AgentRegistry, ProfileSnapshot, ResolveError, RunConfigSnapshot,
+};
 use super::router::{ChatMessage, MessageContent, ModelRouter, ToolCall, ToolDefinition};
 use crate::agent::tools::{self, ToolOutcome};
 use crate::browser::BrowserAutomationManager;
@@ -582,7 +584,12 @@ The program is started as an explicit executable plus argument vector; free-form
             .map(|m| m.content.as_text_lossy())
             .unwrap_or_default();
 
-        let memory_context = MemoryStore::build_context_block(&db, &active_agent_id, &last_prompt);
+        let memory_context = MemoryStore::build_context_block_scoped(
+            &db,
+            &active_agent_id,
+            &last_prompt,
+            &profile.context.memory_scopes,
+        );
 
         // Query deep local RAG over authorized documents if there is an active user prompt
         let rag_context = if !last_prompt.trim().is_empty() {
@@ -1003,26 +1010,109 @@ The program is started as an explicit executable plus argument vector; free-form
         profile: &ProfileSnapshot,
         base_url: Option<&str>,
     ) -> (String, bool, Option<String>) {
-        let workspace_root = if let Ok(Some(r)) = db.get_run(run_id) {
-            r.config_json.as_ref().and_then(|cfg| {
-                serde_json::from_str::<serde_json::Value>(cfg)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("workspace_root")
-                            .and_then(|s| s.as_str())
-                            .map(PathBuf::from)
-                    })
-            })
-        } else {
-            None
+        let canonical_name = canonical_tool_name(&tc.name);
+
+        // Security boundary: enforce profile-level tool restrictions
+        if !profile.tool_allowed(&canonical_name) {
+            log::warn!(
+                "[Security] Tool '{}' (canonical: '{}') rejected by agent '@{}' profile policy (mode: '{}')",
+                tc.name,
+                canonical_name,
+                profile.name,
+                profile.tools.mode
+            );
+            return (
+                format!(
+                    "Tool '{}' is not permitted by agent '@{}' profile policy.",
+                    tc.name, profile.name
+                ),
+                true,
+                None,
+            );
         }
-        .or_else(|| {
-            db.get_setting("workspace_root")
-                .ok()
-                .flatten()
-                .map(PathBuf::from)
-        })
-        .or_else(|| dirs::data_dir().map(|d| d.join("kyro").join("workspace")));
+
+        if canonical_name == "delegate_task" && !profile.delegation.enabled {
+            return (
+                format!(
+                    "Delegation rejected: agent '@{}' has delegation disabled in its profile.",
+                    profile.name
+                ),
+                true,
+                None,
+            );
+        }
+
+        let (configured_workspace, requires_isolated_worktree) =
+            if let Ok(Some(r)) = db.get_run(run_id) {
+                if let Some(ref cfg_str) = r.config_json {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cfg_str) {
+                        let iso_path = v
+                            .get("isolated_worktree_path")
+                            .and_then(|s| s.as_str())
+                            .map(PathBuf::from);
+                        let ws_path = v
+                            .get("workspace_root")
+                            .and_then(|s| s.as_str())
+                            .map(PathBuf::from);
+                        let is_isolated = v
+                            .get("isolated_worktree")
+                            .map(|b| b.as_bool().unwrap_or(true))
+                            .unwrap_or(iso_path.is_some());
+
+                        if let Some(p) = iso_path {
+                            (Some(p), true)
+                        } else if let Some(p) = ws_path {
+                            (Some(p), is_isolated)
+                        } else {
+                            (None, false)
+                        }
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    (None, false)
+                }
+            } else {
+                (None, false)
+            };
+
+        // Fail-closed workspace containment: if isolation was requested, path MUST exist.
+        // Never silently fall back to host project root or default workspace!
+        let workspace_root = if requires_isolated_worktree {
+            match configured_workspace {
+                Some(ref root) if root.exists() => configured_workspace,
+                Some(ref root) => {
+                    log::error!(
+                        "[Security] Isolated workspace {:?} does not exist. Halting execution to prevent fallback.",
+                        root
+                    );
+                    return (
+                        format!(
+                            "Execution failed: requested isolated workspace {:?} does not exist. Halting task to prevent unauthorized execution in project root.",
+                            root
+                        ),
+                        true,
+                        None,
+                    );
+                }
+                None => {
+                    return (
+                        "Execution failed: task requires an isolated worktree, but no worktree path was configured.".to_string(),
+                        true,
+                        None,
+                    );
+                }
+            }
+        } else {
+            configured_workspace
+                .or_else(|| {
+                    db.get_setting("workspace_root")
+                        .ok()
+                        .flatten()
+                        .map(PathBuf::from)
+                })
+                .or_else(|| dirs::data_dir().map(|d| d.join("kyro").join("workspace")))
+        };
 
         if let Some(ref root) = workspace_root {
             let _ = std::fs::create_dir_all(root);
@@ -1336,6 +1426,10 @@ The program is started as an explicit executable plus argument vector; free-form
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .kill_on_drop(true);
+
+                    if let Some(root) = workspace_root {
+                        cmd_builder.current_dir(root);
+                    }
 
                     #[cfg(unix)]
                     {
@@ -2285,6 +2379,41 @@ The program is started as an explicit executable plus argument vector; free-form
                     }
                 };
 
+                // (5) Delegation cycle detection: prevent self-delegation and ancestor cycles
+                if target_profile.id == profile.id {
+                    return (
+                        format!(
+                            "Delegation rejected: self-delegation detected; agent '@{}' cannot delegate to itself.",
+                            profile.name
+                        ),
+                        true,
+                        None,
+                    );
+                }
+                {
+                    let mut ancestor_run_id = Some(run_id.to_string());
+                    let mut ancestors = std::collections::HashSet::new();
+                    ancestors.insert(profile.id.clone());
+                    while let Some(pid) = ancestor_run_id {
+                        if let Ok(Some(parent_run)) = db.get_run(&pid) {
+                            ancestors.insert(parent_run.agent_id.clone());
+                            ancestor_run_id = parent_run.parent_run_id;
+                        } else {
+                            break;
+                        }
+                    }
+                    if ancestors.contains(&target_profile.id) {
+                        return (
+                            format!(
+                                "Delegation rejected: cycle detected; agent '@{}' is already an active ancestor in the delegation chain.",
+                                target_profile.name
+                            ),
+                            true,
+                            None,
+                        );
+                    }
+                }
+
                 // Create child run record with unique ID
                 let child_run_id = format!(
                     "{}_child_{}_{}",
@@ -2299,7 +2428,37 @@ The program is started as an explicit executable plus argument vector; free-form
                     .flatten()
                     .map(|r| r.model)
                     .unwrap_or_else(|| "nvidia/nemotron-3-ultra-550b-a55b".to_string());
-                let child_model = parent_model.clone();
+
+                // Respect profile model settings
+                let child_model = match target_profile.model.mode.as_str() {
+                    "fixed" => target_profile
+                        .model
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| parent_model.clone()),
+                    "inherit" => parent_model.clone(),
+                    _ => parent_model.clone(),
+                };
+
+                let run_snapshot = RunConfigSnapshot {
+                    profile: target_profile.clone(),
+                    effective_model: child_model.clone(),
+                    workspace_root: workspace_root.map(|p| p.to_string_lossy().to_string()),
+                    isolated_worktree_path: None,
+                    isolated_worktree: None,
+                    base_commit: None,
+                    workflow_id: None,
+                    task_id: None,
+                    attempt: None,
+                    parent_run_id: Some(run_id.to_string()),
+                    parent_agent: Some(profile.id.clone()),
+                    delegation_depth: Some(new_depth),
+                    context_summary: if context_summary.trim().is_empty() {
+                        None
+                    } else {
+                        Some(context_summary.to_string())
+                    },
+                };
 
                 let child_run = AgentRun {
                     id: child_run_id.clone(),
@@ -2318,19 +2477,25 @@ The program is started as an explicit executable plus argument vector; free-form
                     started_at: Some(now),
                     completed_at: None,
                     error: None,
-                    config_json: Some(
-                        serde_json::json!({
-                            "context": context_summary,
-                            "parent_run_id": run_id,
-                            "parent_agent": profile.id,
-                            "delegation_depth": new_depth,
-                            "workspace_root": workspace_root.map(|p| p.to_string_lossy().to_string()),
-                        })
-                        .to_string(),
-                    ),
+                    config_json: Some(serde_json::to_string(&run_snapshot).unwrap_or_default()),
                     parent_run_id: Some(run_id.to_string()),
                 };
-                let _ = db.create_run(&child_run);
+
+                if let Err(e) = db.create_run(&child_run) {
+                    log::error!(
+                        "[Delegation] Failed to persist child run record {}: {}",
+                        child_run_id,
+                        e
+                    );
+                    return (
+                        format!(
+                            "Delegation failed: unable to persist durable child run: {}",
+                            e
+                        ),
+                        true,
+                        None,
+                    );
+                }
 
                 // Track the teammate's live task in the roster; the guard
                 // clears exactly this (teammate, run) pair on every exit path.

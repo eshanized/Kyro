@@ -1,7 +1,7 @@
 use crate::agent::router::{ModelCapabilities, ModelRouter};
 use crate::agent::vision::{VisualAnalysisContext, VisualAnalysisResult, VisualAnalyzer};
 use crate::agent::{
-    registry::{AgentRegistry, ValidationState, DEFAULT_AGENT_ID},
+    registry::{AgentRegistry, RunConfigSnapshot, ValidationState, DEFAULT_AGENT_ID},
     router::DEFAULT_NEMOTRON_MODEL,
     AgentLoopEngine, AgentStepEvent, CancellationToken, ChatMessage, ProfileOrigin, RegistryEntry,
 };
@@ -577,7 +577,7 @@ pub struct AgentProfileRecord {
 
 fn agent_profile_record(id: &str, entry: &RegistryEntry) -> AgentProfileRecord {
     let validation_error = match &entry.validation {
-        ValidationState::Ok => None,
+        ValidationState::Ok => entry.override_error.clone(),
         ValidationState::Invalid(msg) => Some(msg.clone()),
     };
     let source_path = entry
@@ -1067,13 +1067,54 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .map(|m| m.content.as_text_lossy())
         .unwrap_or_else(|| "Interactive task".to_string());
 
-    let effective_bot_id = bot_id.unwrap_or_else(|| "apex-orchestrator".to_string());
+    // Authoritative mention routing & fallback resolution
+    let routing = {
+        let mut registry = state.engine.registry.write().await;
+        registry.ensure_fresh();
+        registry.route_turn(&task_prompt, bot_id.as_deref())
+    };
 
-    // Stage C: resolve the requested agent (id/alias/legacy id) to its
-    // canonical profile so persisted run records always reference an agent the
-    // registry can actually execute.
-    let resolved_profile = state.engine.resolve_agent(Some(&effective_bot_id)).await?;
+    let resolved_profile = state
+        .engine
+        .resolve_agent(Some(&routing.target_agent_id))
+        .await?;
     let effective_bot_id = resolved_profile.id.clone();
+
+    let run_snapshot = RunConfigSnapshot {
+        profile: resolved_profile.clone(),
+        effective_model: selected_model.clone(),
+        workspace_root: None,
+        isolated_worktree_path: None,
+        isolated_worktree: None,
+        base_commit: None,
+        workflow_id: None,
+        task_id: None,
+        attempt: None,
+        parent_run_id: None,
+        parent_agent: None,
+        delegation_depth: Some(0),
+        context_summary: None,
+    };
+    let mut cfg_value = serde_json::to_value(&run_snapshot).unwrap_or_default();
+    if let Some(obj) = cfg_value.as_object_mut() {
+        obj.insert(
+            "profile_version".to_string(),
+            serde_json::json!(resolved_profile.version_label()),
+        );
+        obj.insert(
+            "profile_origin".to_string(),
+            serde_json::json!(resolved_profile.origin),
+        );
+        obj.insert(
+            "routing".to_string(),
+            serde_json::json!({
+                "mention_detected": routing.mention_detected,
+                "detected_token": routing.detected_token,
+                "is_fallback": routing.is_fallback,
+                "fallback_reason": routing.fallback_reason,
+            }),
+        );
+    }
 
     let run_record = AgentRun {
         id: effective_run_id.clone(),
@@ -1086,13 +1127,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         started_at: Some(now),
         completed_at: None,
         error: None,
-        config_json: Some(
-            serde_json::json!({
-                "profile_version": resolved_profile.version_label(),
-                "profile_origin": resolved_profile.origin,
-            })
-            .to_string(),
-        ),
+        config_json: Some(cfg_value.to_string()),
         parent_run_id: None,
     };
     state
@@ -2210,12 +2245,14 @@ pub async fn get_selected_agent(state: State<'_, AppState>) -> Result<String, St
             // anything else (deleted, disabled, invalid) falls back.
             let mut registry = state.engine.registry.write().await;
             registry.ensure_fresh();
-            match registry.resolve_lenient(&id) {
-                Ok(snapshot) if snapshot.enabled => return Ok(snapshot.id),
+            match registry.resolve(&id) {
+                Ok(snapshot) if snapshot.enabled => return Ok(snapshot.id.clone()),
                 _ => {}
             }
         }
     }
+    // Fall back to the default agent and persist fallback so settings stay valid
+    let _ = state.db.set_setting("selected_agent", DEFAULT_AGENT_ID);
     Ok(DEFAULT_AGENT_ID.to_string())
 }
 
@@ -2231,17 +2268,20 @@ pub async fn save_selected_agent(
 
     let mut registry = state.engine.registry.write().await;
     registry.ensure_fresh();
-    let snapshot = registry
-        .resolve_lenient(&trimmed)
-        .map_err(|e| e.to_string())?;
+    // Authoritative check: must resolve to an active, enabled agent profile
+    let snapshot_id = registry
+        .resolve(&trimmed)
+        .map_err(|e| e.to_string())?
+        .id
+        .clone();
     drop(registry);
 
     state
         .db
-        .set_setting("selected_agent", &snapshot.id)
+        .set_setting("selected_agent", &snapshot_id)
         .map_err(|e| e.to_string())?;
 
-    Ok(snapshot.id)
+    Ok(snapshot_id)
 }
 
 // -----------------------------------------------------------------------------
@@ -2472,6 +2512,19 @@ pub async fn reconcile_multi_agent_workspace(
         }
     }
     Ok(outcome)
+}
+
+#[tauri::command]
+pub async fn apply_multi_agent_workspace_reconciliation(
+    project_root: String,
+    worktree_path: String,
+    branch_name: Option<String>,
+) -> Result<String, String> {
+    MultiAgentOrchestrator::apply_reconciliation(
+        Path::new(&project_root),
+        Path::new(&worktree_path),
+        branch_name.as_deref(),
+    )
 }
 
 // -----------------------------------------------------------------------------

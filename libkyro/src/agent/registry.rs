@@ -118,12 +118,21 @@ impl ProfileSnapshot {
     }
 
     /// Whether a tool with `tool_name` may be dispatched under this profile's
-    /// tool policy (`inherit` → everything; `allowlist` → exact matches).
+    /// tool policy (`inherit` → everything except delegation if delegation is disabled;
+    /// `allowlist` → explicit canonical matches).
     pub fn tool_allowed(&self, tool_name: &str) -> bool {
-        if self.tools.mode == "allowlist" {
-            self.tools.allow.iter().any(|a| a == tool_name)
-        } else {
-            true
+        let canonical = canonical_tool_name(tool_name);
+        if canonical == "delegate_task" && !self.delegation.enabled {
+            return false;
+        }
+        match self.tools.mode.as_str() {
+            "allowlist" => self
+                .tools
+                .allow
+                .iter()
+                .any(|a| canonical_tool_name(a) == canonical),
+            "inherit" => true,
+            _ => false, // fail closed for any unknown or invalid mode
         }
     }
 
@@ -135,6 +144,161 @@ impl ProfileSnapshot {
             &self.content_hash[..12.min(self.content_hash.len())]
         )
     }
+}
+
+/// Canonical tool identifier mapping.
+/// Resolves aliases (e.g. "bash", "terminal", "shell" -> "execute_shell")
+/// and normalizes casing to prevent policy bypasses.
+pub fn canonical_tool_name(name: &str) -> String {
+    let lower = name.trim().to_lowercase();
+    match lower.as_str() {
+        "bash" | "terminal" | "shell" => "execute_shell".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Immutable, versioned configuration snapshot persisted with each run record.
+/// Contains everything that materially affected execution at start time,
+/// ensuring historical and in-flight runs remain reproducible even if profile manifests
+/// are subsequently modified, reset, disabled, or deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunConfigSnapshot {
+    pub profile: ProfileSnapshot,
+    pub effective_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated_worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated_worktree: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_summary: Option<String>,
+}
+
+/// Strips non-routable contexts from a user prompt before parsing @mentions:
+/// 1. Fenced code blocks (```...``` or ~~~...~~~)
+/// 2. Blockquotes (lines starting with >)
+/// 3. Inline code (`...`)
+pub fn strip_non_routable_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    let mut fence_char = ' ';
+
+    for line in text.lines() {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
+            let ch = trimmed_start.chars().next().unwrap();
+            if !in_fence {
+                in_fence = true;
+                fence_char = ch;
+            } else if ch == fence_char {
+                in_fence = false;
+            }
+            out.push('\n');
+            continue;
+        }
+
+        if in_fence {
+            out.push('\n');
+            continue;
+        }
+
+        // Blockquotes
+        if trimmed_start.starts_with('>') {
+            out.push('\n');
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // Strip inline code `...`
+    let mut without_inline = String::with_capacity(out.len());
+    let mut in_inline = false;
+    for ch in out.chars() {
+        if ch == '`' {
+            in_inline = !in_inline;
+            without_inline.push(' ');
+        } else if in_inline {
+            without_inline.push(' ');
+        } else {
+            without_inline.push(ch);
+        }
+    }
+
+    without_inline
+}
+
+/// Extracts potential mention tokens from text where '@' is at word start.
+/// Returns tokens without the leading '@'.
+pub fn extract_mention_tokens(text: &str) -> Vec<String> {
+    let cleaned = strip_non_routable_text(text);
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = cleaned.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '@' {
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                let prev = chars[i - 1];
+                prev.is_whitespace()
+                    || matches!(prev, '(' | '[' | '{' | ':' | ',' | '"' | '\'' | '.' | '!')
+            };
+
+            if prev_ok {
+                i += 1;
+                let start = i;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_')
+                {
+                    i += 1;
+                }
+                if i > start {
+                    // Check succeeding char: must NOT be '.' followed by alpha (which would be an email domain like @example.com)
+                    let is_email_domain = if i < len && chars[i] == '.' {
+                        i + 1 < len && chars[i + 1].is_alphabetic()
+                    } else {
+                        false
+                    };
+
+                    if !is_email_domain {
+                        let token: String = chars[start..i].iter().collect();
+                        tokens.push(token);
+                    }
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// Structured outcome of mention routing for a user prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionRoutingResult {
+    pub target_agent_id: String,
+    pub mention_detected: bool,
+    pub detected_token: Option<String>,
+    pub is_fallback: bool,
+    pub fallback_reason: Option<String>,
 }
 
 /// A registry entry: an active profile or a validation failure the user should
@@ -150,6 +314,11 @@ pub struct RegistryEntry {
     pub snapshot: Option<ProfileSnapshot>,
     /// Entry-scoped disabled flag (mirrors the runtime `agent_disabled_ids` set).
     pub runtime_disabled: bool,
+    /// Error message when an override of a built-in profile failed validation.
+    /// In this state, `snapshot` preserves the active bundled default so the
+    /// application remains operable, while `override_error` surfaces the failure
+    /// in the UI for repair or reset.
+    pub override_error: Option<String>,
 }
 
 impl RegistryEntry {
@@ -161,6 +330,7 @@ impl RegistryEntry {
             validation: ValidationState::Ok,
             snapshot: Some(Self::snapshot_from(m, origin, disabled)),
             runtime_disabled: disabled,
+            override_error: None,
         }
     }
 
@@ -378,6 +548,7 @@ impl AgentRegistry {
                             validation: ValidationState::Invalid(e.to_string()),
                             snapshot: None,
                             runtime_disabled: false,
+                            override_error: None,
                         },
                     );
                     continue;
@@ -437,14 +608,24 @@ impl AgentRegistry {
                 Err(e) => {
                     log::warn!("[AgentRegistry] Unreadable manifest {:?}: {}", path, e);
                     if let Some(id) = id_from_file {
-                        self.entries.entry(id).or_insert(RegistryEntry {
-                            source_path: Some(path.clone()),
-                            origin,
-                            doc: None,
-                            validation: ValidationState::Invalid(format!("Unreadable: {}", e)),
-                            snapshot: None,
-                            runtime_disabled: false,
-                        });
+                        if origin == ProfileOrigin::Override
+                            && BUILTIN_MANIFESTS.iter().any(|(bid, _)| *bid == id)
+                        {
+                            if let Some(entry) = self.entries.get_mut(&id) {
+                                entry.override_error = Some(format!("Unreadable override: {}", e));
+                                entry.source_path = Some(path.clone());
+                            }
+                        } else {
+                            self.entries.entry(id).or_insert(RegistryEntry {
+                                source_path: Some(path.clone()),
+                                origin,
+                                doc: None,
+                                validation: ValidationState::Invalid(format!("Unreadable: {}", e)),
+                                snapshot: None,
+                                runtime_disabled: false,
+                                override_error: None,
+                            });
+                        }
                     }
                     continue;
                 }
@@ -479,18 +660,26 @@ impl AgentRegistry {
                                 .unwrap_or_default()
                         });
                     log::warn!("[AgentRegistry] Invalid manifest {:?}: {}", path, e);
-                    // An entry that already exists (e.g. a bundled default)
-                    // keeps its previous valid state (doc-only insertion, no
-                    // overwrite); otherwise the invalid file gets a visible
-                    // invalid entry.
-                    self.entries.entry(id).or_insert(RegistryEntry {
-                        source_path: Some(path.clone()),
-                        origin,
-                        doc: None,
-                        validation: ValidationState::Invalid(e.to_string()),
-                        snapshot: None,
-                        runtime_disabled: false,
-                    });
+                    if origin == ProfileOrigin::Override
+                        && BUILTIN_MANIFESTS.iter().any(|(bid, _)| *bid == id)
+                    {
+                        // Crucial fix: an invalid override of a built-in profile must NOT replace the shipped default!
+                        // The shipped default remains active, while the invalid override's diagnostics are preserved.
+                        if let Some(entry) = self.entries.get_mut(&id) {
+                            entry.override_error = Some(e.to_string());
+                            entry.source_path = Some(path.clone());
+                        }
+                    } else {
+                        self.entries.entry(id).or_insert(RegistryEntry {
+                            source_path: Some(path.clone()),
+                            origin,
+                            doc: None,
+                            validation: ValidationState::Invalid(e.to_string()),
+                            snapshot: None,
+                            runtime_disabled: false,
+                            override_error: None,
+                        });
+                    }
                 }
             }
         }
@@ -502,11 +691,11 @@ impl AgentRegistry {
     /// order for name ownership: bundled built-in > user override > custom;
     /// within the same class, lexicographic id. A colliding entry is flagged
     /// invalid and stays inactive until its name/alias is fixed.
-    fn validate_cross_profile_uniqueness(&mut self) {
+    pub fn validate_entries_uniqueness(entries: &mut HashMap<String, RegistryEntry>) {
         // Recompute error states from scratch so removing a colliding profile
         // also clears flags. Entries without a parsed doc keep their
         // parse-level failure state.
-        for entry in self.entries.values_mut() {
+        for entry in entries.values_mut() {
             if let Some(doc) = entry.doc.clone() {
                 entry.snapshot = Some(RegistryEntry::snap_from_doc(
                     &doc,
@@ -517,9 +706,9 @@ impl AgentRegistry {
             }
         }
 
-        let mut own_ids: Vec<String> = self.entries.keys().cloned().collect();
+        let mut own_ids: Vec<String> = entries.keys().cloned().collect();
         own_ids.sort_by(|a, b| {
-            let class = |v: &str| match self.entries.get(v) {
+            let class = |v: &str| match entries.get(v) {
                 Some(e) if e.origin == ProfileOrigin::Builtin => 0u8,
                 Some(e) if e.origin == ProfileOrigin::Override => 1u8,
                 _ => 2u8,
@@ -529,7 +718,7 @@ impl AgentRegistry {
 
         let mut seen_names: HashMap<String, String> = HashMap::new();
         for id in &own_ids {
-            let Some(snapshot) = self.entries.get(id).and_then(|e| e.snapshot.clone()) else {
+            let Some(snapshot) = entries.get(id).and_then(|e| e.snapshot.clone()) else {
                 continue;
             };
             for key in &snapshot.aliases {
@@ -540,7 +729,7 @@ impl AgentRegistry {
                             "Name/alias '{}' collides with agent '@{}'; rename the profile or remove the alias so @mention routing stays unambiguous",
                             key, owner
                         );
-                        if let Some(entry) = self.entries.get_mut(id) {
+                        if let Some(entry) = entries.get_mut(id) {
                             entry.validation = ValidationState::Invalid(msg);
                             entry.snapshot = None; // colliding profiles are inactive
                         }
@@ -551,6 +740,10 @@ impl AgentRegistry {
                 }
             }
         }
+    }
+
+    fn validate_cross_profile_uniqueness(&mut self) {
+        Self::validate_entries_uniqueness(&mut self.entries);
     }
 
     // ---------------------------------------------------------------- lookups
@@ -690,9 +883,9 @@ impl AgentRegistry {
     // ---------------------------------------------------------------- writes
 
     /// Persist a manifest document for `id` atomically and activate it.
-    /// Validation happens before anything touches the active profile; an
-    /// invalid save is rejected outright and the previously active profile
-    /// remains in place.
+    /// Prospective validation runs against an in-memory clone of registry state
+    /// before touching disk or active memory. An invalid save is rejected outright,
+    /// leaving disk and active memory completely untouched.
     pub fn save_profile(&mut self, id: &str, document: &str) -> Result<ProfileSnapshot, String> {
         if !path_component_ok(id) {
             return Err(format!("Invalid agent profile id '{}'", id));
@@ -705,46 +898,71 @@ impl AgentRegistry {
             ));
         }
         let path = self.profile_path(id)?;
-        manifest_mod::atomic_write(&path, document).map_err(|e| {
-            // Nothing was activated; the previously active profile remains.
-            format!("Save rejected; active profile unchanged. Error: {}", e)
-        })?;
-        // Activate by reloading the single profile we know we wrote.
         let origin = if BUILTIN_MANIFESTS.iter().any(|(bid, _)| *bid == id) {
             ProfileOrigin::Override
         } else {
             ProfileOrigin::Custom
         };
         let disabled = self.runtime_disabled.contains(id);
-        let entry = RegistryEntry {
-            source_path: Some(path),
+
+        // Stage 4: Prospective transactional validation against an in-memory clone
+        let mut candidate_entries = self.entries.clone();
+        let candidate_entry = RegistryEntry {
+            source_path: Some(path.clone()),
             origin,
             doc: Some(manifest.clone()),
             validation: ValidationState::Ok,
             snapshot: Some(RegistryEntry::snapshot_from(&manifest, origin, disabled)),
             runtime_disabled: disabled,
+            override_error: None,
         };
-        self.entries.insert(id.to_string(), entry);
-        self.validate_cross_profile_uniqueness();
+        candidate_entries.insert(id.to_string(), candidate_entry);
+        Self::validate_entries_uniqueness(&mut candidate_entries);
+
+        // Check if the candidate entry itself became invalid
+        if let Some(entry) = candidate_entries.get(id) {
+            if let ValidationState::Invalid(ref err_msg) = entry.validation {
+                return Err(format!(
+                    "Save rejected before persisting; active profile unchanged. Error: {}",
+                    err_msg
+                ));
+            }
+            if entry.snapshot.is_none() {
+                return Err(format!(
+                    "Save rejected before persisting; active profile unchanged. Agent '{}' failed validation.",
+                    id
+                ));
+            }
+        }
+
+        // Check if the candidate entry caused any other previously valid entry to collide and become invalid
+        for (other_id, old_entry) in &self.entries {
+            if other_id != id && old_entry.validation == ValidationState::Ok {
+                if let Some(cand) = candidate_entries.get(other_id) {
+                    if let ValidationState::Invalid(ref err_msg) = cand.validation {
+                        return Err(format!(
+                            "Save rejected before persisting; active profile unchanged. Conflict with existing agent '@{}': {}",
+                            other_id, err_msg
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Prospective validation succeeded. Now, and only now, write atomically to disk.
+        manifest_mod::atomic_write(&path, document)
+            .map_err(|e| format!("Save rejected; active profile unchanged. Error: {}", e))?;
+
+        // Swap the validated candidate entries into active service.
+        self.entries = candidate_entries;
         self.refresh_signature();
-        // Cross-profile validation may have flagged the saved profile (e.g. a
-        // name/alias collision); report the final state so callers never claim
-        // a success the runtime would not honor.
+
         match self.entries.get(id).and_then(|e| e.snapshot.clone()) {
             Some(snapshot) => Ok(snapshot),
-            None => Err(self
-                .entries
-                .get(id)
-                .and_then(|e| match &e.validation {
-                    ValidationState::Invalid(msg) => Some(msg.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "Agent '{}' was saved but flagged invalid; see the agent roster",
-                        id
-                    )
-                })),
+            None => Err(format!(
+                "Unexpected failure activating profile '{}' after successful validation.",
+                id
+            )),
         }
     }
 
@@ -881,6 +1099,61 @@ impl AgentRegistry {
         let mut ids: Vec<String> = self.runtime_disabled.iter().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Resolves mention routing from a user prompt or falls back to `requested_bot_id` or the default agent.
+    pub fn route_turn(&self, prompt: &str, requested_bot_id: Option<&str>) -> MentionRoutingResult {
+        let tokens = extract_mention_tokens(prompt);
+        for token in tokens {
+            if let Ok(profile) = self.resolve(&token) {
+                return MentionRoutingResult {
+                    target_agent_id: profile.id.clone(),
+                    mention_detected: true,
+                    detected_token: Some(token),
+                    is_fallback: false,
+                    fallback_reason: None,
+                };
+            }
+        }
+
+        // No mention found: resolve requested_bot_id or default
+        if let Some(requested) = requested_bot_id {
+            let req_clean = requested.trim();
+            if !req_clean.is_empty() {
+                match self.resolve(req_clean) {
+                    Ok(profile) => {
+                        return MentionRoutingResult {
+                            target_agent_id: profile.id.clone(),
+                            mention_detected: false,
+                            detected_token: None,
+                            is_fallback: false,
+                            fallback_reason: None,
+                        };
+                    }
+                    Err(e) => {
+                        let default_id = DEFAULT_AGENT_ID;
+                        return MentionRoutingResult {
+                            target_agent_id: default_id.to_string(),
+                            mention_detected: false,
+                            detected_token: None,
+                            is_fallback: true,
+                            fallback_reason: Some(format!(
+                                "Requested agent '{}' is unavailable ({}). Fell back to default agent '{}'.",
+                                req_clean, e, default_id
+                            )),
+                        };
+                    }
+                }
+            }
+        }
+
+        MentionRoutingResult {
+            target_agent_id: DEFAULT_AGENT_ID.to_string(),
+            mention_detected: false,
+            detected_token: None,
+            is_fallback: false,
+            fallback_reason: None,
+        }
     }
 
     /// Cheap external-change detection: compare (mtime, size) of every managed
@@ -1175,31 +1448,57 @@ mod tests {
     fn duplicate_name_collision_flags_the_colliding_entry() {
         let cfg = TempConfig::new();
         let mut reg = AgentRegistry::load(cfg.config()).unwrap();
-        // Second profile reusing the name "Forge" (case-insensitive).
-        let _ = reg.save_profile(
+        // Second profile reusing the name "Forge" (case-insensitive) is rejected transactionally
+        let res = reg.save_profile(
             "dup-forge",
             "---\nid: dup-forge\nname: forge\nrole: r\n---\n\nBody.\n",
         );
-        let err = reg.resolve("dup-forge").unwrap_err();
-        assert!(matches!(err, ResolveError::InvalidProfile(_, msg) if msg.contains("collides")));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("collides"));
+        // Active registry was not mutated
+        assert!(reg.resolve("dup-forge").is_err());
         // The original Forge remains valid and resolvable.
         assert!(reg.resolve("forge-devops").is_ok());
+
+        // When a colliding profile exists on disk, load_dir marks it as InvalidProfile
+        let custom_dir = reg.custom_dir().unwrap();
+        std::fs::write(
+            custom_dir.join("dup-forge.md"),
+            "---\nid: dup-forge\nname: forge\nrole: r\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let reloaded = AgentRegistry::load(cfg.config()).unwrap();
+        let err = reloaded.resolve("dup-forge").unwrap_err();
+        assert!(matches!(err, ResolveError::InvalidProfile(_, msg) if msg.contains("collides")));
     }
 
     #[test]
     fn alias_colliding_with_other_profile_flagged() {
         let cfg = TempConfig::new();
         let mut reg = AgentRegistry::load(cfg.config()).unwrap();
-        let _ = reg.save_profile(
+        let res = reg.save_profile(
             "alias-thief",
             "---\nid: alias-thief\nname: Thief\nrole: r\naliases: [forge]\n---\n\nBody.\n",
         );
-        let err = reg.resolve("alias-thief").unwrap_err();
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("collides"));
+        assert!(reg.resolve("alias-thief").is_err());
+        assert_eq!(reg.resolve("forge").unwrap().id, "forge-devops");
+
+        // When a colliding alias profile exists on disk, load_dir marks it as InvalidProfile
+        let custom_dir = reg.custom_dir().unwrap();
+        std::fs::write(
+            custom_dir.join("alias-thief.md"),
+            "---\nid: alias-thief\nname: Thief\nrole: r\naliases: [forge]\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let reloaded = AgentRegistry::load(cfg.config()).unwrap();
+        let err = reloaded.resolve("alias-thief").unwrap_err();
         assert!(
             matches!(err, ResolveError::InvalidProfile(_, msg) if msg.contains("collides") || msg.contains("forge"))
         );
-        // Forge still resolves through its own alias first (first-scanned wins).
-        assert_eq!(reg.resolve("forge").unwrap().id, "forge-devops");
+        // Forge still resolves through its own alias first.
+        assert_eq!(reloaded.resolve("forge").unwrap().id, "forge-devops");
     }
 
     #[test]

@@ -46,7 +46,7 @@ Usage:
 
 Options:
   -p, --prefix <DIR>     Installation directory prefix (default: ~/.local, or /usr/local if root)
-  -v, --version <VER>    Install specific version (e.g. v0.1.1 or 0.1.1, default: latest)
+  -v, --version <VER>    Install specific version (e.g. v0.1.2 or 0.1.2, default: latest)
   --dry-run              Print intended actions without installing
   --uninstall            Run uninstaller
   -h, --help             Show this help message
@@ -135,7 +135,7 @@ if [ -z "$DEFAULT_VERSION" ]; then
     VERSION="$(echo "$LATEST_JSON" | grep -m1 '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   fi
   if [ -z "${VERSION:-}" ]; then
-    VERSION="v0.1.1"
+    VERSION="v0.1.2"
   fi
 else
   VERSION="$DEFAULT_VERSION"

@@ -91,3 +91,15 @@ This document records the implemented remediation phases that evolved the Kyro d
 - [x] Bump version to `0.1.1` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, and templates.
 - [x] Refactor repository documentation (`README.md`, `runtime-overview.md`, `security-boundaries.md`, `connector-system.md`, `feature-matrix.md`, `implementation-log.md`).
 - [x] Multi-distribution release pipeline validation and GitHub release publishing.
+
+### Phase 16: v0.1.2 Release — Critical Agent Runtime, Security, Worktree Isolation & Registry Remediation
+- [x] Enforce profile-level tool permissions at the actual execution boundary (`execute_tool_governed` in `loop_engine.rs`) with canonical tool name normalization (`canonical_tool_name`) and forged delegation rejection.
+- [x] Propagate authoritative isolated worktrees to shell commands (`cmd_builder.current_dir(root)`) and filesystem tools, failing closed immediately if an isolated worktree was requested but does not exist on disk.
+- [x] Implement collision-resistant worktree paths and branch naming (`{ws}_{task}_a{attempt}`), base-commit tracking, merge-base detection, and concurrent modification conflict detection in `MultiAgentOrchestrator::reconcile_changes`.
+- [x] Implement transactional profile saves with prospective uniqueness validation across candidate entries prior to atomic disk persistence, and preserve `override_error` diagnostics for corrupt override files.
+- [x] Prevent multi-agent delegation recursion cycles and self-delegation by walking the SQLite database ancestor chain, enforcing fatal child run persistence, and respecting `model.mode` (`fixed` vs `inherit`).
+- [x] Implement context-stripped mention parsing (`strip_non_routable_text`) ignoring code fences, blockquotes, inline backticks, and email addresses, with diagnostic fallback to `apex-orchestrator`.
+- [x] Filter context facts strictly by profile `memory_scopes` (`build_context_block_scoped`) to prevent fact leakage.
+- [x] Reconcile frontend teammate roster origin badges ("Built-in", "Override", "Custom"), auto-fallback to Apex on active agent deletion/disablement, and preserve form drafts on validation failure.
+- [x] Expand automated test coverage to 313 Rust tests and 268 Vitest tests across 33 test files with zero compiler or linter warnings (`cargo clippy --all-targets -- -D warnings`).
+- [x] Bump version to `0.1.2` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs.

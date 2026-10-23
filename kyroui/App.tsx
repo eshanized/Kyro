@@ -532,7 +532,10 @@ export const App: React.FC = () => {
         const fallback = profiles.find(
           (p) => p.id === DEFAULT_PROFILE.id && p.enabled && !p.validation_error,
         );
-        if (fallback) setActiveBot(fallback);
+        if (fallback) {
+          setActiveBot(fallback);
+          invoke("save_selected_agent", { agentId: fallback.id }).catch(console.error);
+        }
       }
     } catch (e) {
       console.error(e);

@@ -17,7 +17,7 @@ use serde_yaml_ng as yaml;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use crate::multibot::group::MultiBotOrchestrator;
@@ -107,6 +107,8 @@ pub struct SpecialistTask {
     pub child_run_id: Option<String>,
     pub isolated_worktree_path: Option<PathBuf>,
     pub worktree_branch: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub output: Option<String>,
     pub error: Option<String>,
     pub started_at: Option<i64>,
@@ -412,6 +414,7 @@ impl MultiAgentOrchestrator {
                 child_run_id: None,
                 isolated_worktree_path: None,
                 worktree_branch: None,
+                base_commit: None,
                 output: None,
                 error: None,
                 started_at: None,
@@ -843,11 +846,17 @@ impl MultiAgentOrchestrator {
                 t.status = "running".to_string();
             }
             if ws.tasks[index].isolated_worktree {
-                match Self::setup_isolated_worktree(&ws.project_path, id) {
-                    Ok((dir, branch)) => {
+                match Self::setup_isolated_worktree(
+                    &ws.project_path,
+                    &ws.workspace_id,
+                    id,
+                    ws.tasks[index].attempts,
+                ) {
+                    Ok((dir, branch, base_commit)) => {
                         let t = &mut ws.tasks[index];
                         t.isolated_worktree_path = Some(dir);
                         t.worktree_branch = branch;
+                        t.base_commit = base_commit;
                     }
                     Err(e) => {
                         // The attempt is consumed; the retry budget applies.
@@ -916,14 +925,18 @@ impl MultiAgentOrchestrator {
                         "attempt": job.attempt,
                         "parent_run_id": ws.parent_run_id,
                         "workflow_id": ws.workflow_id,
-                        "isolated_worktree": job.worktree,
+                        "isolated_worktree": job.worktree.is_some(),
                         "isolated_worktree_path": job.worktree.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        "workspace_root": job.worktree.as_ref().map(|p| p.to_string_lossy().to_string())
+                            .or_else(|| Some(ws.project_path.to_string_lossy().to_string())),
+                        "base_commit": ws.tasks[job.task_index].base_commit,
                     })
                     .to_string(),
                 ),
                 parent_run_id: Some(ws.parent_run_id.clone()),
             };
-            let _ = db.create_run(&child_run);
+            db.create_run(&child_run)
+                .map_err(|e| format!("Failed to persist workflow child run: {}", e))?;
             MultiBotOrchestrator::set_bot_task(
                 &job.agent_id,
                 &job.child_run_id,
@@ -995,11 +1008,13 @@ impl MultiAgentOrchestrator {
 
     /// Set up an isolated working environment for a task using a Git worktree
     /// when the project is a Git repository, or a shadow scratch directory if
-    /// not.
+    /// not. Uses collision-resistant directory and branch names scoped to workspace, task, and attempt.
     pub fn setup_isolated_worktree(
         project_root: &Path,
+        workspace_id: &str,
         task_id: &str,
-    ) -> Result<(PathBuf, Option<String>), String> {
+        attempt: u32,
+    ) -> Result<(PathBuf, Option<String>, Option<String>), String> {
         let scratch_base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("kyro")
@@ -1008,11 +1023,50 @@ impl MultiAgentOrchestrator {
         fs::create_dir_all(&scratch_base)
             .map_err(|e| format!("Failed to create worktree base directory: {}", e))?;
 
-        let worktree_dir = scratch_base.join(task_id);
-        let branch_name = format!("kyro-wt-{}", task_id);
+        let safe_ws: String = workspace_id
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe_task: String = task_id
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let dir_name = format!("{}_{}_a{}", safe_ws, safe_task, attempt);
+        let worktree_dir = scratch_base.join(dir_name);
+        let branch_name = format!("kyro-wt-{}-{}-a{}", safe_ws, safe_task, attempt);
 
         let is_git = project_root.join(".git").exists();
         if is_git {
+            let base_commit = Command::new("git")
+                .arg("-C")
+                .arg(project_root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+
+            if worktree_dir.exists() {
+                let _ = fs::remove_dir_all(&worktree_dir);
+            }
+
             let output = Command::new("git")
                 .arg("-C")
                 .arg(project_root)
@@ -1022,22 +1076,27 @@ impl MultiAgentOrchestrator {
                 .output();
 
             match output {
-                Ok(out) if out.status.success() => Ok((worktree_dir, Some(branch_name))),
-                Ok(out) => {
-                    let _err = String::from_utf8_lossy(&out.stderr);
-                    // Fallback to directory copy when `worktree add` fails
-                    // (e.g. branch already exists from an earlier attempt).
-                    Self::fallback_shadow_copy(project_root, &worktree_dir)?;
-                    Ok((worktree_dir, None))
+                Ok(out) if out.status.success() => {
+                    Ok((worktree_dir, Some(branch_name), base_commit))
                 }
-                Err(_) => {
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    log::warn!(
+                        "[Workspace] git worktree add failed ({}): falling back to shadow copy",
+                        err
+                    );
                     Self::fallback_shadow_copy(project_root, &worktree_dir)?;
-                    Ok((worktree_dir, None))
+                    Ok((worktree_dir, None, base_commit))
+                }
+                Err(e) => {
+                    log::warn!("[Workspace] Failed to run git worktree add: {}: falling back to shadow copy", e);
+                    Self::fallback_shadow_copy(project_root, &worktree_dir)?;
+                    Ok((worktree_dir, None, base_commit))
                 }
             }
         } else {
             Self::fallback_shadow_copy(project_root, &worktree_dir)?;
-            Ok((worktree_dir, None))
+            Ok((worktree_dir, None, None))
         }
     }
 
@@ -1101,7 +1160,7 @@ impl MultiAgentOrchestrator {
     }
 
     /// Reconciles changes from an isolated implementation worktree against the
-    /// parent repository.
+    /// parent repository with base-commit tracking and conflict detection.
     pub fn reconcile_changes(
         project_root: &Path,
         worktree_path: &Path,
@@ -1121,47 +1180,142 @@ impl MultiAgentOrchestrator {
 
         let is_git = project_root.join(".git").exists();
         if is_git {
+            let parent_head = Command::new("git")
+                .arg("-C")
+                .arg(project_root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+
+            // Find common ancestor base_commit between worktree and parent_head
+            let base_commit = if let Some(ref phead) = parent_head {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(worktree_path)
+                    .args(["merge-base", "HEAD", phead])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        if out.status.success() {
+                            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
+
+            // Unified diff of worktree changes against base_commit or HEAD
+            let diff_target = base_commit.as_deref().unwrap_or("HEAD");
             let diff_cmd = Command::new("git")
                 .arg("-C")
                 .arg(worktree_path)
-                .args(["diff", "HEAD"])
+                .args(["diff", diff_target])
                 .output();
 
+            let mut diff_text = String::new();
             if let Ok(out) = diff_cmd {
-                let diff_text = String::from_utf8_lossy(&out.stdout).to_string();
-                let status_cmd = Command::new("git")
-                    .arg("-C")
-                    .arg(worktree_path)
-                    .args(["status", "--porcelain"])
-                    .output();
+                diff_text = String::from_utf8_lossy(&out.stdout).to_string();
+            }
 
-                let mut modified = Vec::new();
-                if let Ok(s_out) = status_cmd {
-                    let s_text = String::from_utf8_lossy(&s_out.stdout);
-                    for line in s_text.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.len() >= 3 {
-                            modified.push(trimmed[3..].to_string());
+            // Modified / added / untracked files in worktree
+            let status_cmd = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["status", "--porcelain"])
+                .output();
+
+            let mut modified = Vec::new();
+            if let Ok(s_out) = status_cmd {
+                let s_text = String::from_utf8_lossy(&s_out.stdout);
+                for line in s_text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.len() >= 3 {
+                        let path_part = trimmed[3..].trim();
+                        let file_name = if let Some((_, dest)) = path_part.split_once(" -> ") {
+                            dest.trim().to_string()
+                        } else {
+                            path_part.to_string()
+                        };
+                        if !modified.contains(&file_name) {
+                            modified.push(file_name);
                         }
                     }
                 }
-
-                let changes_detected = !modified.is_empty() || !diff_text.is_empty();
-                return Ok(ReconciliationOutcome {
-                    workspace_id: workspace_id.to_string(),
-                    changes_detected,
-                    modified_files: modified,
-                    unified_diff: diff_text,
-                    conflicts_detected: vec![],
-                    can_safely_merge: changes_detected,
-                    reconciliation_summary: if changes_detected {
-                        "Changes successfully isolated and ready for reviewed integration."
-                            .to_string()
-                    } else {
-                        "No code modifications made in isolated worktree.".to_string()
-                    },
-                });
             }
+
+            // Also include files from git diff --name-only <base_commit>
+            if let Ok(name_out) = Command::new("git")
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["diff", "--name-only", diff_target])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&name_out.stdout);
+                for line in text.lines() {
+                    let f = line.trim().to_string();
+                    if !f.is_empty() && !modified.contains(&f) {
+                        modified.push(f);
+                    }
+                }
+            }
+
+            // Conflict detection: did project_root modify any of the same files since base_commit?
+            let mut conflicts = Vec::new();
+            if let (Some(ref base), Some(ref phead)) = (&base_commit, &parent_head) {
+                if base != phead {
+                    if let Ok(p_diff) = Command::new("git")
+                        .arg("-C")
+                        .arg(project_root)
+                        .args(["diff", "--name-only", base, phead])
+                        .output()
+                    {
+                        let p_text = String::from_utf8_lossy(&p_diff.stdout);
+                        for line in p_text.lines() {
+                            let changed_in_parent = line.trim();
+                            if !changed_in_parent.is_empty()
+                                && modified.iter().any(|m| m == changed_in_parent)
+                            {
+                                conflicts.push(format!(
+                                    "Concurrent modification in project root: {}",
+                                    changed_in_parent
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let changes_detected = !modified.is_empty() || !diff_text.is_empty();
+            let can_safely_merge = changes_detected && conflicts.is_empty();
+            let summary = if !conflicts.is_empty() {
+                format!(
+                    "Conflicts detected in {} file(s) between worktree and project root. Manual resolution required.",
+                    conflicts.len()
+                )
+            } else if changes_detected {
+                "Changes successfully isolated and ready for reviewed integration.".to_string()
+            } else {
+                "No code modifications made in isolated worktree.".to_string()
+            };
+
+            return Ok(ReconciliationOutcome {
+                workspace_id: workspace_id.to_string(),
+                changes_detected,
+                modified_files: modified,
+                unified_diff: diff_text,
+                conflicts_detected: conflicts,
+                can_safely_merge,
+                reconciliation_summary: summary,
+            });
         }
 
         // Generic directory diff for non-git projects
@@ -1174,6 +1328,85 @@ impl MultiAgentOrchestrator {
             can_safely_merge: true,
             reconciliation_summary: "Generic directory comparison complete.".to_string(),
         })
+    }
+
+    /// Safely apply reconciled changes into the project root if no conflicts were detected.
+    pub fn apply_reconciliation(
+        project_root: &Path,
+        worktree_path: &Path,
+        branch_name: Option<&str>,
+    ) -> Result<String, String> {
+        if !project_root.exists() || !worktree_path.exists() {
+            return Err("Project root or worktree path does not exist".to_string());
+        }
+
+        let is_git = project_root.join(".git").exists();
+        if is_git {
+            if let Some(branch) = branch_name {
+                let merge_out = Command::new("git")
+                    .arg("-C")
+                    .arg(project_root)
+                    .args([
+                        "merge",
+                        "--no-ff",
+                        "-m",
+                        &format!("Reconcile worktree branch '{}'", branch),
+                        branch,
+                    ])
+                    .output()
+                    .map_err(|e| format!("Failed to execute git merge: {}", e))?;
+
+                if merge_out.status.success() {
+                    Ok(format!(
+                        "Successfully merged branch '{}' into project root.",
+                        branch
+                    ))
+                } else {
+                    let err = String::from_utf8_lossy(&merge_out.stderr);
+                    Err(format!("Git merge failed: {}", err))
+                }
+            } else {
+                let diff_out = Command::new("git")
+                    .arg("-C")
+                    .arg(worktree_path)
+                    .args(["diff", "HEAD"])
+                    .output()
+                    .map_err(|e| format!("Failed to generate diff: {}", e))?;
+
+                if diff_out.stdout.is_empty() {
+                    return Ok("No changes to apply.".to_string());
+                }
+
+                let mut apply_child = Command::new("git")
+                    .arg("-C")
+                    .arg(project_root)
+                    .args(["apply"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn git apply: {}", e))?;
+
+                if let Some(mut stdin) = apply_child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(&diff_out.stdout);
+                }
+
+                let apply_out = apply_child
+                    .wait_with_output()
+                    .map_err(|e| format!("Failed to wait for git apply: {}", e))?;
+
+                if apply_out.status.success() {
+                    Ok("Successfully applied worktree changes to project root.".to_string())
+                } else {
+                    let err = String::from_utf8_lossy(&apply_out.stderr);
+                    Err(format!("Failed to apply diff: {}", err))
+                }
+            }
+        } else {
+            Self::fallback_shadow_copy(worktree_path, project_root)?;
+            Ok("Successfully synced files from worktree back to project root.".to_string())
+        }
     }
 
     /// Mark workspace "reconciled" and persist the label.

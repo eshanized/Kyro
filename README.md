@@ -197,12 +197,12 @@ Prebuilt packages for every major Linux distribution family are published under 
 
 | Distribution / Environment | Package Format | Quick Install Command |
 |:---|:---:|:---|
-| **Ubuntu, Debian, Pop!_OS, Linux Mint, Kali** | `.deb` | `sudo apt install ./Kyro_0.1.1_amd64.deb` |
-| **Fedora, RHEL, CentOS Stream, Rocky, Alma** | `.rpm` | `sudo dnf install ./Kyro-0.1.1-1.x86_64.rpm` |
-| **openSUSE (Leap / Tumbleweed)** | `.rpm` | `sudo zypper install ./Kyro-0.1.1-1.x86_64.rpm` |
-| **Arch Linux, Manjaro, EndeavourOS, SteamOS** | `.pkg.tar.zst` | `sudo pacman -U kyro-0.1.1-1-x86_64.pkg.tar.zst` |
-| **Universal Linux (Standalone / Zero Install)** | `.AppImage` | `chmod +x Kyro_0.1.1_amd64.AppImage && ./Kyro_0.1.1_amd64.AppImage` |
-| **Portable Linux Archive (Custom Prefix)** | `.tar.gz` | `tar -xzf kyro-0.1.1-linux-x86_64.tar.gz && ./kyro-0.1.1-linux-x86_64/install.sh` |
+| **Ubuntu, Debian, Pop!_OS, Linux Mint, Kali** | `.deb` | `sudo apt install ./Kyro_0.1.2_amd64.deb` |
+| **Fedora, RHEL, CentOS Stream, Rocky, Alma** | `.rpm` | `sudo dnf install ./Kyro-0.1.2-1.x86_64.rpm` |
+| **openSUSE (Leap / Tumbleweed)** | `.rpm` | `sudo zypper install ./Kyro-0.1.2-1.x86_64.rpm` |
+| **Arch Linux, Manjaro, EndeavourOS, SteamOS** | `.pkg.tar.zst` | `sudo pacman -U kyro-0.1.2-1-x86_64.pkg.tar.zst` |
+| **Universal Linux (Standalone / Zero Install)** | `.AppImage` | `chmod +x Kyro_0.1.2_amd64.AppImage && ./Kyro_0.1.2_amd64.AppImage` |
+| **Portable Linux Archive (Custom Prefix)** | `.tar.gz` | `tar -xzf kyro-0.1.2-linux-x86_64.tar.gz && ./kyro-0.1.2-linux-x86_64/install.sh` |
 
 Verify asset integrity with `sha256sum -c SHA256SUMS.txt`.
 
@@ -281,7 +281,7 @@ Keys configured in UI Settings are encrypted inside your OS Keyring and will nev
 
 ## 🛠️ Verification & Testing
 
-Kyro has strict test coverage across unit, integration, and security layers (over 250 backend Rust tests and 250+ frontend Vitest tests across 31 test suites, achieving &ge; 95% frontend coverage and 510+ total automated tests):
+Kyro has strict test coverage across unit, integration, and security layers (over 310 backend Rust tests and 268 frontend Vitest tests across 33 test suites, achieving &ge; 95% frontend coverage and 580+ total automated tests):
 
 ```bash
 # Run the complete end-to-end verification pipeline:

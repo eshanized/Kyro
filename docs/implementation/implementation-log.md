@@ -252,3 +252,59 @@ This log chronicles the engineering remediation, feature completion, and verific
 - **Implementation Status & Feature Matrix**:
   - Updated `feature-matrix.md` with frontend &ge;95% coverage verification and cross-distro packaging pipeline status.
   - Updated `remediation-plan.md` to record completion of Phases 14 and 15.
+
+---
+
+## 2026-10-24: Kyro v0.1.2 Release — Critical Agent Runtime, Security, Worktree Isolation & Registry Remediation
+
+### 1. Security & Execution Boundary Remediation
+- **Tool Authorization at Actual Execution Boundary**:
+  - Centralized agent profile tool permission enforcement directly within `execute_tool_governed` before any tool dispatches.
+  - Implemented `canonical_tool_name` normalization and alias resolution (`bash`, `sh`, `terminal`, `shell` → `execute_shell`).
+  - Added strict policy validation for `allowlist` and `inherit` modes, failing closed on unknown modes or tools.
+  - Enforced `delegation.enabled == false` checks at the dispatch boundary, rejecting forged `delegate_task` calls.
+
+### 2. Workflow Worktree Containment & Reconciliation
+- **Authoritative Execution Root**:
+  - Bound subprocess working directory in `execute_tool_core` (`cmd_builder.current_dir(root)`) so shell commands and scripts run inside the isolated worktree.
+  - Introduced fail-closed workspace containment: if an isolated worktree is requested in the run configuration but does not exist on disk, the task halts immediately instead of falling back to the project root.
+  - Created collision-resistant worktree paths (`.kyro/worktrees/{workspace_id}_{task_id}_a{attempt}`) and Git branches (`kyro-wt-{workspace_id}-{task_id}-a{attempt}`).
+  - Captured `base_commit` at worktree setup, discovered `merge-base` against project root `HEAD`, detected concurrent modifications on touched files, and flagged `can_safely_merge: false` on conflicts.
+  - Added `apply_reconciliation` for safe branch merges and diff application.
+
+### 3. Transactional Registry & Fallback Protection
+- **Transactional Profile Saves**:
+  - Implemented prospective uniqueness validation in `save_profile`: clones in-memory entries into a candidate registry, validates uniqueness across IDs, display names, and aliases prior to writing to disk.
+  - Implemented atomic disk persistence via temporary file creation and atomic rename.
+  - Rolled back in-memory state on validation failure.
+  - Added built-in override fallback protection: preserves `override_error` diagnostics for corrupt override files while falling back to built-in defaults.
+
+### 4. Bounded Multi-Agent Delegation & Scoped Memory
+- **Delegation Safety**:
+  - Prevented recursion cycles by walking the SQLite database parent-run ancestor chain.
+  - Blocked self-delegation.
+  - Treated database insertion of child runs as fatal, aborting delegation if persistence fails.
+  - Respected profile `model.mode` (`fixed` vs `inherit`).
+- **Scoped Fact Retrieval**:
+  - Added `MemoryStore::build_context_block_scoped` to strictly filter facts according to profile `context.memory_scopes` (`preference`, `agent`).
+
+### 5. Authoritative Mention Parsing & UI Synchronization
+- **Mention Routing**:
+  - Implemented `strip_non_routable_text` and `extract_mention_tokens` in `AgentRegistry`, ignoring code fences, blockquotes, inline backticks, and email addresses.
+  - Implemented `route_turn` routing mentions to resolved profiles and falling back to default agent (`apex-orchestrator`) with informative diagnostics.
+- **Frontend Teammate Roster**:
+  - Updated origin badges to "Built-in", "Override", and "Custom" in `TeammateRosterModal.tsx`.
+  - Added automatic fallback to Apex when deleting or disabling the currently active teammate.
+  - Preserved draft edits and displayed validation errors in the modal upon save rejection.
+
+### 6. Test Suite & Verification Results
+- **Automated Tests**:
+  - Authored 11 new end-to-end remediation verification tests in `libkyro/tests/remediation_verification_tests.rs`.
+  - **313 backend Rust tests** passed (201 unit tests + 112 integration/security tests).
+  - **268 frontend Vitest tests** passed across 33 test files (&ge;95% coverage).
+  - Zero warnings under `cargo clippy --manifest-path libkyro/Cargo.toml --all-targets --all-features -- -D warnings`.
+  - Clean `cargo fmt --manifest-path libkyro/Cargo.toml --all -- --check`.
+  - Clean `npx tsc --noEmit && npm run build`.
+
+### 7. Version Bump to `0.1.2`
+- Bumped `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs to `0.1.2`.
