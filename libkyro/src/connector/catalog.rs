@@ -35,7 +35,7 @@ pub fn get_default_catalog_items() -> Vec<ConnectorCatalogItem> {
                 "create_issue".into(),
                 "add_comment".into(),
             ],
-            required_scopes: vec!["repo".into(), "read:user".into(), "actions:read".into()],
+            required_scopes: vec!["repo".into(), "read:user".into()],
             is_builtin: true,
             is_available: true,
             doc_url: Some("https://docs.github.com/en/rest".into()),

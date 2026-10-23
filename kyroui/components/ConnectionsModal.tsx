@@ -1144,38 +1144,38 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                     <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
                       <Shield className="w-4 h-4 text-neutral-300" /> Secure Browser PKCE Flow
                     </div>
-                    Sign in with your GitHub account directly in your system browser. No credentials or secrets are manually entered into Kyro.
+                    Sign in with your GitHub account directly in your system browser. This flow requires credentials for a registered GitHub OAuth App; your GitHub password is never entered into Kyro.
                   </div>
 
                   <div>
                     <label className="block text-xs text-neutral-300 mb-1 font-medium">
-                      OAuth Client ID (Optional)
+                      OAuth Client ID (required unless preconfigured)
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g. Ov23li... (Leave blank for default / env KYRO_GITHUB_CLIENT_ID)"
+                      placeholder="e.g. Ov23li... (GitHub OAuth App Client ID)"
                       value={oauthClientId}
                       onChange={(e) => setOauthClientId(e.target.value)}
                       className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
                     />
                     <p className="text-[11px] text-neutral-500 mt-1">
-                      Configure your own GitHub OAuth application Client ID if you prefer dedicated rate limits.
+                      Kyro needs a registered GitHub OAuth App Client ID. Enter your app's public ID here, or configure KYRO_GITHUB_CLIENT_ID in the process environment. To connect without an OAuth app, choose Personal Access Token.
                     </p>
                   </div>
 
                   <div>
                     <label className="block text-xs text-neutral-300 mb-1 font-medium">
-                      OAuth Client Secret (Optional - Stored in Vault)
+                      OAuth Client Secret (required unless preconfigured)
                     </label>
                     <input
                       type="password"
-                      placeholder="Optional confidential client secret"
+                      placeholder="GitHub OAuth App Client Secret"
                       value={oauthClientSecret}
                       onChange={(e) => setOauthClientSecret(e.target.value)}
                       className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
                     />
                     <p className="text-[11px] text-neutral-500 mt-1">
-                      If your GitHub OAuth App requires a client secret, it will be securely encrypted in the Vault, never in SQLite.
+                      GitHub requires the OAuth App client secret to exchange the authorization code. Enter it here or configure KYRO_GITHUB_CLIENT_SECRET in Kyro's process environment. Kyro stores the completed account credentials in its secure Vault. To avoid configuring an OAuth App, choose Personal Access Token.
                     </p>
                   </div>
 

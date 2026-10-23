@@ -780,13 +780,38 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
     assert!(google_missing_cid.is_err());
     assert!(google_missing_cid.unwrap_err().contains("Client ID"));
 
-    let gh_init = conn_mgr
+    let gh_missing_secret = conn_mgr
         .start_oauth_flow("github", Some("test_client_id".to_string()), None)
+        .await;
+    assert!(gh_missing_secret.is_err());
+    assert!(gh_missing_secret.unwrap_err().contains("Client Secret"));
+
+    let gh_init = conn_mgr
+        .start_oauth_flow(
+            "github",
+            Some("test_client_id".to_string()),
+            Some("test_client_secret".to_string()),
+        )
         .await;
     assert!(gh_init.is_ok());
     let init_res = gh_init.unwrap();
     assert!(!init_res.session_id.is_empty());
-    assert!(init_res.auth_url.contains("github.com"));
+    let auth_url = reqwest::Url::parse(&init_res.auth_url).unwrap();
+    assert_eq!(auth_url.host_str(), Some("github.com"));
+    assert_eq!(auth_url.path(), "/login/oauth/authorize");
+    let auth_params = auth_url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        auth_params.get("scope").map(String::as_str),
+        Some("repo read:user")
+    );
+    assert_eq!(
+        auth_params.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
+    assert!(!auth_params.get("scope").unwrap().contains("actions:read"));
 
     // 2. get_oauth_status
     let status = conn_mgr.get_oauth_status(&init_res.session_id).await;
@@ -795,6 +820,10 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
 
     let status_missing = conn_mgr.get_oauth_status("missing_session_xyz").await;
     assert!(status_missing.is_err());
+    conn_mgr
+        .cancel_oauth_flow(&init_res.session_id)
+        .await
+        .unwrap();
 
     // 3. refresh_account_token validation
     // Non-existent account

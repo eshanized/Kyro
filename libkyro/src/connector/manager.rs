@@ -487,6 +487,19 @@ impl ConnectorManager {
             ));
         }
 
+        let client_secret_opt = if connector_id == "github" {
+            client_secret_opt
+                .filter(|secret| !secret.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("KYRO_GITHUB_CLIENT_SECRET")
+                        .ok()
+                        .filter(|secret| !secret.trim().is_empty())
+                })
+                .map(|secret| secret.trim().to_string())
+        } else {
+            client_secret_opt
+        };
+
         let (state, code_verifier, code_challenge) = OAuthManager::generate_pkce();
         let session_id = format!("oauth_{}", uuid::Uuid::new_v4());
 
@@ -505,16 +518,27 @@ impl ConnectorManager {
             let cid = client_id_opt
                 .unwrap_or_else(|| std::env::var("KYRO_GITHUB_CLIENT_ID").unwrap_or_default());
             if cid.trim().is_empty() {
-                return Err("GitHub OAuth requires a Client ID. Configure one in Kyro Settings or enter it in the connection modal.".to_string());
+                return Err("GitHub OAuth requires a Client ID. Set KYRO_GITHUB_CLIENT_ID in the process environment or enter it in the connection modal.".to_string());
             }
-            let url = format!(
-                "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=repo,read:user,actions:read&code_challenge={}&code_challenge_method=S256",
-                cid, redirect_uri, state, code_challenge
-            );
+            if client_secret_opt.is_none() {
+                return Err("GitHub OAuth authorization-code flow requires a Client Secret. Enter it in the connection modal or configure KYRO_GITHUB_CLIENT_SECRET in the process environment. Alternatively, connect using a Personal Access Token.".to_string());
+            }
+            let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize")
+                .map_err(|e| format!("Failed to parse GitHub OAuth URL: {}", e))?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("client_id", cid.trim());
+                query.append_pair("redirect_uri", &redirect_uri);
+                query.append_pair("state", &state);
+                // oauth app scopes are space-delimited; repo covers actions reads for private repos.
+                query.append_pair("scope", "repo read:user");
+                query.append_pair("code_challenge", &code_challenge);
+                query.append_pair("code_challenge_method", "S256");
+            }
             (
-                url,
+                url.to_string(),
                 "https://github.com/login/oauth/access_token".to_string(),
-                cid,
+                cid.trim().to_string(),
             )
         } else {
             let cid = client_id_opt
