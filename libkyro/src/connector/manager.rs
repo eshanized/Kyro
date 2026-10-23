@@ -505,7 +505,7 @@ impl ConnectorManager {
             let cid = client_id_opt
                 .unwrap_or_else(|| std::env::var("KYRO_GITHUB_CLIENT_ID").unwrap_or_default());
             if cid.trim().is_empty() {
-                return Err("GitHub OAuth requires a Client ID. Configure one in Kyro Settings or enter it in the connection modal.".to_string());
+                return Err("GitHub OAuth requires a Client ID. Set KYRO_GITHUB_CLIENT_ID in the process environment or enter it in the connection modal.".to_string());
             }
             let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize")
                 .map_err(|e| format!("Failed to parse GitHub OAuth URL: {}", e))?;
