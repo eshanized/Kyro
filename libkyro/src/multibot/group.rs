@@ -1,4 +1,5 @@
-use super::bot::{BotProfile, BotStatus};
+use super::bot::{BotProfile, BotStatus, BotTaskStatus};
+use crate::agent::registry::ProfileSnapshot;
 use crate::storage::Database;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -6,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-static ACTIVE_BOT_TASKS: Lazy<Mutex<HashMap<String, String>>> =
+/// Live per-robot task map: bot/profile id → (owning run id → objective).
+/// A teammate can serve several delegations at once; completion clears the
+/// exact (bot, run) pair rather than the whole bot slot.
+static ACTIVE_BOT_TASKS: Lazy<Mutex<HashMap<String, HashMap<String, String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +31,10 @@ pub struct DelegationResult {
 pub struct MultiBotOrchestrator;
 
 impl MultiBotOrchestrator {
-    /// Detects if any bot is mentioned in the prompt (e.g. "@Forge fix the docker container")
+    /// Detects if any bot is mentioned in the prompt (e.g. "@Forge fix the docker container").
+    ///
+    /// Compat helper used by tests; production runs resolve identities through
+    /// [`AgentRegistry::resolve`], which also understands aliases.
     pub fn extract_mentioned_bot(prompt: &str, bots: &[BotProfile]) -> Option<BotProfile> {
         let re = Regex::new(r"@([a-zA-Z0-9_\-]+)").unwrap();
         for cap in re.captures_iter(prompt) {
@@ -43,49 +50,74 @@ impl MultiBotOrchestrator {
         None
     }
 
-    /// Formats the combined multi-bot group system prompt
-    pub fn build_group_system_prompt(active_bot: &BotProfile, all_bots: &[BotProfile]) -> String {
-        let mut teammates_list = String::new();
-        for b in all_bots {
-            if b.id != active_bot.id {
-                teammates_list.push_str(&format!(
-                    "- @{} ({}): {}\n",
-                    b.name, b.role, b.system_prompt
-                ));
-            }
-        }
-
-        format!(
-            "{}\n\n[Team Context]\nYou are currently responding as @{} ({}).\nYou are collaborating in a shared workspace with the following teammate bots:\n{}\nIf a user or task would be better handled by a teammate, or if you need their specialized expertise, you can invoke them by calling delegate_task or mentioning '@BotName'.",
-            active_bot.system_prompt,
-            active_bot.name,
-            active_bot.role,
-            teammates_list
-        )
-    }
-
-    /// Update active execution status of a teammate bot
-    pub fn set_bot_task(bot_id: &str, task_desc: Option<&str>) {
+    /// Record or clear the task a teammate bot is executing for one run.
+    /// `None` clears exactly the (bot, run) pair, leaving tasks owned by other
+    /// runs untouched.
+    pub fn set_bot_task(bot_id: &str, run_id: &str, task_desc: Option<&str>) {
         let mut map = ACTIVE_BOT_TASKS.lock().unwrap();
-        if let Some(task) = task_desc {
-            map.insert(bot_id.to_string(), task.to_string());
-        } else {
+        let now_empty = {
+            let entry = map.entry(bot_id.to_string()).or_default();
+            match task_desc {
+                Some(task) => {
+                    entry.insert(run_id.to_string(), task.to_string());
+                    false
+                }
+                None => {
+                    entry.remove(run_id);
+                    entry.is_empty()
+                }
+            }
+        };
+        if now_empty {
             map.remove(bot_id);
         }
     }
 
-    /// Retrieve live roster status for all configured bots
-    pub fn get_roster_statuses(db: &Database) -> Vec<BotStatus> {
-        let map = ACTIVE_BOT_TASKS.lock().unwrap();
-        let bots = db.list_bots().unwrap_or_default();
+    /// Drop every task owned by a run (used on completion, failure or cancel).
+    pub fn clear_run_tasks(run_id: &str) {
+        let mut map = ACTIVE_BOT_TASKS.lock().unwrap();
+        let mut emptied: Vec<String> = Vec::new();
+        for (bot_id, tasks) in map.iter_mut() {
+            tasks.remove(run_id);
+            if tasks.is_empty() {
+                emptied.push(bot_id.clone());
+            }
+        }
+        for bot_id in emptied {
+            map.remove(&bot_id);
+        }
+    }
 
+    fn tasks_for(bot_id: &str) -> Vec<BotTaskStatus> {
+        let map = ACTIVE_BOT_TASKS.lock().unwrap();
+        match map.get(bot_id) {
+            Some(tasks) => {
+                let mut v: Vec<BotTaskStatus> = tasks
+                    .iter()
+                    .map(|(run_id, objective)| BotTaskStatus {
+                        run_id: run_id.clone(),
+                        objective: objective.clone(),
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+                v
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Retrieve live roster status for the seeded compat bots (bots table).
+    /// Prefer [`MultiBotOrchestrator::get_roster_statuses_for`] + the agent
+    /// registry, which is the canonical identity source.
+    pub fn get_roster_statuses(db: &Database) -> Vec<BotStatus> {
+        let bots = db.list_bots().unwrap_or_default();
         bots.into_iter()
             .map(|b| {
-                let current_task = map.get(&b.id).cloned();
-                let state = if current_task.is_some() {
-                    "busy".to_string()
-                } else {
+                let active = Self::tasks_for(&b.id);
+                let state = if active.is_empty() {
                     "idle".to_string()
+                } else {
+                    "busy".to_string()
                 };
                 BotStatus {
                     id: b.id,
@@ -93,7 +125,34 @@ impl MultiBotOrchestrator {
                     avatar: b.avatar,
                     role: b.role,
                     state,
-                    current_task,
+                    current_task: active.first().map(|t| t.objective.clone()),
+                    active_tasks: active,
+                }
+            })
+            .collect()
+    }
+
+    /// Live roster status for the validated profiles of the agent registry.
+    /// Ids follow the manifest ids, so the roster always matches what the
+    /// backend can actually run.
+    pub fn get_roster_statuses_for(profiles: &[ProfileSnapshot]) -> Vec<BotStatus> {
+        profiles
+            .iter()
+            .map(|p| {
+                let active = Self::tasks_for(&p.id);
+                let state = if active.is_empty() {
+                    "idle".to_string()
+                } else {
+                    "busy".to_string()
+                };
+                BotStatus {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    avatar: p.avatar.clone(),
+                    role: p.role.clone(),
+                    state,
+                    current_task: active.first().map(|t| t.objective.clone()),
+                    active_tasks: active,
                 }
             })
             .collect()
