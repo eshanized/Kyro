@@ -820,7 +820,10 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
 
     let status_missing = conn_mgr.get_oauth_status("missing_session_xyz").await;
     assert!(status_missing.is_err());
-    conn_mgr.cancel_oauth_flow(&init_res.session_id).await.unwrap();
+    conn_mgr
+        .cancel_oauth_flow(&init_res.session_id)
+        .await
+        .unwrap();
 
     // 3. refresh_account_token validation
     // Non-existent account
