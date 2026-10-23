@@ -91,17 +91,55 @@ describe("DevWorkbenchModal Comprehensive Integration Tests", () => {
     workspace_id: "ws_multi_1",
     parent_run_id: "run_1",
     project_path: "/home/snigdha/Desktop/Kyro",
+    workflow_id: "software-change",
+    workflow_name: "Software Change",
+    primary_objective: "Implement production visual regression suite",
+    concurrency: 2,
+    on_failure: "continue",
     tasks: [
       {
-        task_id: "t_1",
-        role: "implementation_engineer",
-        objective: "Add endpoints",
-        dependencies: [],
+        task_id: "investigate",
+        agent_id: "forge-devops",
+        objective: "Investigate the repository",
+        depends_on: [],
+        optional: false,
+        isolated_worktree: false,
+        max_attempts: 1,
+        attempts: 1,
         status: "completed",
+        child_run_id: "ws_multi_1_investigate_a1",
+        isolated_worktree_path: null,
+        worktree_branch: null,
+        output: "done",
+        error: null,
+        started_at: 1,
+        completed_at: 2,
+      },
+      {
+        task_id: "implement",
+        agent_id: "forge-devops",
+        objective: "Add endpoints",
+        depends_on: ["investigate"],
+        optional: false,
+        isolated_worktree: true,
+        max_attempts: 1,
+        attempts: 1,
+        status: "completed",
+        child_run_id: "ws_multi_1_implement_a1",
+        isolated_worktree_path: "/tmp/kyro/scratch/worktrees/implement",
+        worktree_branch: "kyro-wt-implement",
+        output: "done",
+        error: null,
+        started_at: 2,
+        completed_at: 3,
       },
     ],
-    status: "active",
+    status: "completed",
+    created_at: 0,
+    updated_at: 0,
   };
+
+  const mockWorkspaceList = [mockWorkspace];
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -133,7 +171,10 @@ describe("DevWorkbenchModal Comprehensive Integration Tests", () => {
           description: "No visual defects found",
         });
       }
+      if (cmd === "list_multi_agent_workspaces") return Promise.resolve(mockWorkspaceList);
       if (cmd === "create_multi_agent_workspace") return Promise.resolve(mockWorkspace);
+      if (cmd === "run_multi_agent_workspace") return Promise.resolve(mockWorkspace);
+      if (cmd === "cancel_multi_agent_workspace") return Promise.resolve(true);
       if (cmd === "reconcile_multi_agent_workspace") {
         return Promise.resolve({
           workspace_id: "ws_multi_1",
@@ -268,11 +309,16 @@ describe("DevWorkbenchModal Comprehensive Integration Tests", () => {
     });
   });
 
-  it("navigates Multi-Agent Workspace tab and initializes worktrees", async () => {
+  it("navigates Multi-Agent Workspace tab, plans and runs the DAG workflow", async () => {
     render(<DevWorkbenchModal isOpen={true} onClose={vi.fn()} initialTab="workspace" />);
 
-    const initBtn = screen.getByRole("button", { name: /Initialize Specialist Workspace/i });
-    fireEvent.click(initBtn);
+    // The workspace tab lists durable workspaces on open.
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("list_multi_agent_workspaces");
+    });
+
+    const planBtn = screen.getByRole("button", { name: /Plan Workspace/i });
+    fireEvent.click(planBtn);
 
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith(
@@ -283,6 +329,20 @@ describe("DevWorkbenchModal Comprehensive Integration Tests", () => {
       );
     });
 
+    const runBtn = await screen.findByRole("button", { name: /Run workspace/i });
+    fireEvent.click(runBtn);
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith(
+        "run_multi_agent_workspace",
+        expect.objectContaining({
+          workspaceId: "ws_multi_1",
+        })
+      );
+    });
+
+    // The completed implement stage generated a worktree; reconciliation
+    // targets that durable worktree path.
     const reconcileBtn = screen.getByRole("button", { name: /Reconcile Worktree Changes/i });
     fireEvent.click(reconcileBtn);
 
@@ -291,6 +351,7 @@ describe("DevWorkbenchModal Comprehensive Integration Tests", () => {
         "reconcile_multi_agent_workspace",
         expect.objectContaining({
           workspaceId: "ws_multi_1",
+          worktreePath: "/tmp/kyro/scratch/worktrees/implement",
         })
       );
     });
@@ -708,22 +769,39 @@ describe("ArtifactsModal, CommandPalette, and Teammates Tests", () => {
     },
   ];
 
-  const mockBots = [
+  const mockProfiles = [
     {
-      id: "bot_forge",
+      id: "forge-devops",
       name: "Forge",
       avatar: "wrench",
       role: "Engineering Implementation Specialist",
-      system_prompt: "Write production Rust and TypeScript code.",
-      is_default: false,
+      description: "",
+      model_id: null,
+      origin: "builtin",
+      enabled: true,
+      runtime_disabled: false,
+      schema_version: 1,
+      version_label: "v1:forge",
+      aliases: ["forge"],
+      validation_error: null,
+      source_path: null,
+      instructions: "",
+      tools_mode: "inherit",
+      tools_allow: [],
+      delegation_enabled: true,
+      delegation_max_depth: 3,
+      delegation_max_children: 4,
+      max_steps: 25,
+      is_builtin: true,
     },
   ];
 
   const mockStatuses = [
     {
-      id: "bot_forge",
+      id: "forge-devops",
       state: "idle",
       current_task: null,
+      active_tasks: [],
     },
   ];
 
@@ -736,10 +814,9 @@ describe("ArtifactsModal, CommandPalette, and Teammates Tests", () => {
       if (cmd === "export_artifact") return Promise.resolve("/tmp/spec_exported.md");
       if (cmd === "delete_artifact") return Promise.resolve(true);
       if (cmd === "add_artifact_comment") return Promise.resolve(true);
-      if (cmd === "list_bots") return Promise.resolve(mockBots);
+      if (cmd === "list_agent_profiles") return Promise.resolve(mockProfiles);
       if (cmd === "get_roster_statuses") return Promise.resolve(mockStatuses);
-      if (cmd === "create_bot") return Promise.resolve(mockBots[0]);
-      if (cmd === "delete_bot") return Promise.resolve(true);
+      if (cmd === "search_workspace") return Promise.resolve([]);
       return Promise.resolve(null);
     });
   });
@@ -809,7 +886,7 @@ describe("ArtifactsModal, CommandPalette, and Teammates Tests", () => {
       <TeammateRosterModal
         isOpen={true}
         onClose={vi.fn()}
-        selectedBotId="apex"
+        selectedBotId="apex-orchestrator"
         onSelectBot={handleSelectBot}
       />
     );
@@ -824,7 +901,7 @@ describe("ArtifactsModal, CommandPalette, and Teammates Tests", () => {
       fireEvent.click(botCard);
       expect(handleSelectBot).toHaveBeenCalledWith(
         expect.objectContaining({
-          id: "bot_forge",
+          id: "forge-devops",
           name: "Forge",
         })
       );
