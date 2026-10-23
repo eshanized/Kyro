@@ -145,10 +145,10 @@ impl Default for ExecutableResolver {
 
 impl ExecutableResolver {
     pub fn new() -> Self {
-        let mut dirs: Vec<PathBuf> = Vec::new();
-
-        // Deterministic, well-known locations first.
-        for d in [
+        // Keep deterministic system-directory precedence, but do not trust a
+        // well-known path blindly: hosted runners and container images can make
+        // /usr/local/bin world-writable, just like a user-provided PATH entry.
+        let mut candidates: Vec<PathBuf> = [
             "/usr/local/bin",
             "/usr/bin",
             "/bin",
@@ -156,24 +156,39 @@ impl ExecutableResolver {
             "/usr/sbin",
             "/sbin",
             "/opt/bin",
-        ] {
-            dirs.push(PathBuf::from(d));
-        }
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
 
-        // The user's PATH is honoured, but only after the system locations and
-        // only for entries that are not world-writable.
+        // The user's PATH is considered after system locations. The same trust
+        // checks apply to every directory regardless of where it came from.
         if let Some(user_path) = std::env::var_os("PATH") {
-            for raw in std::env::split_paths(&user_path) {
-                if !dirs.contains(&raw) && Self::dir_is_trusted(&raw) {
-                    dirs.push(raw);
-                }
-            }
+            candidates.extend(std::env::split_paths(&user_path));
         }
 
-        Self { search_dirs: dirs }
+        Self {
+            search_dirs: Self::trusted_search_dirs(candidates),
+        }
+    }
+
+    /// Removes duplicate, missing, and world-writable directories while
+    /// preserving search order.
+    fn trusted_search_dirs(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        for dir in candidates {
+            if !dir.is_dir() || !Self::dir_is_trusted(&dir) || dirs.contains(&dir) {
+                continue;
+            }
+            dirs.push(dir);
+        }
+        dirs
     }
 
     /// Builds a resolver with an explicit search path (used by tests).
+    ///
+    /// This deliberately preserves the provided paths so tests can exercise
+    /// rejection behavior for an untrusted directory.
     pub fn with_search_dirs(dirs: Vec<PathBuf>) -> Self {
         Self { search_dirs: dirs }
     }
@@ -481,6 +496,51 @@ mod tests {
             .unwrap();
         assert!(resolved.path.ends_with("hello"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skips_world_writable_search_dirs_and_uses_the_next_trusted_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmpdir("trusted_search");
+        let untrusted_dir = root.join("untrusted");
+        let trusted_dir = root.join("trusted");
+        std::fs::create_dir_all(&untrusted_dir).unwrap();
+        std::fs::create_dir_all(&trusted_dir).unwrap();
+        std::fs::set_permissions(
+            &untrusted_dir,
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &trusted_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        for dir in [&untrusted_dir, &trusted_dir] {
+            let executable = dir.join("npm");
+            std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(
+                &executable,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let resolver = ExecutableResolver::with_search_dirs(
+            ExecutableResolver::trusted_search_dirs(vec![
+                untrusted_dir.clone(),
+                trusted_dir.clone(),
+            ]),
+        );
+        let resolved = resolver
+            .resolve(&ProgramSpec::new("npm"))
+            .expect("the trusted npm candidate should be selected");
+        assert_eq!(resolved.path, trusted_dir.join("npm").canonicalize().unwrap());
+        assert!(!resolver.search_dirs().contains(&untrusted_dir));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
