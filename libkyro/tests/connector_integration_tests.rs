@@ -793,8 +793,14 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<std::collections::HashMap<_, _>>();
-    assert_eq!(auth_params.get("scope").map(String::as_str), Some("repo read:user"));
-    assert_eq!(auth_params.get("code_challenge_method").map(String::as_str), Some("S256"));
+    assert_eq!(
+        auth_params.get("scope").map(String::as_str),
+        Some("repo read:user")
+    );
+    assert_eq!(
+        auth_params.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
     assert!(!auth_params.get("scope").unwrap().contains("actions:read"));
 
     // 2. get_oauth_status
