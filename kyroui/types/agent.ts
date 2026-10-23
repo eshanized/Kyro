@@ -5,6 +5,54 @@ export interface Conversation {
   created_at: number;
 }
 
+/** Origin of the active agent profile content. */
+export type ProfileOrigin = "builtin" | "override" | "custom";
+
+/**
+ * One agent profile in the registry. The Markdown manifest is authoritative;
+ * this record is a read-model the roster UI renders and edits.
+ */
+export interface AgentProfileRecord {
+  id: string;
+  name: string;
+  avatar: string;
+  role: string;
+  description: string;
+  model_id?: string | null;
+  origin: ProfileOrigin;
+  enabled: boolean;
+  runtime_disabled: boolean;
+  schema_version: number;
+  version_label: string;
+  aliases: string[];
+  validation_error?: string | null;
+  source_path?: string | null;
+  instructions: string;
+  tools_mode: string;
+  tools_allow: string[];
+  delegation_enabled: boolean;
+  delegation_max_depth: number;
+  delegation_max_children: number;
+  max_steps: number;
+  is_builtin: boolean;
+}
+
+/** Raw Markdown manifest of an agent profile for the editor. */
+export interface AgentProfileDocument {
+  id: string;
+  document: string;
+  source_path?: string | null;
+}
+
+export interface CreateAgentProfileRequest {
+  id: string;
+  name: string;
+  avatar: string;
+  role: string;
+  description: string;
+  instructions: string;
+}
+
 export interface ToolCall {
   id: string;
   name: string;
@@ -174,6 +222,8 @@ export interface BotStatus {
   role: string;
   state: "idle" | "busy" | "delegating";
   current_task?: string;
+  /** Every active objective, keyed by the run that owns it. */
+  active_tasks?: { run_id: string; objective: string }[];
 }
 
 export interface TakeoverStatus {
@@ -626,24 +676,61 @@ export interface VisualRegressionResult {
 
 export interface SpecialistTask {
   task_id: string;
-  role: "repository_investigator" | "implementation_engineer" | "test_regression_specialist" | "code_reviewer" | "documentation_reviewer";
+  /** The agent profile that runs this stage (resolved via the registry). */
+  agent_id: string;
   objective: string;
-  dependencies: string[];
-  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  depends_on: string[];
+  optional: boolean;
+  isolated_worktree: boolean;
+  /** Retry budget: retries + 1 attempts total. */
+  max_attempts: number;
+  /** Attempts consumed so far. */
+  attempts: number;
+  status: "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled";
   child_run_id?: string | null;
   isolated_worktree_path?: string | null;
+  worktree_branch?: string | null;
   output?: string | null;
   error?: string | null;
   started_at?: number | null;
   completed_at?: number | null;
 }
 
+export interface WorkflowTaskSpec {
+  task_id: string;
+  agent_id: string;
+  /** `{{objective}}` is replaced by the workspace's primary objective. */
+  objective: string;
+  depends_on: string[];
+  optional: boolean;
+  isolated_worktree: boolean;
+  /** Retry count after the first attempt (0 = single attempt). */
+  retries: number;
+}
+
+export interface WorkflowSpec {
+  id: string;
+  name: string;
+  description: string;
+  /** 1..=8 concurrent task batches. */
+  concurrency: number;
+  on_failure: "abort" | "continue";
+  tasks: WorkflowTaskSpec[];
+}
+
 export interface MultiAgentWorkspace {
   workspace_id: string;
   parent_run_id: string;
   project_path: string;
+  workflow_id: string;
+  workflow_name: string;
+  primary_objective: string;
+  concurrency: number;
+  on_failure: "abort" | "continue";
   tasks: SpecialistTask[];
-  status: "active" | "completed" | "reconciled" | "failed";
+  status: "active" | "completed" | "failed" | "failed_partial" | "cancelled" | "reconciled";
+  created_at: number;
+  updated_at: number;
 }
 
 export interface ReconciliationOutcome {
