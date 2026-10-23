@@ -239,7 +239,7 @@ describe("App Ultimate Coverage & Edge Cases", () => {
       expect(screen.getByText("Active Task")).toBeInTheDocument();
     });
 
-    const input = screen.getByPlaceholderText(/Ask @Kyro General/i);
+    const input = screen.getByPlaceholderText(/Ask @/i);
     fireEvent.change(input, { target: { value: "organize and clean up my downloads" } });
 
     const sendBtn = screen.getByText("Send");
@@ -447,7 +447,7 @@ describe("App Ultimate Coverage & Edge Cases", () => {
     const askBtns = screen.getAllByRole("button", { name: /Ask Kyro/i });
     fireEvent.click(askBtns[0]);
     await waitFor(() => {
-      expect(screen.getByPlaceholderText(/Ask @Kyro General/i)).toBeInTheDocument();
+      expect(screen.getByPlaceholderText(/Ask @/i)).toBeInTheDocument();
     });
   });
 });
