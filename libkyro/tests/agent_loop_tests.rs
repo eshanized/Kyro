@@ -1,8 +1,9 @@
 use kyro_lib::agent::cancellation::CancellationToken;
 use kyro_lib::agent::loop_engine::AgentLoopEngine;
+use kyro_lib::agent::registry::AgentRegistry;
 use kyro_lib::agent::router::{ChatMessage, MessageContent};
 use kyro_lib::governance::TakeoverController;
-use kyro_lib::storage::{AgentRun, Database};
+use kyro_lib::storage::{AgentRun, BotRecord, Database};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,9 @@ impl Drop for TestDir {
 struct MockLlmServer {
     addr: std::net::SocketAddr,
     responses: Arc<Mutex<VecDeque<serde_json::Value>>>,
+    /// Raw request bodies, in arrival order; lets tests assert exactly what the
+    /// model server received (used by the registry migration verification).
+    requests: Arc<Mutex<VecDeque<String>>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -43,9 +47,11 @@ impl MockLlmServer {
         let addr = listener.local_addr().unwrap();
         let responses: Arc<Mutex<VecDeque<serde_json::Value>>> =
             Arc::new(Mutex::new(VecDeque::new()));
+        let requests: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
 
         let resp_clone = responses.clone();
+        let req_clone = requests.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -54,17 +60,51 @@ impl MockLlmServer {
                     }
                     Ok((mut socket, _)) = listener.accept() => {
                         let resp_q = resp_clone.clone();
+                        let req_q = req_clone.clone();
                         tokio::spawn(async move {
-                            let mut buf = vec![0u8; 16384];
-                            let mut total_read = 0;
-                            loop {
-                                let n = socket.read(&mut buf[total_read..]).await.unwrap_or(0);
-                                if n == 0 { break; }
-                                total_read += n;
-                                if buf[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            // Drain headers, then keep reading until the full
+                            // Content-Length body has arrived so request
+                            // capture is complete.
+                            let mut received: Vec<u8> = Vec::new();
+                            let mut chunk = [0u8; 8192];
+                            let header_end = loop {
+                                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                                if n == 0 {
+                                    break received.len();
+                                }
+                                received.extend_from_slice(&chunk[..n]);
+                                if let Some(pos) = received
+                                    .windows(4)
+                                    .position(|w| w == b"\r\n\r\n")
+                                {
+                                    break pos + 4;
+                                }
+                            };
+                            let content_length: usize = String::from_utf8_lossy(
+                                &received[..header_end.min(received.len())],
+                            )
+                            .lines()
+                            .find_map(|l| {
+                                l.strip_prefix("Content-Length:")
+                                    .map(|v| v.trim().to_string())
+                            })
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                            let total = header_end + content_length;
+                            while received.len() < total {
+                                let want = total - received.len();
+                                let take = want.min(chunk.len());
+                                let n = socket.read(&mut chunk[..take]).await.unwrap_or(0);
+                                if n == 0 {
                                     break;
                                 }
+                                received.extend_from_slice(&chunk[..n]);
                             }
+                            let body = String::from_utf8_lossy(
+                                &received[header_end.min(received.len())..],
+                            )
+                            .to_string();
+                            req_q.lock().await.push_back(body);
 
                             let maybe_resp = {
                                 let mut q = resp_q.lock().await;
@@ -110,6 +150,7 @@ impl MockLlmServer {
         MockLlmServer {
             addr,
             responses,
+            requests,
             _shutdown: tx,
         }
     }
@@ -120,6 +161,10 @@ impl MockLlmServer {
 
     fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    async fn request_bodies(&self) -> Vec<String> {
+        self.requests.lock().await.iter().cloned().collect()
     }
 }
 
@@ -1346,7 +1391,8 @@ async fn test_agent_loop_delegate_task_to_subagent() {
 
     db.set_setting("mcp_perm:delegate_task", "allow").unwrap();
 
-    // Step 1: LLM calls delegate_task
+    // Step 1: LLM calls delegate_task using the production schema
+    // (`target_bot_id` + `objective`, resolved against the agent registry).
     server
         .enqueue_response(serde_json::json!({
             "choices": [{
@@ -1359,8 +1405,9 @@ async fn test_agent_loop_delegate_task_to_subagent() {
                         "function": {
                             "name": "delegate_task",
                             "arguments": serde_json::json!({
-                                "target_agent": "scout-researcher",
-                                "task_prompt": "Research security vulnerabilities in dependencies"
+                                "target_bot_id": "scout-web",
+                                "objective": "Research security vulnerabilities in dependencies",
+                                "context_summary": "Rust workspace with outdated crates"
                             }).to_string()
                         }
                     }]
@@ -1370,7 +1417,20 @@ async fn test_agent_loop_delegate_task_to_subagent() {
         }))
         .await;
 
-    // Step 2: Finish
+    // The child team run consumes the next response before the parent resumes.
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Scout research findings attached."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    // Step 2: parent finishes after the delegated child reports back
     server
         .enqueue_response(serde_json::json!({
             "choices": [{
@@ -1407,7 +1467,30 @@ async fn test_agent_loop_delegate_task_to_subagent() {
         .await;
 
     assert!(res.is_ok());
+    // Bug fix note: the earlier version of this test used the wrong tool
+    // schema (`target_agent`/`task_prompt`), so production rejected the call
+    // with "Target bot '' not found in roster" and the assertion passed for
+    // the wrong reason.
     assert_eq!(res.unwrap(), "Delegation dispatched successfully.");
+
+    // The delegation created a real child run for Scout, linked to the parent,
+    // and the child completed successfully.
+    let runs = db.list_runs(50).unwrap();
+    let child = runs
+        .iter()
+        .find(|r| r.parent_run_id.as_deref() == Some(run_id))
+        .expect("delegation must create a child run");
+    assert_eq!(child.agent_id, "scout-web");
+    assert_eq!(child.status, "succeeded");
+    assert_eq!(
+        child.prompt,
+        "Research security vulnerabilities in dependencies"
+    );
+    // Child run recorded the delegating context (objective/parent provenance).
+    let cfg: serde_json::Value =
+        serde_json::from_str(child.config_json.as_deref().unwrap_or("{}")).unwrap();
+    assert_eq!(cfg["parent_run_id"], run_id);
+    assert_eq!(cfg["parent_agent"], "apex-orchestrator");
 }
 
 #[tokio::test]
@@ -2201,5 +2284,153 @@ async fn test_agent_loop_exhausts_step_budget_fails_and_cleans_up() {
     assert!(
         !engine.is_run_active(run_id).await,
         "Active run should have been cleaned up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage G: pre-registry install migration verification.
+//
+// Simulates an install from before the Markdown agent registry existed: the
+// SQLite `bots` compat index holds the user's seeded rows, including a legacy
+// system prompt for the default agent. The runtime must keep every seeded row
+// untouched, resolve agent identity exclusively from the registry, and never
+// forward the legacy DB prompt to the model.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_pre_registry_install_bots_survive_and_legacy_prompts_ignored() {
+    let server = MockLlmServer::start().await;
+    let tdir = TestDir::new("stage_g_migration");
+    let db = Database::init(tdir.path().to_path_buf()).unwrap();
+
+    // 1. Reconstruct legacy user data: the compat index previously stored the
+    //    (now non-authoritative) system prompt for the default agent plus a
+    //    user-created bot. `Database::init` already seeded the built-in rows.
+    let legacy_apex = BotRecord {
+        id: "apex-orchestrator".to_string(),
+        name: "Apex Legacy".to_string(),
+        avatar: "zap".to_string(),
+        role: "orchestrator".to_string(),
+        system_prompt: "LEGACY_PROMPT_MARKER_42".to_string(),
+        is_default: true,
+    };
+    db.create_bot(&legacy_apex).unwrap();
+    db.create_bot(&BotRecord {
+        id: "legacy-user-bot".to_string(),
+        name: "My Legacy Bot".to_string(),
+        avatar: "bot".to_string(),
+        role: "helper".to_string(),
+        system_prompt: "LEGACY_USER_BOT_PROMPT".to_string(),
+        is_default: false,
+    })
+    .unwrap();
+
+    // 2. Production wiring: registry backed by the user config directory
+    //    (first launch initializes it from the embedded defaults).
+    let registry = AgentRegistry::load_or_embedded(&tdir.path().join("config"));
+    let engine = AgentLoopEngine::new();
+    *engine.registry.write().await = registry;
+
+    // 3. The compat index survives the registry boot: no user data was lost.
+    let bots = db.list_bots().unwrap();
+    let apex_row = bots
+        .iter()
+        .find(|b| b.id == "apex-orchestrator")
+        .expect("seeded apex bot row must survive on disk");
+    assert_eq!(apex_row.system_prompt, "LEGACY_PROMPT_MARKER_42");
+    assert!(
+        bots.iter().any(|b| b.id == "legacy-user-bot"),
+        "user-created bots table rows must not be dropped"
+    );
+
+    // 4. The registry resolves the profile from manifests, not from the DB.
+    let profile = engine
+        .registry
+        .read()
+        .await
+        .resolve_lenient("apex-orchestrator")
+        .expect("bundled default must resolve after migration");
+    assert_eq!(profile.id, "apex-orchestrator");
+    assert!(
+        profile.instructions.contains("You are Apex"),
+        "profile instructions must come from the manifest"
+    );
+    assert!(
+        !profile.instructions.contains("LEGACY_PROMPT_MARKER_42"),
+        "legacy DB prompt must not leak into the resolved profile"
+    );
+
+    // 5. Run one real engine step through the mock server, passing the legacy
+    //    prompt in the (compatibility-only) system_prompt parameter.
+    let ws_dir = TestDir::new("stage_g_ws");
+    let run_id = "run_migration_compat";
+    create_test_run(&db, run_id, ws_dir.path());
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "Migration run completed." },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Run with the legacy prompt present"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    let res = engine
+        .run_step_with_connectors(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "LEGACY_PROMPT_MARKER_42",
+            history,
+            db.clone(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+    assert!(res.is_ok(), "engine step must complete: {:?}", res.err());
+
+    // 6. The model request is composed from the platform manual plus the
+    //    manifest instructions — the legacy prompt never reaches the API.
+    let bodies = server.request_bodies().await;
+    assert!(
+        !bodies.is_empty(),
+        "the mock server must have received the request"
+    );
+    let joined = bodies.join("\n");
+    assert!(
+        joined.contains("You are Apex"),
+        "model request must contain manifest instructions; got: {}",
+        joined.chars().take(400).collect::<String>()
+    );
+    assert!(
+        !joined.contains("LEGACY_PROMPT_MARKER_42"),
+        "legacy system prompt from the compat index must be ignored"
+    );
+    assert!(
+        !joined.contains("LEGACY_USER_BOT_PROMPT"),
+        "user bots table prompt must not leak into other agent runs"
+    );
+
+    // 7. The run timeline carries the immutable profile provenance snapshot.
+    let events = db.get_run_events(run_id, None).unwrap();
+    let profile_event = events
+        .iter()
+        .find(|e| e.event_type == "profile")
+        .expect("profile snapshot event must be persisted");
+    let payload: serde_json::Value = serde_json::from_str(&profile_event.payload_json).unwrap();
+    assert_eq!(payload["profile_id"], "apex-orchestrator");
+    assert_eq!(payload["origin"], "builtin");
+    assert!(
+        !payload["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("LEGACY_PROMPT_MARKER_42"),
+        "profile snapshot must capture manifest instructions, not the legacy prompt"
     );
 }
