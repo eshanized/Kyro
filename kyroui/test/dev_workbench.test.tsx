@@ -230,25 +230,52 @@ describe("Kyro Dev Workbench Modal", () => {
       workspace_id: "ws-999",
       parent_run_id: "run-100",
       project_path: "/home/snigdha/Desktop/Kyro",
+      workflow_id: "software-change",
+      workflow_name: "Software Change",
+      primary_objective: "Implement visual regression engine",
+      concurrency: 2,
+      on_failure: "continue",
       tasks: [
         {
-          task_id: "task-1",
-          role: "repository_investigator" as const,
+          task_id: "investigate",
+          agent_id: "forge-devops",
           objective: "Map codebase architecture",
-          dependencies: [],
-          status: "completed" as const,
-          isolated_worktree_path: "/home/snigdha/Desktop/Kyro/.kyro-worktrees/repository_investigator",
+          depends_on: [],
+          optional: false,
+          isolated_worktree: false,
+          max_attempts: 1,
+          attempts: 1,
+          status: "completed",
+          child_run_id: "ws-999_investigate_a1",
+          isolated_worktree_path: null,
+          worktree_branch: null,
+          output: "done",
+          error: null,
+          started_at: 1,
+          completed_at: 2,
         },
         {
-          task_id: "task-2",
-          role: "implementation_engineer" as const,
+          task_id: "implement",
+          agent_id: "forge-devops",
           objective: "Implement visual regression engine",
-          dependencies: ["task-1"],
-          status: "completed" as const,
-          isolated_worktree_path: "/home/snigdha/Desktop/Kyro/.kyro-worktrees/implementation_engineer",
+          depends_on: ["investigate"],
+          optional: false,
+          isolated_worktree: true,
+          max_attempts: 1,
+          attempts: 1,
+          status: "completed",
+          child_run_id: "ws-999_implement_a1",
+          isolated_worktree_path: "/tmp/kyro/scratch/worktrees/implement",
+          worktree_branch: "kyro-wt-implement",
+          output: "done",
+          error: null,
+          started_at: 2,
+          completed_at: 3,
         },
       ],
-      status: "active" as const,
+      status: "completed",
+      created_at: 0,
+      updated_at: 0,
     };
 
     const mockReconciliation = {
@@ -262,7 +289,13 @@ describe("Kyro Dev Workbench Modal", () => {
     };
 
     (invoke as any).mockImplementation((cmd: string) => {
+      if (cmd === "list_multi_agent_workspaces") {
+        return Promise.resolve([]);
+      }
       if (cmd === "create_multi_agent_workspace") {
+        return Promise.resolve(mockWorkspace);
+      }
+      if (cmd === "run_multi_agent_workspace") {
         return Promise.resolve(mockWorkspace);
       }
       if (cmd === "reconcile_multi_agent_workspace") {
@@ -276,17 +309,17 @@ describe("Kyro Dev Workbench Modal", () => {
 
     expect(screen.getByText("Multi-Agent Workspace")).toBeInTheDocument();
 
-    // Create workspace
-    const createBtn = screen.getByText("Initialize Specialist Workspace");
+    // Plan the workspace from the bundled workflow
+    const createBtn = screen.getByText("Plan Workspace");
     fireEvent.click(createBtn);
 
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith("create_multi_agent_workspace", expect.any(Object));
-      expect(screen.getByText(/repository investigator/i)).toBeInTheDocument();
-      expect(screen.getByText(/implementation engineer/i)).toBeInTheDocument();
+      expect(screen.getAllByText("investigate").length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/forge-devops/i).length).toBeGreaterThan(0);
     });
 
-    // Reconcile
+    // Reconcile the worktree that actually holds integrated work
     const reconcileBtn = screen.getByText("Reconcile Worktree Changes");
     fireEvent.click(reconcileBtn);
 
