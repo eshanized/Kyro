@@ -27,6 +27,7 @@ import {
   Shield,
   Clock,
   Cpu,
+  Activity,
 } from "lucide-react";
 import {
   DiscoveryResult,
@@ -107,6 +108,8 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   const [reconciliation, setReconciliation] = useState<ReconciliationOutcome | null>(null);
   const [isCreatingWorkspace, setIsCreatingWorkspace] = useState<boolean>(false);
   const [isReconciling, setIsReconciling] = useState<boolean>(false);
+  const [isRunningWorkspace, setIsRunningWorkspace] = useState<boolean>(false);
+  const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
 
   // --- Sandboxed Experiments State ---
   const [experiments, setExperiments] = useState<CodeExperimentRecord[]>([]);
@@ -140,6 +143,9 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
       loadDevServers();
       if (activeTab === "experiments") {
         loadExperiments();
+      }
+      if (activeTab === "workspace") {
+        loadWorkspaces().catch(console.error);
       }
     }
   }, [isOpen, activeTab]);
@@ -438,35 +444,94 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   };
 
   // --- Multi-Agent Handlers ---
+  const loadWorkspaces = async () => {
+    try {
+      const list = await invoke<MultiAgentWorkspace[]>("list_multi_agent_workspaces");
+      // Show the most recent workspace; the user can re-run/reconcile it.
+      if (Array.isArray(list) && list.length > 0) {
+        setMultiAgentWorkspace((prev) => prev ?? list[0]);
+      }
+    } catch (err: any) {
+      console.error("Failed to list workspaces:", err);
+    }
+  };
+
   const handleCreateMultiAgentWorkspace = async () => {
     setIsCreatingWorkspace(true);
+    setWorkspaceNotice(null);
     try {
       const res = await invoke<MultiAgentWorkspace>("create_multi_agent_workspace", {
         parentRunId: "run-" + Date.now(),
         projectPath: agentProjectPath,
         objective: agentObjective,
+        workflowId: null,
+        customWorkflow: null,
       });
       setMultiAgentWorkspace(res);
       setReconciliation(null);
     } catch (err: any) {
-      alert("Failed to initialize multi-agent workspace: " + String(err));
+      setWorkspaceNotice("Failed to initialize multi-agent workspace: " + String(err));
     } finally {
       setIsCreatingWorkspace(false);
+    }
+  };
+
+  const handleRunWorkspace = async () => {
+    if (!multiAgentWorkspace) return;
+    setIsRunningWorkspace(true);
+    setWorkspaceNotice(null);
+    try {
+      const res = await invoke<MultiAgentWorkspace>("run_multi_agent_workspace", {
+        workspaceId: multiAgentWorkspace.workspace_id,
+      });
+      setMultiAgentWorkspace(res);
+      setWorkspaceNotice(
+        `Workflow "${res.workflow_name}" finished: ${res.status}. ${
+          res.tasks.filter((t) => t.status === "completed").length
+        }/${res.tasks.length} stages completed.`,
+      );
+    } catch (err: any) {
+      setWorkspaceNotice("Workspace run failed: " + String(err));
+    } finally {
+      setIsRunningWorkspace(false);
+    }
+  };
+
+  const handleCancelWorkspace = async () => {
+    if (!multiAgentWorkspace) return;
+    try {
+      const stopped = await invoke<boolean>("cancel_multi_agent_workspace", {
+        workspaceId: multiAgentWorkspace.workspace_id,
+      });
+      setWorkspaceNotice(stopped ? "Cancellation requested." : "Workspace was not active.");
+    } catch (err: any) {
+      setWorkspaceNotice("Cancel error: " + String(err));
     }
   };
 
   const handleReconcileWorkspace = async () => {
     if (!multiAgentWorkspace) return;
     setIsReconciling(true);
+    setWorkspaceNotice(null);
     try {
+      // Reconcile the isolated worktree that actually holds integrated work;
+      // tasks never ran in a worktree fail loudly instead of pretending.
+      const worktreePath = multiAgentWorkspace.tasks.find((t) => t.isolated_worktree_path)
+        ?.isolated_worktree_path;
+      if (!worktreePath) {
+        setWorkspaceNotice(
+          "No isolated worktree was produced by this workspace — nothing to reconcile.",
+        );
+        return;
+      }
       const res = await invoke<ReconciliationOutcome>("reconcile_multi_agent_workspace", {
         projectRoot: multiAgentWorkspace.project_path,
-        worktreePath: `${multiAgentWorkspace.project_path}/.kyro-worktrees/implementation_engineer`,
+        worktreePath,
         workspaceId: multiAgentWorkspace.workspace_id,
       });
       setReconciliation(res);
     } catch (err: any) {
-      alert("Reconciliation error: " + String(err));
+      setWorkspaceNotice("Reconciliation error: " + String(err));
     } finally {
       setIsReconciling(false);
     }
@@ -1215,7 +1280,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
             <div className="space-y-6">
               <div className="p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-3">
                 <div className="text-xs font-semibold text-neutral-200 uppercase tracking-wide">
-                  Specialist Multi-Agent Swarm (5 Roles, Git Worktree Isolation)
+                  DAG Workflow Swarm (software-change · bounded concurrency · Git worktree isolation)
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
@@ -1238,32 +1303,76 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                   </div>
                 </div>
 
-                <div className="flex justify-end">
+                <div className="flex justify-end gap-2">
+                  {multiAgentWorkspace && (
+                    <button
+                      onClick={handleCancelWorkspace}
+                      className="px-3 py-2 rounded-lg bg-neutral-900 hover:bg-neutral-800 text-neutral-300 border border-neutral-700 font-medium text-xs flex items-center gap-2 transition"
+                    >
+                      Cancel run
+                    </button>
+                  )}
                   <button
                     onClick={handleCreateMultiAgentWorkspace}
                     disabled={isCreatingWorkspace}
                     className="px-4 py-2 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 font-medium text-xs flex items-center gap-2 transition disabled:opacity-50"
                   >
                     <Users className="w-3.5 h-3.5" />
-                    {isCreatingWorkspace ? "Creating Isolated Worktrees..." : "Initialize Specialist Workspace"}
+                    {isCreatingWorkspace ? "Planning workspace..." : "Plan Workspace"}
                   </button>
                 </div>
               </div>
 
+              {workspaceNotice && (
+                <div className="p-3 rounded-xl bg-neutral-900 border border-neutral-700 text-xs text-neutral-300">
+                  {workspaceNotice}
+                </div>
+              )}
+
               {multiAgentWorkspace && (
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-neutral-200 uppercase tracking-wide">
-                      Specialist Task Graph & Worktrees
-                    </span>
-                    <button
-                      onClick={handleReconcileWorkspace}
-                      disabled={isReconciling}
-                      className="px-3 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/60 text-purple-200 border border-purple-800/60 text-xs font-medium flex items-center gap-1.5 transition"
-                    >
-                      <FolderGit2 className="w-3.5 h-3.5" />
-                      {isReconciling ? "Reconciling..." : "Reconcile Worktree Changes"}
-                    </button>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="text-xs text-neutral-400 space-y-0.5">
+                      <div className="font-semibold text-neutral-200 uppercase tracking-wide">
+                        Specialist Task Graph & Worktrees
+                      </div>
+                      <div className="text-[11px]">
+                        Workflow: <span className="font-mono">{multiAgentWorkspace.workflow_id}</span> ·{" "}
+                        concurrency {multiAgentWorkspace.concurrency} ·{" "}
+                        on_failure <span className="font-mono">{multiAgentWorkspace.on_failure}</span> ·{" "}
+                        objective: {multiAgentWorkspace.primary_objective || agentObjective}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] uppercase font-mono font-bold ${
+                          multiAgentWorkspace.status === "completed"
+                            ? "bg-green-950/60 text-green-300 border border-green-800/60"
+                            : multiAgentWorkspace.status === "failed" ||
+                              multiAgentWorkspace.status === "failed_partial"
+                            ? "bg-red-950/60 text-red-300 border border-red-800/60"
+                            : "bg-amber-950/40 text-amber-300 border border-amber-800/60"
+                        }`}
+                      >
+                        {multiAgentWorkspace.status}
+                      </span>
+                      <button
+                        onClick={handleRunWorkspace}
+                        disabled={isRunningWorkspace}
+                        className="px-3 py-1.5 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 text-xs font-medium flex items-center gap-1.5 transition disabled:opacity-50"
+                      >
+                        <Activity className="w-3.5 h-3.5" />
+                        {isRunningWorkspace ? "Running..." : "Run workspace"}
+                      </button>
+                      <button
+                        onClick={handleReconcileWorkspace}
+                        disabled={isReconciling}
+                        className="px-3 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/60 text-purple-200 border border-purple-800/60 text-xs font-medium flex items-center gap-1.5 transition"
+                      >
+                        <FolderGit2 className="w-3.5 h-3.5" />
+                        {isReconciling ? "Reconciling..." : "Reconcile Worktree Changes"}
+                      </button>
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-1 gap-3">
@@ -1272,32 +1381,49 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                         key={task.task_id}
                         className="p-4 bg-[#141414] border border-neutral-800 rounded-xl space-y-2"
                       >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2.5">
-                            <span className="font-semibold text-sm text-neutral-200 uppercase font-mono">
-                              {task.role.replace(/_/g, " ")}
+                        <div className="flex items-center justify-between gap-4">
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <span className="font-semibold text-sm text-neutral-200">
+                              {task.task_id}
+                            </span>
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-neutral-800 text-neutral-300">
+                              @{task.agent_id}
                             </span>
                             <span className="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-neutral-800 text-neutral-300">
                               {task.status}
                             </span>
+                            {task.optional && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-neutral-900 text-neutral-400 border border-neutral-700">
+                                optional
+                              </span>
+                            )}
+                            {task.isolated_worktree && (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-neutral-900 text-neutral-400 border border-neutral-700">
+                                worktree
+                              </span>
+                            )}
                           </div>
-                          {task.isolated_worktree_path && (
-                            <span className="text-[11px] font-mono text-neutral-400">
-                              Worktree: {task.isolated_worktree_path.split("/").slice(-2).join("/")}
-                            </span>
-                          )}
+                          <span className="text-[11px] font-mono text-neutral-400 shrink-0">
+                            attempts {task.attempts}/{task.max_attempts}
+                          </span>
                         </div>
 
                         <p className="text-xs text-neutral-300">{task.objective}</p>
 
-                        {task.dependencies.length > 0 && (
+                        {task.depends_on && task.depends_on.length > 0 && (
                           <div className="text-[10px] text-neutral-400 flex items-center gap-1">
                             <span>Dependencies:</span>
-                            {task.dependencies.map((d) => (
+                            {task.depends_on.map((d) => (
                               <span key={d} className="px-1.5 py-0.5 bg-neutral-900 rounded font-mono">
                                 {d}
                               </span>
                             ))}
+                          </div>
+                        )}
+
+                        {task.error && (
+                          <div className="text-[11px] p-2 rounded-lg bg-red-950/40 border border-red-800/50 text-red-200/90">
+                            {task.error}
                           </div>
                         )}
                       </div>
