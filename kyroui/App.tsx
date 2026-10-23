@@ -5,7 +5,7 @@ import {
   Conversation,
   Message,
   AgentStepEvent,
-  BotRecord,
+  AgentProfileRecord,
   TakeoverStatus,
   ApprovalRequest,
   GroundedScreenResult,
@@ -215,15 +215,33 @@ export const App: React.FC = () => {
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Multi-Bot & Governance
-  const [activeBot, setActiveBot] = useState<BotRecord>({
+  // Multi-Bot & Governance. The active teammate is an agent profile resolved
+  // by the registry — client-supplied prompts are never trusted.
+  const DEFAULT_PROFILE: AgentProfileRecord = {
     id: "apex-orchestrator",
     name: "Apex",
     avatar: "zap",
     role: "General Workspace & Strategic Orchestrator",
-    system_prompt: "",
-    is_default: true,
-  });
+    description: "",
+    model_id: null,
+    origin: "builtin",
+    enabled: true,
+    runtime_disabled: false,
+    schema_version: 1,
+    version_label: "",
+    aliases: [],
+    validation_error: null,
+    source_path: null,
+    instructions: "",
+    tools_mode: "inherit",
+    tools_allow: [],
+    delegation_enabled: true,
+    delegation_max_depth: 3,
+    delegation_max_children: 4,
+    max_steps: 25,
+    is_builtin: true,
+  };
+  const [activeBot, setActiveBot] = useState<AgentProfileRecord>(DEFAULT_PROFILE);
 
   const [takeover, setTakeover] = useState<TakeoverStatus>({
     is_active: false,
@@ -500,13 +518,30 @@ export const App: React.FC = () => {
 
   const loadDefaultBot = async () => {
     try {
-      const bots = await invoke<BotRecord[]>("list_bots");
-      if (Array.isArray(bots) && bots.length > 0) {
-        setActiveBot(bots[0]);
+      // The active profile persists in the settings store (selected_agent);
+      // an unknown or disabled id resolves back to the bundled default.
+      const [savedId, rawProfiles] = await Promise.all([
+        invoke<string>("get_selected_agent"),
+        invoke<AgentProfileRecord[]>("list_agent_profiles"),
+      ]);
+      const profiles = Array.isArray(rawProfiles) ? rawProfiles : [];
+      const profile = profiles.find((p) => p.id === savedId && p.enabled && !p.validation_error);
+      if (profile) {
+        setActiveBot(profile);
+      } else {
+        const fallback = profiles.find(
+          (p) => p.id === DEFAULT_PROFILE.id && p.enabled && !p.validation_error,
+        );
+        if (fallback) setActiveBot(fallback);
       }
     } catch (e) {
       console.error(e);
     }
+  };
+
+  const handleSelectAgent = (profile: AgentProfileRecord) => {
+    setActiveBot(profile);
+    invoke("save_selected_agent", { agentId: profile.id }).catch(console.error);
   };
 
   const loadConversations = async () => {
@@ -846,17 +881,15 @@ export const App: React.FC = () => {
     ]);
 
     try {
-      const systemPrompt = activeBot.system_prompt
-        ? `${activeBot.system_prompt}\nYou are responding as @${activeBot.name}.`
-        : null;
-
+      // The profile prompt is resolved engine-side (Stage C); the client can
+      // only choose an agent id, never supply instructions.
       const finalReply = await invoke<string>("run_agent_turn", {
         runId,
         conversationId: convId,
         model: selectedModel,
         botId: activeBot.id,
         history,
-        systemPrompt,
+        systemPrompt: null,
       });
 
       const assistantMsg: Message = {
@@ -2240,7 +2273,7 @@ export const App: React.FC = () => {
         onClose={() => setIsTeammatesOpen(false)}
         selectedBotId={activeBot.id}
         onSelectBot={(bot) => {
-          setActiveBot(bot);
+          handleSelectAgent(bot);
           setIsTeammatesOpen(false);
         }}
       />
@@ -2319,7 +2352,7 @@ export const App: React.FC = () => {
           setIsSettingsOpen(true);
         }}
         onSelectConversation={(id) => setActiveConvId(id)}
-        onSelectBot={(bot) => setActiveBot(bot)}
+        onSelectBot={handleSelectAgent}
       />
 
       {/* Confirmation Dialog for Session Deletion */}
