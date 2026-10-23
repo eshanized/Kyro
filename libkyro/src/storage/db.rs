@@ -291,6 +291,84 @@ pub struct ConnectorToolPolicyRecord {
     pub schema_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HabitSettingsRecord {
+    pub key: String,
+    pub enabled: bool,
+    pub min_occurrences: usize,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HabitSuggestionRecord {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub signature_hash: String,
+    pub occurrences: usize,
+    pub confidence: f32,
+    pub proposed_action_type: String, // "skill" | "prompt"
+    pub proposed_payload_json: String,
+    pub status: String, // "pending" | "accepted" | "dismissed" | "snoozed"
+    pub evidence_json: String,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentChunkRecord {
+    pub id: String,
+    pub document_path: String,
+    pub chunk_index: usize,
+    pub heading: Option<String>,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub content: String,
+    pub content_hash: String,
+    pub format: String,
+    pub chunk_version: u32,
+    pub indexed_at: i64,
+    pub embedding_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagSettingsRecord {
+    pub key: String,
+    pub embedding_mode: String, // "lexical_only" | "local_endpoint"
+    pub embedding_endpoint: Option<String>,
+    pub embedding_model: Option<String>,
+    pub max_candidates: usize,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeExperimentRecord {
+    pub id: String,
+    pub name: String,
+    pub run_id: Option<String>,
+    pub runtime: String,
+    pub image: String,
+    pub script: Option<String>,
+    pub argv_json: String,
+    pub workspace_path: Option<String>,
+    pub output_dir: Option<String>,
+    pub network_mode: String,
+    pub cpu_limit: f32,
+    pub memory_limit_mb: u64,
+    pub timeout_seconds: u64,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout_tail: Option<String>,
+    pub stderr_tail: Option<String>,
+    pub result_summary: Option<String>,
+    pub artifact_ids_json: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -725,6 +803,106 @@ impl Database {
             )?;
         }
 
+        // Migration 10: Local habit learning, Deep RAG chunking, and Sandboxed Code Experiments
+        let mut stmt10 = conn.prepare("SELECT 1 FROM schema_migrations WHERE version = 10")?;
+        let m10_exists = stmt10.exists([])?;
+        drop(stmt10);
+
+        if !m10_exists {
+            conn.execute_batch(
+                "BEGIN TRANSACTION;
+                CREATE TABLE IF NOT EXISTS habit_learning_settings (
+                    key TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    min_occurrences INTEGER NOT NULL DEFAULT 3,
+                    updated_at INTEGER NOT NULL
+                );
+
+                INSERT OR IGNORE INTO habit_learning_settings (key, enabled, min_occurrences, updated_at)
+                VALUES ('default', 0, 3, strftime('%s', 'now') * 1000);
+
+                CREATE TABLE IF NOT EXISTS habit_suggestions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    signature_hash TEXT NOT NULL UNIQUE,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    proposed_action_type TEXT NOT NULL,
+                    proposed_payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    evidence_json TEXT NOT NULL,
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_habit_sugg_status ON habit_suggestions(status);
+
+                CREATE TABLE IF NOT EXISTS document_chunks (
+                    id TEXT PRIMARY KEY,
+                    document_path TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    heading TEXT,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    chunk_version INTEGER NOT NULL DEFAULT 1,
+                    indexed_at INTEGER NOT NULL,
+                    embedding_json TEXT,
+                    FOREIGN KEY(document_path) REFERENCES document_index(path) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_doc_chunks_path ON document_chunks(document_path);
+                CREATE INDEX IF NOT EXISTS idx_doc_chunks_hash ON document_chunks(content_hash);
+
+                CREATE TABLE IF NOT EXISTS rag_settings (
+                    key TEXT PRIMARY KEY,
+                    embedding_mode TEXT NOT NULL DEFAULT 'lexical_only',
+                    embedding_endpoint TEXT,
+                    embedding_model TEXT,
+                    max_candidates INTEGER NOT NULL DEFAULT 5,
+                    updated_at INTEGER NOT NULL
+                );
+
+                INSERT OR IGNORE INTO rag_settings (key, embedding_mode, max_candidates, updated_at)
+                VALUES ('default', 'lexical_only', 5, strftime('%s', 'now') * 1000);
+
+                CREATE TABLE IF NOT EXISTS code_experiments (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    run_id TEXT,
+                    runtime TEXT NOT NULL,
+                    image TEXT NOT NULL,
+                    script TEXT,
+                    argv_json TEXT NOT NULL,
+                    workspace_path TEXT,
+                    output_dir TEXT,
+                    network_mode TEXT NOT NULL DEFAULT 'none',
+                    cpu_limit REAL NOT NULL DEFAULT 1.0,
+                    memory_limit_mb INTEGER NOT NULL DEFAULT 512,
+                    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    exit_code INTEGER,
+                    stdout_tail TEXT,
+                    stderr_tail TEXT,
+                    result_summary TEXT,
+                    artifact_ids_json TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    error TEXT,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_experiments_status ON code_experiments(status);
+                CREATE INDEX IF NOT EXISTS idx_experiments_run ON code_experiments(run_id);
+
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (10, 'habit_rag_and_experiments_schema', strftime('%s', 'now') * 1000);
+                COMMIT;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -784,6 +962,18 @@ impl Database {
             params![now],
         )?;
 
+        // Reconcile interrupted code_experiments so they are never left in 'running' or 'queued'
+        let exp_count = conn
+            .execute(
+                "UPDATE code_experiments
+             SET status = 'interrupted',
+                 completed_at = ?1,
+                 error = 'Experiment terminated unexpectedly during system restart'
+             WHERE status IN ('running', 'queued')",
+                params![now],
+            )
+            .unwrap_or(0);
+
         // Expire any lingering pending approvals from previous session
         conn.execute(
             "UPDATE approval_requests
@@ -794,7 +984,7 @@ impl Database {
             params![now],
         )?;
 
-        Ok(count + routine_count)
+        Ok(count + routine_count + exp_count)
     }
 
     // Conversations & Messages
@@ -3146,6 +3336,507 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    // --- Habit Learning ---
+
+    pub fn get_habit_settings(&self) -> Result<HabitSettingsRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, enabled, min_occurrences, updated_at FROM habit_learning_settings WHERE key = 'default'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(HabitSettingsRecord {
+                key: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                min_occurrences: row.get::<_, i64>(2)? as usize,
+                updated_at: row.get(3)?,
+            })
+        } else {
+            Ok(HabitSettingsRecord {
+                key: "default".into(),
+                enabled: false,
+                min_occurrences: 3,
+                updated_at: chrono::Utc::now().timestamp_millis(),
+            })
+        }
+    }
+
+    pub fn save_habit_settings(&self, settings: &HabitSettingsRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO habit_learning_settings (key, enabled, min_occurrences, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) DO UPDATE SET enabled = ?2, min_occurrences = ?3, updated_at = ?4",
+            params![
+                settings.key,
+                if settings.enabled { 1 } else { 0 },
+                settings.min_occurrences as i64,
+                settings.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_habit_suggestion(&self, s: &HabitSuggestionRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO habit_suggestions (
+                id, name, description, signature_hash, occurrences, confidence,
+                proposed_action_type, proposed_payload_json, status, evidence_json,
+                first_seen_at, last_seen_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(signature_hash) DO UPDATE SET
+                occurrences = ?5,
+                confidence = ?6,
+                evidence_json = ?10,
+                last_seen_at = ?12,
+                updated_at = ?13",
+            params![
+                s.id,
+                s.name,
+                s.description,
+                s.signature_hash,
+                s.occurrences as i64,
+                s.confidence,
+                s.proposed_action_type,
+                s.proposed_payload_json,
+                s.status,
+                s.evidence_json,
+                s.first_seen_at,
+                s.last_seen_at,
+                s.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_habit_suggestion(&self, id: &str) -> Result<Option<HabitSuggestionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, signature_hash, occurrences, confidence,
+                    proposed_action_type, proposed_payload_json, status, evidence_json,
+                    first_seen_at, last_seen_at, updated_at
+             FROM habit_suggestions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(HabitSuggestionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                signature_hash: row.get(3)?,
+                occurrences: row.get::<_, i64>(4)? as usize,
+                confidence: row.get(5)?,
+                proposed_action_type: row.get(6)?,
+                proposed_payload_json: row.get(7)?,
+                status: row.get(8)?,
+                evidence_json: row.get(9)?,
+                first_seen_at: row.get(10)?,
+                last_seen_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_habit_suggestions(
+        &self,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<HabitSuggestionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |row: &rusqlite::Row| {
+            Ok(HabitSuggestionRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                signature_hash: row.get(3)?,
+                occurrences: row.get::<_, i64>(4)? as usize,
+                confidence: row.get(5)?,
+                proposed_action_type: row.get(6)?,
+                proposed_payload_json: row.get(7)?,
+                status: row.get(8)?,
+                evidence_json: row.get(9)?,
+                first_seen_at: row.get(10)?,
+                last_seen_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        };
+        let mut list = Vec::new();
+        match status_filter {
+            Some(st) if !st.is_empty() && st != "all" => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, description, signature_hash, occurrences, confidence,
+                            proposed_action_type, proposed_payload_json, status, evidence_json,
+                            first_seen_at, last_seen_at, updated_at
+                     FROM habit_suggestions WHERE status = ?1 ORDER BY confidence DESC, updated_at DESC",
+                )?;
+                let rows = stmt.query_map(params![st], map_row)?;
+                for r in rows {
+                    list.push(r?);
+                }
+            }
+            _ => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, description, signature_hash, occurrences, confidence,
+                            proposed_action_type, proposed_payload_json, status, evidence_json,
+                            first_seen_at, last_seen_at, updated_at
+                     FROM habit_suggestions ORDER BY confidence DESC, updated_at DESC",
+                )?;
+                let rows = stmt.query_map([], map_row)?;
+                for r in rows {
+                    list.push(r?);
+                }
+            }
+        }
+        Ok(list)
+    }
+
+    pub fn update_habit_suggestion_status(&self, id: &str, status: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let count = conn.execute(
+            "UPDATE habit_suggestions SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now, id],
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn delete_habit_suggestion(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute("DELETE FROM habit_suggestions WHERE id = ?1", params![id])?;
+        Ok(count > 0)
+    }
+
+    pub fn clear_all_habit_data(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM habit_suggestions", [])?;
+        Ok(())
+    }
+
+    // --- Document Chunks & RAG ---
+
+    pub fn insert_document_chunks(
+        &self,
+        doc_path: &str,
+        chunks: &[DocumentChunkRecord],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM document_chunks WHERE document_path = ?1",
+            params![doc_path],
+        )?;
+        for c in chunks {
+            tx.execute(
+                "INSERT INTO document_chunks (
+                    id, document_path, chunk_index, heading, start_line, end_line,
+                    content, content_hash, format, chunk_version, indexed_at, embedding_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    c.id,
+                    c.document_path,
+                    c.chunk_index as i64,
+                    c.heading,
+                    c.start_line.map(|v| v as i64),
+                    c.end_line.map(|v| v as i64),
+                    c.content,
+                    c.content_hash,
+                    c.format,
+                    c.chunk_version as i64,
+                    c.indexed_at,
+                    c.embedding_json,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_chunks_for_document(&self, doc_path: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM document_chunks WHERE document_path = ?1",
+            params![doc_path],
+        )
+    }
+
+    pub fn get_chunks_for_document(&self, doc_path: &str) -> Result<Vec<DocumentChunkRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, document_path, chunk_index, heading, start_line, end_line,
+                    content, content_hash, format, chunk_version, indexed_at, embedding_json
+             FROM document_chunks WHERE document_path = ?1 ORDER BY chunk_index ASC",
+        )?;
+        let rows = stmt.query_map(params![doc_path], |row| {
+            Ok(DocumentChunkRecord {
+                id: row.get(0)?,
+                document_path: row.get(1)?,
+                chunk_index: row.get::<_, i64>(2)? as usize,
+                heading: row.get(3)?,
+                start_line: row.get::<_, Option<i64>>(4)?.map(|v| v as usize),
+                end_line: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+                content: row.get(6)?,
+                content_hash: row.get(7)?,
+                format: row.get(8)?,
+                chunk_version: row.get::<_, i64>(9)? as u32,
+                indexed_at: row.get(10)?,
+                embedding_json: row.get(11)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn list_all_chunks(&self) -> Result<Vec<DocumentChunkRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, document_path, chunk_index, heading, start_line, end_line,
+                    content, content_hash, format, chunk_version, indexed_at, embedding_json
+             FROM document_chunks ORDER BY indexed_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DocumentChunkRecord {
+                id: row.get(0)?,
+                document_path: row.get(1)?,
+                chunk_index: row.get::<_, i64>(2)? as usize,
+                heading: row.get(3)?,
+                start_line: row.get::<_, Option<i64>>(4)?.map(|v| v as usize),
+                end_line: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+                content: row.get(6)?,
+                content_hash: row.get(7)?,
+                format: row.get(8)?,
+                chunk_version: row.get::<_, i64>(9)? as u32,
+                indexed_at: row.get(10)?,
+                embedding_json: row.get(11)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn clear_all_chunks(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM document_chunks", [])
+    }
+
+    pub fn get_rag_settings(&self) -> Result<RagSettingsRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, embedding_mode, embedding_endpoint, embedding_model, max_candidates, updated_at FROM rag_settings WHERE key = 'default'")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(RagSettingsRecord {
+                key: row.get(0)?,
+                embedding_mode: row.get(1)?,
+                embedding_endpoint: row.get(2)?,
+                embedding_model: row.get(3)?,
+                max_candidates: row.get::<_, i64>(4)? as usize,
+                updated_at: row.get(5)?,
+            })
+        } else {
+            Ok(RagSettingsRecord {
+                key: "default".into(),
+                embedding_mode: "lexical_only".into(),
+                embedding_endpoint: None,
+                embedding_model: None,
+                max_candidates: 5,
+                updated_at: chrono::Utc::now().timestamp_millis(),
+            })
+        }
+    }
+
+    pub fn save_rag_settings(&self, settings: &RagSettingsRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO rag_settings (key, embedding_mode, embedding_endpoint, embedding_model, max_candidates, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(key) DO UPDATE SET
+                embedding_mode = ?2,
+                embedding_endpoint = ?3,
+                embedding_model = ?4,
+                max_candidates = ?5,
+                updated_at = ?6",
+            params![
+                settings.key,
+                settings.embedding_mode,
+                settings.embedding_endpoint,
+                settings.embedding_model,
+                settings.max_candidates as i64,
+                settings.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    // --- Code Experiments ---
+
+    pub fn create_code_experiment(&self, exp: &CodeExperimentRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO code_experiments (
+                id, name, run_id, runtime, image, script, argv_json,
+                workspace_path, output_dir, network_mode, cpu_limit,
+                memory_limit_mb, timeout_seconds, status, exit_code,
+                stdout_tail, stderr_tail, result_summary, artifact_ids_json,
+                created_at, started_at, completed_at, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            params![
+                exp.id,
+                exp.name,
+                exp.run_id,
+                exp.runtime,
+                exp.image,
+                exp.script,
+                exp.argv_json,
+                exp.workspace_path,
+                exp.output_dir,
+                exp.network_mode,
+                exp.cpu_limit,
+                exp.memory_limit_mb as i64,
+                exp.timeout_seconds as i64,
+                exp.status,
+                exp.exit_code,
+                exp.stdout_tail,
+                exp.stderr_tail,
+                exp.result_summary,
+                exp.artifact_ids_json,
+                exp.created_at,
+                exp.started_at,
+                exp.completed_at,
+                exp.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_code_experiment(&self, exp: &CodeExperimentRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE code_experiments SET
+                name = ?2,
+                status = ?3,
+                exit_code = ?4,
+                stdout_tail = ?5,
+                stderr_tail = ?6,
+                result_summary = ?7,
+                artifact_ids_json = ?8,
+                started_at = ?9,
+                completed_at = ?10,
+                error = ?11
+             WHERE id = ?1",
+            params![
+                exp.id,
+                exp.name,
+                exp.status,
+                exp.exit_code,
+                exp.stdout_tail,
+                exp.stderr_tail,
+                exp.result_summary,
+                exp.artifact_ids_json,
+                exp.started_at,
+                exp.completed_at,
+                exp.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_code_experiment(&self, id: &str) -> Result<Option<CodeExperimentRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, run_id, runtime, image, script, argv_json,
+                    workspace_path, output_dir, network_mode, cpu_limit,
+                    memory_limit_mb, timeout_seconds, status, exit_code,
+                    stdout_tail, stderr_tail, result_summary, artifact_ids_json,
+                    created_at, started_at, completed_at, error
+             FROM code_experiments WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(CodeExperimentRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                run_id: row.get(2)?,
+                runtime: row.get(3)?,
+                image: row.get(4)?,
+                script: row.get(5)?,
+                argv_json: row.get(6)?,
+                workspace_path: row.get(7)?,
+                output_dir: row.get(8)?,
+                network_mode: row.get(9)?,
+                cpu_limit: row.get(10)?,
+                memory_limit_mb: row.get::<_, i64>(11)? as u64,
+                timeout_seconds: row.get::<_, i64>(12)? as u64,
+                status: row.get(13)?,
+                exit_code: row.get(14)?,
+                stdout_tail: row.get(15)?,
+                stderr_tail: row.get(16)?,
+                result_summary: row.get(17)?,
+                artifact_ids_json: row.get(18)?,
+                created_at: row.get(19)?,
+                started_at: row.get(20)?,
+                completed_at: row.get(21)?,
+                error: row.get(22)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_code_experiments(&self, limit: usize) -> Result<Vec<CodeExperimentRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, run_id, runtime, image, script, argv_json,
+                    workspace_path, output_dir, network_mode, cpu_limit,
+                    memory_limit_mb, timeout_seconds, status, exit_code,
+                    stdout_tail, stderr_tail, result_summary, artifact_ids_json,
+                    created_at, started_at, completed_at, error
+             FROM code_experiments ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(CodeExperimentRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                run_id: row.get(2)?,
+                runtime: row.get(3)?,
+                image: row.get(4)?,
+                script: row.get(5)?,
+                argv_json: row.get(6)?,
+                workspace_path: row.get(7)?,
+                output_dir: row.get(8)?,
+                network_mode: row.get(9)?,
+                cpu_limit: row.get(10)?,
+                memory_limit_mb: row.get::<_, i64>(11)? as u64,
+                timeout_seconds: row.get::<_, i64>(12)? as u64,
+                status: row.get(13)?,
+                exit_code: row.get(14)?,
+                stdout_tail: row.get(15)?,
+                stderr_tail: row.get(16)?,
+                result_summary: row.get(17)?,
+                artifact_ids_json: row.get(18)?,
+                created_at: row.get(19)?,
+                started_at: row.get(20)?,
+                completed_at: row.get(21)?,
+                error: row.get(22)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn delete_code_experiment(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute("DELETE FROM code_experiments WHERE id = ?1", params![id])?;
+        Ok(count > 0)
     }
 }
 
