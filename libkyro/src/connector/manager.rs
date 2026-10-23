@@ -487,6 +487,19 @@ impl ConnectorManager {
             ));
         }
 
+        let client_secret_opt = if connector_id == "github" {
+            client_secret_opt
+                .filter(|secret| !secret.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("KYRO_GITHUB_CLIENT_SECRET")
+                        .ok()
+                        .filter(|secret| !secret.trim().is_empty())
+                })
+                .map(|secret| secret.trim().to_string())
+        } else {
+            client_secret_opt
+        };
+
         let (state, code_verifier, code_challenge) = OAuthManager::generate_pkce();
         let session_id = format!("oauth_{}", uuid::Uuid::new_v4());
 
@@ -506,6 +519,9 @@ impl ConnectorManager {
                 .unwrap_or_else(|| std::env::var("KYRO_GITHUB_CLIENT_ID").unwrap_or_default());
             if cid.trim().is_empty() {
                 return Err("GitHub OAuth requires a Client ID. Set KYRO_GITHUB_CLIENT_ID in the process environment or enter it in the connection modal.".to_string());
+            }
+            if client_secret_opt.is_none() {
+                return Err("GitHub OAuth authorization-code flow requires a Client Secret. Enter it in the connection modal or configure KYRO_GITHUB_CLIENT_SECRET in the process environment. Alternatively, connect using a Personal Access Token.".to_string());
             }
             let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize")
                 .map_err(|e| format!("Failed to parse GitHub OAuth URL: {}", e))?;
