@@ -1,6 +1,12 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { RoutineRecord, SkillRecord, SkillStep } from "../types/agent";
+import {
+  HabitSettingsRecord,
+  HabitSuggestionRecord,
+  RoutineRecord,
+  SkillRecord,
+  SkillStep,
+} from "../types/agent";
 import {
   Play,
   Trash2,
@@ -13,13 +19,16 @@ import {
   Search,
   AlertTriangle,
   Info,
+  Sparkles,
+  CheckCircle2,
+  Shield,
 } from "lucide-react";
 import { InlineNotice } from "./InlineNotice";
 
 interface TeachTaskModalProps {
   isOpen: boolean;
   onClose: () => void;
-  initialTab?: "skills" | "record" | "routines";
+  initialTab?: "skills" | "record" | "routines" | "suggested";
   highlightTaskId?: string;
 }
 
@@ -36,13 +45,22 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
   initialTab = "skills",
   highlightTaskId,
 }) => {
-  const [activeTab, setActiveTab] = useState<"skills" | "record" | "routines">(initialTab);
+  const [activeTab, setActiveTab] = useState<"skills" | "record" | "routines" | "suggested">(initialTab);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [routines, setRoutines] = useState<RoutineRecord[]>([]);
+  const [suggestions, setSuggestions] = useState<HabitSuggestionRecord[]>([]);
+  const [habitSettings, setHabitSettings] = useState<HabitSettingsRecord | null>(null);
+  const [isAnalyzingHabits, setIsAnalyzingHabits] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordName, setRecordName] = useState("");
   const [recordDesc, setRecordDesc] = useState("");
   const [replayingId, setReplayingId] = useState<string | null>(null);
+
+  // Accept suggestion modal state
+  const [acceptingSuggestion, setAcceptingSuggestion] = useState<HabitSuggestionRecord | null>(null);
+  const [acceptCustomName, setAcceptCustomName] = useState("");
+  const [acceptCustomCron, setAcceptCustomCron] = useState("0 9 * * 1-5");
+  const [isAccepting, setIsAccepting] = useState(false);
 
   // Search & Filter state
   const [skillSearchQuery, setSkillSearchQuery] = useState("");
@@ -105,8 +123,102 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
       if (Array.isArray(r)) {
         setRoutines(r);
       }
+      const hs = await invoke<HabitSettingsRecord>("get_habit_learning_settings");
+      setHabitSettings(hs);
+      const sugg = await invoke<HabitSuggestionRecord[]>("list_habit_suggestions", { status: null });
+      if (Array.isArray(sugg)) {
+        setSuggestions(sugg);
+      }
     } catch (e) {
       console.error("Failed to load task and routine data:", e);
+    }
+  };
+
+  const handleToggleHabitLearning = async (enabled: boolean) => {
+    try {
+      const updated: HabitSettingsRecord = {
+        key: "default",
+        enabled,
+        min_occurrences: habitSettings?.min_occurrences || 3,
+        updated_at: Date.now(),
+      };
+      await invoke("save_habit_learning_settings", { settings: updated });
+      setHabitSettings(updated);
+      setNotice({
+        tone: "success",
+        message: enabled
+          ? "Habit learning enabled. Kyro will analyze completed successful runs."
+          : "Habit learning disabled. No further workflow observations will occur.",
+      });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to update habit settings: " + err });
+    }
+  };
+
+  const handleAnalyzeHabits = async () => {
+    setIsAnalyzingHabits(true);
+    try {
+      const res = await invoke<HabitSuggestionRecord[]>("analyze_habits_now");
+      if (Array.isArray(res)) {
+        const fresh = await invoke<HabitSuggestionRecord[]>("list_habit_suggestions", { status: null });
+        setSuggestions(fresh);
+        setNotice({
+          tone: "info",
+          message:
+            res.length > 0
+              ? `Discovered ${res.length} recurring workflow pattern(s).`
+              : "No new repeated workflows discovered. Patterns require at least 3 completed successful executions.",
+        });
+      }
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Analysis failed: " + err });
+    } finally {
+      setIsAnalyzingHabits(false);
+    }
+  };
+
+  const handleDismissSuggestion = async (id: string) => {
+    try {
+      await invoke("dismiss_habit_suggestion", { suggestionId: id });
+      setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, status: "dismissed" } : s)));
+      setNotice({ tone: "info", message: "Suggestion dismissed." });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to dismiss suggestion: " + err });
+    }
+  };
+
+  const handleSnoozeSuggestion = async (id: string) => {
+    try {
+      await invoke("snooze_habit_suggestion", { suggestionId: id });
+      setSuggestions((prev) => prev.map((s) => (s.id === id ? { ...s, status: "snoozed" } : s)));
+      setNotice({ tone: "info", message: "Suggestion snoozed." });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to snooze suggestion: " + err });
+    }
+  };
+
+  const handleConfirmAcceptSuggestion = async () => {
+    if (!acceptingSuggestion) return;
+    setIsAccepting(true);
+    try {
+      const created = await invoke<RoutineRecord>("accept_habit_suggestion", {
+        suggestionId: acceptingSuggestion.id,
+        customName: acceptCustomName.trim() || undefined,
+        cron: acceptCustomCron.trim() || undefined,
+      });
+      setSuggestions((prev) =>
+        prev.map((s) => (s.id === acceptingSuggestion.id ? { ...s, status: "accepted" } : s))
+      );
+      setRoutines((prev) => [created, ...prev]);
+      setAcceptingSuggestion(null);
+      setNotice({
+        tone: "success",
+        message: `Routine "${created.name}" created in DISABLED state for review. You can safely edit schedule and enable it in the Routines tab.`,
+      });
+    } catch (err: any) {
+      setNotice({ tone: "error", message: "Failed to accept suggestion: " + err });
+    } finally {
+      setIsAccepting(false);
     }
   };
 
@@ -331,6 +443,19 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
             }`}
           >
             <Calendar className="w-3.5 h-3.5" /> Routine Schedules ({routines.length})
+          </button>
+          <button
+            onClick={() => {
+              setActiveTab("suggested");
+              setSelectedRoutine(null);
+            }}
+            className={`py-3 px-3.5 border-b-2 flex items-center gap-1.5 transition ${
+              activeTab === "suggested"
+                ? "border-neutral-100 text-neutral-100 font-semibold"
+                : "border-transparent text-neutral-400 hover:text-neutral-200"
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" /> Suggested Routines ({suggestions.filter((s) => s.status === "pending").length})
           </button>
         </div>
 
@@ -740,8 +865,241 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
               )}
             </div>
           )}
+
+          {/* TAB 4: SUGGESTED ROUTINES */}
+          {activeTab === "suggested" && (
+            <div className="space-y-5">
+              {/* Privacy & Settings Banner */}
+              <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl space-y-3 text-xs text-neutral-300">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold text-neutral-100 flex items-center gap-1.5">
+                    <Shield className="w-4 h-4 text-green-400" /> Local Habit Learning & Routine Suggestions
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => handleToggleHabitLearning(!habitSettings?.enabled)}
+                      className={`px-3 py-1 rounded-lg text-xs font-medium transition ${
+                        habitSettings?.enabled
+                          ? "bg-green-950/60 text-green-300 border border-green-500/40 hover:bg-green-900/60"
+                          : "bg-neutral-800 text-neutral-400 border border-neutral-700 hover:text-neutral-200"
+                      }`}
+                    >
+                      {habitSettings?.enabled ? "Learning: Enabled" : "Learning: Disabled (Default)"}
+                    </button>
+                    <button
+                      onClick={handleAnalyzeHabits}
+                      disabled={isAnalyzingHabits || !habitSettings?.enabled}
+                      className="px-3 py-1 bg-amber-500/10 border border-amber-500/30 hover:bg-amber-500/20 text-amber-300 rounded-lg text-xs font-medium flex items-center gap-1.5 disabled:opacity-40 transition"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      {isAnalyzingHabits ? "Scanning..." : "Scan For Habits"}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-neutral-400 leading-relaxed">
+                  Kyro deterministically analyzes completed, successful workflows to discover repetitive workflows.
+                  Credentials, tokens, passwords, and private files are never stored or learned.
+                  Newly learned routines remain <strong>disabled</strong> until explicitly turned on by you.
+                </p>
+              </div>
+
+              {/* Suggestions List */}
+              {suggestions.length === 0 ? (
+                <div className="p-10 text-center border border-dashed border-[#262626] rounded-xl text-neutral-500 text-xs space-y-2">
+                  <Sparkles className="w-6 h-6 mx-auto text-neutral-600" />
+                  <p className="font-medium text-neutral-400">No routine suggestions available yet</p>
+                  <p>
+                    Enable habit learning and run repeated workflows (e.g., project tests, build checks, audits) at least 3 times.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {suggestions.map((sug) => {
+                    let evidenceItems: any[] = [];
+                    try {
+                      evidenceItems = JSON.parse(sug.evidence_json);
+                    } catch {
+                      // ignore
+                    }
+
+                    return (
+                      <div
+                        key={sug.id}
+                        className={`p-4 bg-[#171717] border rounded-xl space-y-3 text-xs transition ${
+                          sug.status === "pending"
+                            ? "border-amber-500/30 hover:border-amber-500/50"
+                            : sug.status === "accepted"
+                            ? "border-green-500/30 opacity-75"
+                            : "border-neutral-800 opacity-60"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-neutral-100 text-sm">{sug.name}</span>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                              {(sug.confidence * 100).toFixed(0)}% Confidence
+                            </span>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-neutral-800 text-neutral-300">
+                              Observed {sug.occurrences}x
+                            </span>
+                          </div>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase ${
+                              sug.status === "pending"
+                                ? "text-amber-400"
+                                : sug.status === "accepted"
+                                ? "text-green-400"
+                                : "text-neutral-500"
+                            }`}
+                          >
+                            {sug.status}
+                          </span>
+                        </div>
+
+                        <p className="text-neutral-300 leading-relaxed">{sug.description}</p>
+
+                        {/* Evidence breakdown */}
+                        {evidenceItems.length > 0 && (
+                          <div className="p-2.5 bg-[#0a0a0a] border border-[#262626] rounded-lg space-y-1.5">
+                            <span className="text-[10px] uppercase font-semibold text-neutral-500 block">
+                              Observed Supporting Evidence
+                            </span>
+                            <div className="space-y-1">
+                              {evidenceItems.slice(0, 3).map((ev: any, idx: number) => (
+                                <div key={idx} className="flex items-center justify-between text-[11px] text-neutral-400">
+                                  <span className="font-mono text-neutral-300 truncate max-w-[280px]">
+                                    {ev.summary || `Run ${ev.run_id}`}
+                                  </span>
+                                  <span className="text-neutral-500 font-mono text-[10px]">
+                                    {new Date(ev.timestamp).toLocaleDateString()}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Action buttons */}
+                        <div className="flex items-center justify-end gap-2 pt-1 border-t border-[#262626]">
+                          {sug.status === "pending" && (
+                            <>
+                              <button
+                                onClick={() => handleDismissSuggestion(sug.id)}
+                                className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-200 rounded-lg text-xs transition"
+                              >
+                                Dismiss
+                              </button>
+                              <button
+                                onClick={() => handleSnoozeSuggestion(sug.id)}
+                                className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs transition"
+                              >
+                                Snooze
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setAcceptingSuggestion(sug);
+                                  setAcceptCustomName(sug.name);
+                                }}
+                                className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-semibold rounded-lg text-xs flex items-center gap-1.5 transition shadow"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" /> Accept into Routines
+                              </button>
+                            </>
+                          )}
+                          {sug.status === "accepted" && (
+                            <span className="text-green-400 text-xs flex items-center gap-1">
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Saved in Routines (Disabled until enabled by you)
+                            </span>
+                          )}
+                          {sug.status === "dismissed" && (
+                            <span className="text-neutral-500 text-xs">Dismissed</span>
+                          )}
+                          {sug.status === "snoozed" && (
+                            <span className="text-neutral-500 text-xs">Snoozed</span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
+
+      {/* ACCEPT SUGGESTION REVIEW MODAL */}
+      {acceptingSuggestion && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div className="w-full max-w-lg bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-[#262626] pb-3">
+              <h3 className="text-base font-semibold text-neutral-100 flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-amber-400" /> Review & Accept Suggested Routine
+              </h3>
+              <button
+                onClick={() => setAcceptingSuggestion(null)}
+                className="p-1 text-neutral-400 hover:text-neutral-100 rounded-lg"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block text-neutral-400 mb-1">Routine Name</label>
+                <input
+                  type="text"
+                  value={acceptCustomName}
+                  onChange={(e) => setAcceptCustomName(e.target.value)}
+                  className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-neutral-100 focus:outline-none focus:border-neutral-400"
+                />
+              </div>
+
+              <div>
+                <label className="block text-neutral-400 mb-1">Cron Schedule (UTC)</label>
+                <input
+                  type="text"
+                  value={acceptCustomCron}
+                  onChange={(e) => setAcceptCustomCron(e.target.value)}
+                  placeholder="0 9 * * 1-5"
+                  className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-neutral-100 font-mono focus:outline-none focus:border-neutral-400"
+                />
+                <span className="text-[10px] text-neutral-500 mt-1 block">
+                  Example: &quot;0 9 * * 1-5&quot; (Mon-Fri 9:00 AM) or &quot;*/30 * * * *&quot; (Every 30 minutes)
+                </span>
+              </div>
+
+              {/* Safety notice */}
+              <div className="p-3 bg-amber-950/30 border border-amber-500/30 rounded-xl text-amber-300 flex items-start gap-2">
+                <Shield className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>
+                  <strong>Safety First:</strong> This newly learned routine will be saved in a <strong>DISABLED</strong> state.
+                  It will not run automatically until you explicitly review parameters and toggle it on in Routine Schedules.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setAcceptingSuggestion(null)}
+                disabled={isAccepting}
+                className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 rounded-xl text-xs font-medium transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmAcceptSuggestion}
+                disabled={isAccepting}
+                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-black rounded-xl text-xs font-semibold flex items-center gap-2 transition shadow"
+              >
+                {isAccepting ? "Creating..." : "Confirm & Create Disabled Routine"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* EXPLICIT CONFIRMATION DIALOG */}
       {taskToDelete && (
