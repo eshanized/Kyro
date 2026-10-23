@@ -780,8 +780,18 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
     assert!(google_missing_cid.is_err());
     assert!(google_missing_cid.unwrap_err().contains("Client ID"));
 
-    let gh_init = conn_mgr
+    let gh_missing_secret = conn_mgr
         .start_oauth_flow("github", Some("test_client_id".to_string()), None)
+        .await;
+    assert!(gh_missing_secret.is_err());
+    assert!(gh_missing_secret.unwrap_err().contains("Client Secret"));
+
+    let gh_init = conn_mgr
+        .start_oauth_flow(
+            "github",
+            Some("test_client_id".to_string()),
+            Some("test_client_secret".to_string()),
+        )
         .await;
     assert!(gh_init.is_ok());
     let init_res = gh_init.unwrap();
@@ -810,6 +820,7 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
 
     let status_missing = conn_mgr.get_oauth_status("missing_session_xyz").await;
     assert!(status_missing.is_err());
+    conn_mgr.cancel_oauth_flow(&init_res.session_id).await.unwrap();
 
     // 3. refresh_account_token validation
     // Non-existent account
