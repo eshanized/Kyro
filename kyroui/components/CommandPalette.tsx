@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { SearchResultItem, BotRecord } from "../types/agent";
+import { AgentProfileRecord, SearchResultItem } from "../types/agent";
 import {
   Search,
   Plus,
@@ -18,10 +18,9 @@ import {
   Clock,
   ArrowRight,
   Plug,
-  Zap,
-  Globe,
   Workflow,
 } from "lucide-react";
+import { getAgentIconComponent } from "./AgentAvatar";
 
 interface CommandPaletteProps {
   isOpen: boolean;
@@ -37,7 +36,7 @@ interface CommandPaletteProps {
   onOpenArtifacts: () => void;
   onOpenSettings: (tab?: string) => void;
   onSelectConversation: (id: string) => void;
-  onSelectBot: (bot: BotRecord) => void;
+  onSelectBot: (bot: AgentProfileRecord) => void;
 }
 
 interface ActionCommand {
@@ -48,6 +47,13 @@ interface ActionCommand {
   category: "Actions" | "Teammates" | "Views";
   execute: () => void;
 }
+
+/** Shipped profiles keep their stable palette ids for hotkeys/scripts. */
+const STABLE_TEAMMATE_IDS: Record<string, { actionId: string }> = {
+  "apex-orchestrator": { actionId: "switch-apex" },
+  "forge-devops": { actionId: "switch-forge" },
+  "scout-web": { actionId: "switch-scout" },
+};
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
   isOpen,
@@ -67,6 +73,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
 }) => {
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
+  const [teammates, setTeammates] = useState<AgentProfileRecord[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -76,6 +83,15 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       setSearchResults([]);
       setSelectedIndex(0);
       setTimeout(() => inputRef.current?.focus(), 50);
+      // The teammate switch list is registry-driven: any profile (custom
+      // included) is selectable; shipped ones keep stable action ids.
+      invoke<AgentProfileRecord[]>("list_agent_profiles")
+        .then((profiles) =>
+          setTeammates(
+            Array.isArray(profiles) ? profiles.filter((p) => p.enabled && !p.validation_error) : [],
+          ),
+        )
+        .catch(() => setTeammates([]));
     }
   }, [isOpen]);
 
@@ -241,60 +257,29 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         onClose();
       },
     },
-    {
-      id: "switch-apex",
-      title: "Switch to @Apex",
-      subtitle: "General Workspace & Strategic Orchestrator",
-      icon: <Zap className="w-4 h-4 text-neutral-300" />,
-      category: "Teammates",
-      execute: () => {
-        onSelectBot({
-          id: "apex-orchestrator",
-          name: "Apex",
-          avatar: "zap",
-          role: "General Workspace & Strategic Orchestrator",
-          system_prompt: "",
-          is_default: true,
-        });
-        onClose();
-      },
-    },
-    {
-      id: "switch-forge",
-      title: "Switch to @Forge",
-      subtitle: "DevOps, Code & Terminal Specialist",
-      icon: <Wrench className="w-4 h-4 text-neutral-300" />,
-      category: "Teammates",
-      execute: () => {
-        onSelectBot({
-          id: "forge-devops",
-          name: "Forge",
-          avatar: "wrench",
-          role: "DevOps, Code & Terminal Specialist",
-          system_prompt: "",
-          is_default: false,
-        });
-        onClose();
-      },
-    },
-    {
-      id: "switch-scout",
-      title: "Switch to @Scout",
-      subtitle: "Browser Automation & Web Researcher",
-      icon: <Globe className="w-4 h-4 text-neutral-300" />,
-      category: "Teammates",
-      execute: () => {
-        onSelectBot({
-          id: "scout-web",
-          name: "Scout",
-          avatar: "globe",
-          role: "Browser Automation & Web Researcher",
-          system_prompt: "",
-          is_default: false,
-        });
-        onClose();
-      },
-    },
+    // Teammates come from the agent registry (Markdown profiles), always
+    // naming the shipped trio first so hotkeys stay stable across reloads.
+    ...teammates
+      .slice()
+      .sort((a, b) => {
+        const orderA = a.id in STABLE_TEAMMATE_IDS ? 0 : 1;
+        const orderB = b.id in STABLE_TEAMMATE_IDS ? 0 : 1;
+        return orderA !== orderB ? orderA - orderB : a.name.localeCompare(b.name);
+      })
+      .map((p) => ({
+        id: STABLE_TEAMMATE_IDS[p.id]?.actionId ?? `switch-${p.id}`,
+        title: `Switch to @${p.name}`,
+        subtitle: p.role || p.id,
+        icon: React.createElement(
+          getAgentIconComponent(p.avatar, p.name),
+          { className: "w-4 h-4 text-neutral-300" } as { className?: string },
+        ),
+        category: "Teammates" as const,
+        execute: () => {
+          onSelectBot(p);
+          onClose();
+        },
+      })),
   ];
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
