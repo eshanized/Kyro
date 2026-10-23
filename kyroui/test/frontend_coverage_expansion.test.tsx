@@ -292,42 +292,58 @@ describe("TodayDashboardView Rejection & Quick Actions", () => {
 });
 
 describe("TeammateRosterModal Creation & Deletion Flow", () => {
-  const mockBots = [
-    {
-      id: "bot_1",
-      name: "DocuBot",
-      avatar: "book",
-      role: "Documentation Writer",
-      system_prompt: "Write markdown documentation",
-      is_default: false,
-    },
-  ];
+  const mockProfile = {
+    id: "sentinel-reviewer",
+    name: "Sentinel",
+    avatar: "shield",
+    role: "Static analysis & review",
+    description: "Reviews changes",
+    model_id: null,
+    origin: "custom",
+    enabled: true,
+    runtime_disabled: false,
+    schema_version: 1,
+    version_label: "v1:def456",
+    aliases: [],
+    validation_error: null,
+    source_path: "/tmp/agents/custom/sentinel-reviewer.md",
+    instructions: "You are Sentinel.",
+    tools_mode: "inherit",
+    tools_allow: [],
+    delegation_enabled: true,
+    delegation_max_depth: 3,
+    delegation_max_children: 4,
+    max_steps: 25,
+    is_builtin: false,
+  };
 
   const mockStatuses = [
     {
-      id: "bot_1",
+      id: "sentinel-reviewer",
       state: "busy",
       current_task: "Compiling Architecture.md",
+      active_tasks: [{ run_id: "run_1", objective: "Compiling Architecture.md" }],
     },
   ];
 
   beforeEach(() => {
     vi.clearAllMocks();
-    (invoke as any).mockImplementation((cmd: string) => {
-      if (cmd === "list_bots") return Promise.resolve(mockBots);
+    (invoke as any).mockImplementation((cmd: string, _args?: any) => {
+      if (cmd === "list_agent_profiles") return Promise.resolve([mockProfile]);
       if (cmd === "get_roster_statuses") return Promise.resolve(mockStatuses);
-      if (cmd === "create_bot") return Promise.resolve(mockBots[0]);
-      if (cmd === "delete_bot") return Promise.resolve(true);
+      if (cmd === "create_agent_profile") return Promise.resolve(mockProfile);
+      if (cmd === "delete_agent_profile") return Promise.resolve("custom");
+      if (cmd === "set_agent_profile_enabled") return Promise.resolve();
       return Promise.resolve(null);
     });
   });
 
-  it("creates a new specialist bot and displays busy status", async () => {
+  it("creates a new specialist profile and displays busy status", async () => {
     render(
       <TeammateRosterModal
         isOpen={true}
         onClose={vi.fn()}
-        selectedBotId="bot_1"
+        selectedBotId="sentinel-reviewer"
         onSelectBot={vi.fn()}
       />
     );
@@ -336,22 +352,23 @@ describe("TeammateRosterModal Creation & Deletion Flow", () => {
       expect(screen.getByText(/Compiling Architecture\.md/i)).toBeInTheDocument();
     });
 
-    const addBtn = screen.getByRole("button", { name: /Add Teammate/i });
-    fireEvent.click(addBtn);
+    fireEvent.click(screen.getByRole("button", { name: /Add Teammate/i }));
 
-    const nameInput = screen.getByPlaceholderText(/Name \(e\.g\. Sentinel\)/i);
+    const idInput = screen.getByPlaceholderText(/sentinel-reviewer/i);
+    const nameInput = screen.getByPlaceholderText(/^Sentinel$/i);
     const roleInput = screen.getByPlaceholderText(/Role \(e\.g\. Code Review & Static Analysis Specialist\)/i);
+    fireEvent.change(idInput, { target: { value: "sentinel-reviewer" } });
     fireEvent.change(nameInput, { target: { value: "Sentinel" } });
     fireEvent.change(roleInput, { target: { value: "Security Analyst" } });
 
-    const createBtn = screen.getByRole("button", { name: /Save Teammate/i });
-    fireEvent.click(createBtn);
+    fireEvent.click(screen.getByRole("button", { name: /Create Teammate/i }));
 
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith(
-        "create_bot",
+        "create_agent_profile",
         expect.objectContaining({
-          bot: expect.objectContaining({
+          request: expect.objectContaining({
+            id: "sentinel-reviewer",
             name: "Sentinel",
             role: "Security Analyst",
           }),
@@ -360,7 +377,7 @@ describe("TeammateRosterModal Creation & Deletion Flow", () => {
     });
   });
 
-  it("deletes a specialist bot after confirmation", async () => {
+  it("deletes a custom profile after confirmation", async () => {
     render(
       <TeammateRosterModal
         isOpen={true}
@@ -370,17 +387,24 @@ describe("TeammateRosterModal Creation & Deletion Flow", () => {
       />
     );
 
+    // Expand the profile actions to reach the delete control.
     await waitFor(() => {
-      expect(screen.getByLabelText("Remove teammate DocuBot")).toBeInTheDocument();
+      expect(screen.getByText("@Sentinel")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByLabelText("Remove teammate DocuBot"));
+    const manage = screen.getAllByTitle("Manage")[0];
+    fireEvent.click(manage);
 
-    const confirmBtn = screen.getByRole("button", { name: /^Remove teammate$/i });
-    fireEvent.click(confirmBtn);
+    const deleteBtn = await screen.findByRole("button", { name: /Delete profile/i });
+    fireEvent.click(deleteBtn);
+
+    // The confirm dialog carries the same accessible name; it renders after
+    // the roster card, so take the last match.
+    const confirmBtns = screen.getAllByRole("button", { name: /^Delete profile$/i });
+    fireEvent.click(confirmBtns[confirmBtns.length - 1]);
 
     await waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith("delete_bot", { id: "bot_1" });
+      expect(invoke).toHaveBeenCalledWith("delete_agent_profile", { id: "sentinel-reviewer" });
     });
   });
 });
