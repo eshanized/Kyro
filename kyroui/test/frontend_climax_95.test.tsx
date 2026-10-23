@@ -527,7 +527,7 @@ describe("Frontend Climax to >= 95% Coverage", () => {
     const teamBtn = screen.getByRole("button", { name: "Change" });
     fireEvent.click(teamBtn);
     await waitFor(() => {
-      expect(screen.getByText("Teammate Roster & Multi-Agent State")).toBeInTheDocument();
+      expect(screen.getByText("Teammate Roster & Agent Profiles")).toBeInTheDocument();
     });
     // Close team modal
     const closeBtns = screen.getAllByRole("button");
