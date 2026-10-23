@@ -249,24 +249,45 @@ describe("Comprehensive UI Modals & Subsystems", () => {
   });
 
   describe("TeammateRosterModal", () => {
-    it("renders bots list and selects bot", async () => {
+    it("renders agent profiles and selects a teammate", async () => {
       const onSelectBot = vi.fn();
       (invoke as any).mockImplementation((cmd: string) => {
-        if (cmd === "list_bots") {
+        if (cmd === "list_agent_profiles") {
           return Promise.resolve([
             {
-              id: "bot_1",
+              id: "apex-orchestrator",
               name: "Apex",
               avatar: "zap",
               role: "Lead Agent",
-              system_prompt: "Coordinate tasks",
-              is_default: true,
+              description: "",
+              model_id: null,
+              origin: "builtin",
+              enabled: true,
+              runtime_disabled: false,
+              schema_version: 1,
+              version_label: "v1:abc123",
+              aliases: ["apex"],
+              validation_error: null,
+              source_path: null,
+              instructions: "",
+              tools_mode: "inherit",
+              tools_allow: [],
+              delegation_enabled: true,
+              delegation_max_depth: 3,
+              delegation_max_children: 4,
+              max_steps: 25,
+              is_builtin: true,
             },
           ]);
         }
         if (cmd === "get_roster_statuses") {
           return Promise.resolve([
-            { id: "bot_1", state: "idle", current_task: "Idle", last_seen: 1000 },
+            {
+              id: "apex-orchestrator",
+              state: "idle",
+              current_task: "Idle",
+              active_tasks: [],
+            },
           ]);
         }
         return Promise.resolve(null);
@@ -276,7 +297,7 @@ describe("Comprehensive UI Modals & Subsystems", () => {
         <TeammateRosterModal
           isOpen={true}
           onClose={vi.fn()}
-          selectedBotId="bot_1"
+          selectedBotId="apex-orchestrator"
           onSelectBot={onSelectBot}
         />
       );
