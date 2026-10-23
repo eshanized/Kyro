@@ -22,7 +22,10 @@ use crate::multibot::{BotStatus, MultiBotOrchestrator};
 use crate::project::checkpoint::{
     BuildDoctor, BuildDoctorDiagnostic, CheckpointManager, CodeCheckpoint, RollbackResult,
 };
-use crate::sandbox::{ContainerExecResult, DockerSandbox, SandboxStatus};
+use crate::sandbox::{
+    normalize_sandbox_image, ContainerExecResult, DockerSandbox, ExperimentComparisonResult,
+    ExperimentRunner, ExperimentSpec, SandboxStatus,
+};
 use crate::storage::documents::{
     DocumentAnalysisResult, DocumentAssistant, DocumentComparisonResult,
 };
@@ -34,12 +37,14 @@ use crate::storage::organizer::{
 };
 use crate::storage::{
     check_path_authorized_in_folders, AgentRun, ApiKeys, ApiKeysMetadata, ApprovalRequest,
-    ArtifactRecord, AuthorizedFolderRecord, BotRecord, ConnectorToolPolicyRecord, Conversation,
-    Database, ImportSummary, McpServerRecord, MemoryEntry, Message, RoutineRecord,
-    RoutineRunRecord, RunEvent, SearchResultItem, SkillRecord, TemplateEngine, TemplatePack,
-    TimelineStepRecord, Vault,
+    ArtifactRecord, AuthorizedFolderRecord, BotRecord, CodeExperimentRecord,
+    ConnectorToolPolicyRecord, Conversation, Database, HabitSettingsRecord, HabitSuggestionRecord,
+    ImportSummary, McpServerRecord, MemoryEntry, Message, RagSettingsRecord, RagStatus,
+    RetrievalEngine, RetrievalResult, RoutineRecord, RoutineRunRecord, RunEvent, SearchResultItem,
+    SkillRecord, TemplateEngine, TemplatePack, TimelineStepRecord, Vault,
 };
 use crate::teach_task::portable_routine::{EditableRoutine, RoutineEngine};
+use crate::teach_task::HabitLearningEngine;
 use crate::teach_task::{RoutineScheduler, Skill, SkillReplayer, TaskRecorder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -2980,4 +2985,229 @@ pub fn natural_language_to_routine(prompt: String) -> Result<NlRoutineSuggestion
         clarification_prompt,
         schedule_confidence: confidence,
     })
+}
+
+// --- Habit Learning Commands ---
+
+#[tauri::command]
+pub fn get_habit_learning_settings(
+    state: State<'_, AppState>,
+) -> Result<HabitSettingsRecord, String> {
+    state.db.get_habit_settings().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn save_habit_learning_settings(
+    state: State<'_, AppState>,
+    settings: HabitSettingsRecord,
+) -> Result<(), String> {
+    state
+        .db
+        .save_habit_settings(&settings)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn analyze_habits_now(
+    state: State<'_, AppState>,
+) -> Result<Vec<HabitSuggestionRecord>, String> {
+    let engine = HabitLearningEngine::new(state.db.clone());
+    engine.analyze_recent_runs()
+}
+
+#[tauri::command]
+pub fn list_habit_suggestions(
+    state: State<'_, AppState>,
+    status: Option<String>,
+) -> Result<Vec<HabitSuggestionRecord>, String> {
+    state
+        .db
+        .list_habit_suggestions(status.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn accept_habit_suggestion(
+    state: State<'_, AppState>,
+    suggestion_id: String,
+    custom_name: Option<String>,
+    cron: Option<String>,
+) -> Result<RoutineRecord, String> {
+    let engine = HabitLearningEngine::new(state.db.clone());
+    engine.accept_suggestion(&suggestion_id, custom_name, cron)
+}
+
+#[tauri::command]
+pub fn dismiss_habit_suggestion(
+    state: State<'_, AppState>,
+    suggestion_id: String,
+) -> Result<bool, String> {
+    let engine = HabitLearningEngine::new(state.db.clone());
+    engine.dismiss_suggestion(&suggestion_id)
+}
+
+#[tauri::command]
+pub fn snooze_habit_suggestion(
+    state: State<'_, AppState>,
+    suggestion_id: String,
+) -> Result<bool, String> {
+    let engine = HabitLearningEngine::new(state.db.clone());
+    engine.snooze_suggestion(&suggestion_id)
+}
+
+#[tauri::command]
+pub fn clear_habit_data(state: State<'_, AppState>) -> Result<(), String> {
+    let engine = HabitLearningEngine::new(state.db.clone());
+    engine.clear_data()
+}
+
+// --- Deep Local RAG Commands ---
+
+#[tauri::command]
+pub fn get_rag_status(state: State<'_, AppState>) -> Result<RagStatus, String> {
+    let engine = RetrievalEngine::new(state.db.clone());
+    engine.get_status()
+}
+
+#[tauri::command]
+pub fn save_rag_settings(
+    state: State<'_, AppState>,
+    settings: RagSettingsRecord,
+) -> Result<(), String> {
+    state
+        .db
+        .save_rag_settings(&settings)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn index_authorized_chunks(state: State<'_, AppState>) -> Result<usize, String> {
+    let engine = RetrievalEngine::new(state.db.clone());
+    engine.index_all_authorized().await
+}
+
+#[tauri::command]
+pub async fn search_deep_rag(
+    state: State<'_, AppState>,
+    query: String,
+    max_results: Option<usize>,
+) -> Result<Vec<RetrievalResult>, String> {
+    let limit = max_results.unwrap_or(5).clamp(1, 20);
+    let engine = RetrievalEngine::new(state.db.clone());
+    engine.search(&query, limit).await
+}
+
+#[tauri::command]
+pub fn clear_rag_index(state: State<'_, AppState>) -> Result<usize, String> {
+    state.db.clear_all_chunks().map_err(|e| e.to_string())
+}
+
+// --- Sandboxed Code Experiment Commands ---
+
+#[tauri::command]
+pub fn create_experiment(
+    state: State<'_, AppState>,
+    spec: ExperimentSpec,
+) -> Result<CodeExperimentRecord, String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let id = spec.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let runtime = crate::sandbox::experiment::ExperimentRuntime::from_str_name(&spec.runtime);
+    let image = spec
+        .custom_image
+        .as_deref()
+        .unwrap_or_else(|| runtime.default_image());
+    let normalized = normalize_sandbox_image(image);
+
+    let limits = spec.limits.unwrap_or_default().sanitize();
+
+    let record = CodeExperimentRecord {
+        id,
+        name: spec.name,
+        run_id: None,
+        runtime: runtime.as_str().to_string(),
+        image: normalized.to_string(),
+        script: spec.script,
+        argv_json: serde_json::to_string(&spec.argv.unwrap_or_default())
+            .unwrap_or_else(|_| "[]".to_string()),
+        workspace_path: spec.workspace_path,
+        output_dir: None,
+        network_mode: spec.network_mode.unwrap_or_else(|| "none".to_string()),
+        cpu_limit: limits.cpu,
+        memory_limit_mb: limits.memory_mb,
+        timeout_seconds: limits.timeout_seconds,
+        status: "queued".to_string(),
+        exit_code: None,
+        stdout_tail: None,
+        stderr_tail: None,
+        result_summary: None,
+        artifact_ids_json: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+        error: None,
+    };
+
+    state
+        .db
+        .create_code_experiment(&record)
+        .map_err(|e| e.to_string())?;
+    Ok(record)
+}
+
+#[tauri::command]
+pub async fn run_experiment(
+    state: State<'_, AppState>,
+    spec: ExperimentSpec,
+) -> Result<CodeExperimentRecord, String> {
+    let runner = ExperimentRunner::new(state.db.clone());
+    let token = crate::agent::cancellation::CancellationToken::new();
+    runner.execute(spec, None, token).await
+}
+
+#[tauri::command]
+pub fn get_experiment(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<CodeExperimentRecord>, String> {
+    state.db.get_code_experiment(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_experiments(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<CodeExperimentRecord>, String> {
+    state
+        .db
+        .list_code_experiments(limit.unwrap_or(20))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_experiment(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    state
+        .db
+        .delete_code_experiment(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn compare_experiments(
+    state: State<'_, AppState>,
+    id_a: String,
+    id_b: String,
+) -> Result<ExperimentComparisonResult, String> {
+    let exp_a = state
+        .db
+        .get_code_experiment(&id_a)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Experiment A '{}' not found", id_a))?;
+
+    let exp_b = state
+        .db
+        .get_code_experiment(&id_b)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Experiment B '{}' not found", id_b))?;
+
+    Ok(ExperimentRunner::compare(&exp_a, &exp_b))
 }

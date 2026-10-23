@@ -197,7 +197,26 @@ fn main() {
             list_routine_runs,
             update_routine,
             execute_routine_now,
-            natural_language_to_routine
+            natural_language_to_routine,
+            get_habit_learning_settings,
+            save_habit_learning_settings,
+            analyze_habits_now,
+            list_habit_suggestions,
+            accept_habit_suggestion,
+            dismiss_habit_suggestion,
+            snooze_habit_suggestion,
+            clear_habit_data,
+            get_rag_status,
+            save_rag_settings,
+            index_authorized_chunks,
+            search_deep_rag,
+            clear_rag_index,
+            create_experiment,
+            run_experiment,
+            get_experiment,
+            list_experiments,
+            delete_experiment,
+            compare_experiments
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kyro application");

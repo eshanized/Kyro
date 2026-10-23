@@ -328,6 +328,7 @@ impl AuthorizationEngine {
             "capture_screen" | "capture_grounded_screen" => AuthDecision::Allow,
             "launch_ghost_app" => Self::evaluate_ghost_launch(&policy, args),
             "invoke_skill" => Self::evaluate_skill_invoke(&policy, args),
+            "run_safe_experiment" => Self::evaluate_experiment(&policy, args),
             _ => {
                 // MCP or custom external tool
                 Self::evaluate_mcp_or_custom(db, &policy, tool_name, args)
@@ -395,7 +396,7 @@ impl AuthorizationEngine {
             }
             return ShellAnalysis {
                 decision: AuthDecision::AllowSandboxOnly {
-                    image: "alpine:latest".to_string(),
+                    image: "alpine:3.20".to_string(),
                 },
                 argv: None,
                 requires_shell: true,
@@ -1070,6 +1071,22 @@ Use the 'executable' and 'args' fields so the launch can be validated."
             };
         }
         AuthDecision::Allow
+    }
+
+    pub fn evaluate_experiment(
+        _policy: &GovernancePolicy,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        let name = args["name"].as_str().unwrap_or("unnamed experiment");
+        let runtime = args["runtime"].as_str().unwrap_or("python");
+        AuthDecision::RequireApproval {
+            reason: format!(
+                "Code experiment '{}' requests execution in isolated {} container sandbox",
+                name, runtime
+            ),
+            risk: RiskLevel::Moderate,
+            summary: format!("Run isolated {} experiment '{}'", runtime, name),
+        }
     }
 
     pub fn evaluate_mcp_or_custom(

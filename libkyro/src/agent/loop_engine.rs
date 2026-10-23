@@ -315,6 +315,25 @@ The program is started as an explicit executable plus argument vector; free-form
                 }),
             },
             ToolDefinition {
+                name: "run_safe_experiment".to_string(),
+                description: "Execute a controlled code experiment (script, prototype, or test) inside a secure, network-isolated container sandbox with strict CPU, memory, and timeout limits.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Short descriptive name for the experiment" },
+                        "runtime": {
+                            "type": "string",
+                            "enum": ["python", "node", "rust", "bash", "debian"],
+                            "description": "The isolated runtime environment"
+                        },
+                        "script": { "type": "string", "description": "The full script source code to execute inside the sandbox" },
+                        "workspace_path": { "type": "string", "description": "Optional project directory to safely copy into the experiment workspace" },
+                        "timeout_seconds": { "type": "integer", "description": "Timeout in seconds (default 60, max 300)" }
+                    },
+                    "required": ["name", "runtime", "script"]
+                }),
+            },
+            ToolDefinition {
                 name: "delegate_task".to_string(),
                 description: "Delegate a sub-objective to a specialized teammate agent (e.g. @Forge for DevOps/Shell, @Scout for Web).".to_string(),
                 parameters: serde_json::json!({
@@ -427,7 +446,20 @@ The program is started as an explicit executable plus argument vector; free-form
             .unwrap_or_default();
 
         let memory_context = MemoryStore::build_context_block(&db, &active_agent_id, &last_prompt);
-        let enriched_prompt = format!("{}{}", system_prompt, memory_context);
+
+        // Query deep local RAG over authorized documents if there is an active user prompt
+        let rag_context = if !last_prompt.trim().is_empty() {
+            let engine = crate::storage::retrieval::RetrievalEngine::new(db.clone());
+            if let Ok(results) = engine.search(&last_prompt, 4).await {
+                crate::storage::retrieval::RetrievalEngine::format_context_block(&results)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let enriched_prompt = format!("{}{}{}", system_prompt, memory_context, rag_context);
 
         let max_steps = 25;
         let mut final_content = String::new();
@@ -996,7 +1028,7 @@ The program is started as an explicit executable plus argument vector; free-form
                     force_sandbox || tc.arguments["use_sandbox"].as_bool().unwrap_or(false);
 
                 if use_sandbox {
-                    let image = sandbox_image.unwrap_or_else(|| "alpine:latest".to_string());
+                    let image = sandbox_image.unwrap_or_else(|| "alpine:3.20".to_string());
                     match DockerSandbox::run_in_sandbox(&image, cmd) {
                         Ok(res) => (
                             format!(
@@ -1837,6 +1869,54 @@ The program is started as an explicit executable plus argument vector; free-form
                         None,
                     ),
                     Err(e) => (format!("Database error reading skill: {}", e), true, None),
+                }
+            }
+            "run_safe_experiment" => {
+                let name = tc.arguments["name"]
+                    .as_str()
+                    .unwrap_or("unnamed experiment");
+                let runtime = tc.arguments["runtime"].as_str().unwrap_or("python");
+                let script = tc.arguments["script"].as_str().map(|s| s.to_string());
+                let ws_path = tc.arguments["workspace_path"]
+                    .as_str()
+                    .map(|s| s.to_string());
+                let timeout_seconds = tc.arguments["timeout_seconds"].as_u64().unwrap_or(60);
+
+                let spec = crate::sandbox::experiment::ExperimentSpec {
+                    id: None,
+                    name: name.to_string(),
+                    runtime: runtime.to_string(),
+                    custom_image: None,
+                    script,
+                    argv: None,
+                    workspace_path: ws_path,
+                    network_mode: Some("none".to_string()),
+                    limits: Some(crate::sandbox::experiment::ResourceLimits {
+                        timeout_seconds,
+                        ..Default::default()
+                    }),
+                };
+
+                let runner = crate::sandbox::experiment::ExperimentRunner::new(db.clone());
+                match runner.execute(spec, Some(run_id), token.clone()).await {
+                    Ok(rec) => {
+                        let is_err = rec.status != "succeeded";
+                        let summary = format!(
+                            "Experiment '{}' status: {}.\nExit code: {:?}\nArtifacts: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                            rec.name,
+                            rec.status,
+                            rec.exit_code,
+                            rec.artifact_ids_json.as_deref().unwrap_or("[]"),
+                            rec.stdout_tail.as_deref().unwrap_or(""),
+                            rec.stderr_tail.as_deref().unwrap_or("")
+                        );
+                        (summary, is_err, None)
+                    }
+                    Err(e) => (
+                        format!("Failed to execute safe experiment: {}", e),
+                        true,
+                        None,
+                    ),
                 }
             }
             "delegate_task" => {

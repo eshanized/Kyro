@@ -880,4 +880,133 @@ export interface NlRoutineSuggestion {
   schedule_confidence?: string;
 }
 
+export interface HabitSettingsRecord {
+  key: string;
+  enabled: boolean;
+  min_occurrences: number;
+  updated_at: number;
+}
+
+export interface HabitSuggestionRecord {
+  id: string;
+  name: string;
+  description: string;
+  signature_hash: string;
+  occurrences: number;
+  confidence: number;
+  proposed_action_type: string;
+  proposed_payload_json: string;
+  status: "pending" | "accepted" | "dismissed" | "snoozed";
+  evidence_json: string;
+  first_seen_at: number;
+  last_seen_at: number;
+  updated_at: number;
+}
+
+export interface DocumentChunkRecord {
+  id: string;
+  document_path: string;
+  chunk_index: number;
+  heading?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+  content: string;
+  content_hash: string;
+  format: string;
+  chunk_version: number;
+  indexed_at: number;
+  embedding_json?: string | null;
+}
+
+export interface RetrievalResult {
+  chunk_id: string;
+  document_path: string;
+  heading?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+  content: string;
+  score: number;
+  lexical_score: number;
+  semantic_score: number;
+  match_type: "lexical" | "semantic" | "hybrid";
+}
+
+export interface RagStatus {
+  total_documents_indexed: number;
+  total_chunks_indexed: number;
+  embedding_mode: string;
+  embedding_model?: string | null;
+  embedding_endpoint?: string | null;
+  authorized_folder_count: number;
+}
+
+export interface RagSettingsRecord {
+  key: string;
+  embedding_mode: string;
+  embedding_endpoint?: string | null;
+  embedding_model?: string | null;
+  max_candidates: number;
+  updated_at: number;
+}
+
+export interface ResourceLimits {
+  cpu: number;
+  memory_mb: number;
+  pids_limit: number;
+  timeout_seconds: number;
+  max_output_bytes: number;
+}
+
+export interface ExperimentSpec {
+  id?: string | null;
+  name: string;
+  runtime: string;
+  custom_image?: string | null;
+  script?: string | null;
+  argv?: string[] | null;
+  workspace_path?: string | null;
+  network_mode?: string | null;
+  limits?: ResourceLimits | null;
+}
+
+export interface CodeExperimentRecord {
+  id: string;
+  name: string;
+  run_id?: string | null;
+  runtime: string;
+  image: string;
+  script?: string | null;
+  argv_json: string;
+  workspace_path?: string | null;
+  output_dir?: string | null;
+  network_mode: string;
+  cpu_limit: number;
+  memory_limit_mb: number;
+  timeout_seconds: number;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out" | "interrupted";
+  exit_code?: number | null;
+  stdout_tail?: string | null;
+  stderr_tail?: string | null;
+  result_summary?: string | null;
+  artifact_ids_json?: string | null;
+  created_at: number;
+  started_at?: number | null;
+  completed_at?: number | null;
+  error?: string | null;
+}
+
+export interface ExperimentComparisonResult {
+  exp_a_id: string;
+  exp_a_name: string;
+  exp_a_status: string;
+  exp_a_exit_code?: number | null;
+  exp_b_id: string;
+  exp_b_name: string;
+  exp_b_status: string;
+  exp_b_exit_code?: number | null;
+  summary_diff: string;
+  stdout_match: boolean;
+  exit_codes_match: boolean;
+}
+
 
