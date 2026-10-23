@@ -1,4 +1,5 @@
 use super::cancellation::CancellationToken;
+use super::registry::{AgentRegistry, ProfileSnapshot, ResolveError};
 use super::router::{ChatMessage, MessageContent, ModelRouter, ToolCall, ToolDefinition};
 use crate::agent::tools::{self, ToolOutcome};
 use crate::browser::BrowserAutomationManager;
@@ -20,7 +21,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 use tokio::time::{sleep, timeout};
 
 /// The event emitted for each agent step.
@@ -93,7 +94,15 @@ pub struct AgentLoopEngine {
     pub browser: Arc<BrowserAutomationManager>,
     /// The managed development-server subsystem.
     pub dev_servers: Arc<DevServerManager>,
+    /// The canonical agent profile registry. Authoritative for identity,
+    /// instructions, tool policy, delegation budgets and step limits; manifests
+    /// on disk are the single editable source of truth.
+    pub registry: Arc<TokioRwLock<AgentRegistry>>,
 }
+
+/// Hard safety bound on delegation chain walks (defense against corrupted
+/// parent linkage creating pathological loops).
+const MAX_DELEGATION_DEPTH_WALK: usize = 64;
 
 impl Default for AgentLoopEngine {
     fn default() -> Self {
@@ -116,13 +125,52 @@ impl AgentLoopEngine {
         browser: Arc<BrowserAutomationManager>,
         dev_servers: Arc<DevServerManager>,
     ) -> Self {
+        let registry = Arc::new(TokioRwLock::new(AgentRegistry::embedded_only()));
+        Self::with_registry(browser, dev_servers, registry)
+    }
+
+    /// Creates an engine with the shipped subsystem managers and an
+    /// externally maintained agent registry (the production wiring shares one
+    /// registry between the engine and the command layer).
+    pub fn with_registry(
+        browser: Arc<BrowserAutomationManager>,
+        dev_servers: Arc<DevServerManager>,
+        registry: Arc<TokioRwLock<AgentRegistry>>,
+    ) -> Self {
         Self {
             router: ModelRouter::new(),
             active_runs: Arc::new(TokioMutex::new(HashMap::new())),
             cancelled_runs: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
             browser,
             dev_servers,
+            registry,
         }
+    }
+
+    /// Resolve the canonical profile for a requested agent (id, alias, or
+    /// `None` for the bundled default). Refreshes the registry when manifest
+    /// files changed on disk. Production callers use this before creating a
+    /// run record so persisted ids are always canonical.
+    pub async fn resolve_agent(
+        &self,
+        id_or_alias: Option<&str>,
+    ) -> Result<ProfileSnapshot, String> {
+        let mut registry = self.registry.write().await;
+        registry.ensure_fresh();
+        match id_or_alias.filter(|s| !s.trim().is_empty()) {
+            None => registry
+                .resolve_default()
+                .cloned()
+                .map_err(|e| e.to_string()),
+            Some(id) => registry.resolve_lenient(id).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Configuration directory root backing the registry's manifests, when
+    /// one exists (workspace progress persists there).
+    pub async fn config_root(&self) -> Option<std::path::PathBuf> {
+        let registry = self.registry.read().await;
+        registry.config_root().map(|p| p.to_path_buf())
     }
 
     /// Register a cancellation token for an active run
@@ -379,7 +427,12 @@ The program is started as an explicit executable plus argument vector; free-form
         .collect()
     }
 
-    /// Execute an autonomous agent run step with cancellation, centralized authorization, and timeline persistence
+    /// Execute an autonomous agent run step with cancellation, centralized authorization, and timeline persistence.
+    ///
+    /// Compatibility note: `system_prompt` is retained in the signature but is
+    /// no longer authoritative — the run's system prompt is composed from the
+    /// agent profile resolved in [`AgentRegistry`] plus the platform manual
+    /// (see `run_step_with_connectors`).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_step<F>(
         &self,
@@ -413,7 +466,12 @@ The program is started as an explicit executable plus argument vector; free-form
         .await
     }
 
-    /// Execute an autonomous agent run step with both connector manager and local MCP support
+    /// Execute an autonomous agent run step with both connector manager and local MCP support.
+    ///
+    /// The system prompt, tool set, delegation policy and step budget are all
+    /// resolved from the run's agent profile in the [`AgentRegistry`]; the
+    /// `system_prompt` parameter is accepted for signature compatibility but is
+    /// ignored.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_step_with_connectors<F>(
         &self,
@@ -421,7 +479,8 @@ The program is started as an explicit executable plus argument vector; free-form
         model: &str,
         api_key: &str,
         base_url: Option<&str>,
-        system_prompt: &str,
+        // Ignored; the profile resolved from the registry is authoritative.
+        _system_prompt: &str,
         mut history: Vec<ChatMessage>,
         db: Database,
         mcp_manager: Option<McpManager>,
@@ -460,13 +519,60 @@ The program is started as an explicit executable plus argument vector; free-form
         }
 
         // Determine active agent ID from run or default to apex
-        let (active_agent_id, run_conversation_id, run_parent_id) =
+        let (recorded_agent_id, run_conversation_id, run_parent_id) =
             if let Ok(Some(r)) = db.get_run(run_id) {
                 (r.agent_id, r.conversation_id, r.parent_run_id)
             } else {
                 ("apex-orchestrator".to_string(), None, None)
             };
         let is_child_run = run_parent_id.is_some();
+
+        // ---- Stage C: the registry, not the caller, decides who runs what ----
+        // The profile is resolved by id/alias from the agent registry; the
+        // legacy `system_prompt` parameter is accepted for signature
+        // compatibility but is never authoritative.
+        let profile: ProfileSnapshot = {
+            let mut registry = self.registry.write().await;
+            registry.ensure_fresh();
+            match registry.resolve_lenient(&recorded_agent_id) {
+                Ok(p) => p,
+                Err(err) => {
+                    let msg = match &err {
+                        ResolveError::DisabledProfile(id) => {
+                            format!("Agent '{}' is disabled and cannot run.", id)
+                        }
+                        ResolveError::InvalidProfile(id, reason) => {
+                            format!("Agent '{}' has an invalid profile: {}", id, reason)
+                        }
+                        ResolveError::UnknownProfile(id) => format!(
+                            "No agent profile could be resolved for '{}' (registry default unavailable)",
+                            id
+                        ),
+                    };
+                    let seq = db.get_next_event_seq(run_id).unwrap_or(1);
+                    let _ = db.append_run_event(&RunEvent {
+                        id: format!("evt_{}_{}", run_id, seq),
+                        run_id: run_id.to_string(),
+                        seq,
+                        event_type: "error".to_string(),
+                        payload_json: serde_json::json!({ "step": 0, "error": &msg }).to_string(),
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                    });
+                    let _ = db.update_run_status(
+                        run_id,
+                        "failed",
+                        None,
+                        Some(chrono::Utc::now().timestamp_millis()),
+                        Some(&msg),
+                    );
+                    return Err(msg);
+                }
+            }
+        };
+        // Canonical profile id: memory scopes, timeline events and roster
+        // status always key on it, even when the run was recorded with an
+        // alias or a legacy pseudo id.
+        let active_agent_id = profile.id.clone();
 
         // Extract last user prompt for relevance matching
         let last_prompt = history
@@ -490,9 +596,60 @@ The program is started as an explicit executable plus argument vector; free-form
             String::new()
         };
 
-        let enriched_prompt = format!("{}{}{}", system_prompt, memory_context, rag_context);
+        // Compose the authoritative system prompt: platform subsystem manual,
+        // then the profile's own instructions (the last identity statement
+        // wins), then memory and retrieved context.
+        let composed_system = {
+            let mut s = crate::commands::build_default_system_prompt();
+            s.push_str("\n\n# Agent profile: ");
+            s.push_str(&profile.name);
+            s.push_str(" (");
+            s.push_str(&profile.id);
+            s.push_str(")\n\n");
+            s.push_str(&profile.instructions);
+            s
+        };
+        let enriched_prompt = format!("{}{}{}", composed_system, memory_context, rag_context);
 
-        let max_steps = 25;
+        // Profile tool policy (Stage C): an allowlist restricts dispatch to
+        // exactly the named tools (deny by default), and a profile without
+        // delegation permission never sees delegate_task.
+        tools.retain(|t| profile.tool_allowed(&t.name));
+        if !profile.delegation.enabled {
+            tools.retain(|t| t.name != "delegate_task");
+        }
+
+        // Persist the profile snapshot with the run timeline so provenance is
+        // immutable for in-flight and historical runs even when the manifest is
+        // later edited or deleted.
+        {
+            let seq = db.get_next_event_seq(run_id).unwrap_or(1);
+            let snapshot_event = RunEvent {
+                id: format!("evt_{}_{}", run_id, seq),
+                run_id: run_id.to_string(),
+                seq,
+                event_type: "profile".to_string(),
+                payload_json: serde_json::json!({
+                    "profile_id": profile.id,
+                    "name": profile.name,
+                    "role": profile.role,
+                    "origin": profile.origin,
+                    "enabled": profile.enabled,
+                    "version": profile.version_label(),
+                    "content_hash": profile.content_hash,
+                    "model": profile.model,
+                    "tools": { "mode": profile.tools.mode, "allow": profile.tools.allow },
+                    "delegation": profile.delegation,
+                    "limits": profile.limits,
+                    "instructions": profile.instructions,
+                })
+                .to_string(),
+                created_at: chrono::Utc::now().timestamp_millis(),
+            };
+            let _ = db.append_run_event(&snapshot_event);
+        }
+
+        let max_steps = profile.limits.max_steps.max(1) as usize;
         let mut final_content = String::new();
         let mut is_completed = false;
 
@@ -645,6 +802,8 @@ The program is started as an explicit executable plus argument vector; free-form
                         connector_manager.as_ref(),
                         mcp_manager.as_ref(),
                         &token,
+                        &profile,
+                        base_url,
                     )
                     .await;
 
@@ -841,6 +1000,8 @@ The program is started as an explicit executable plus argument vector; free-form
         connector_manager: Option<&Arc<crate::connector::ConnectorManager>>,
         mcp_manager: Option<&McpManager>,
         token: &CancellationToken,
+        profile: &ProfileSnapshot,
+        base_url: Option<&str>,
     ) -> (String, bool, Option<String>) {
         let workspace_root = if let Ok(Some(r)) = db.get_run(run_id) {
             r.config_json.as_ref().and_then(|cfg| {
@@ -952,6 +1113,8 @@ The program is started as an explicit executable plus argument vector; free-form
                     token,
                     None,
                     authorized_argv.as_deref(),
+                    profile,
+                    base_url,
                 )
                 .await
             }
@@ -1048,6 +1211,8 @@ The program is started as an explicit executable plus argument vector; free-form
                                     token,
                                     Some(&proof),
                                     authorized_argv.as_deref(),
+                                    profile,
+                                    base_url,
                                 )
                                 .await;
                         } else if status.status == "denied" {
@@ -1091,6 +1256,8 @@ The program is started as an explicit executable plus argument vector; free-form
                     token,
                     None,
                     authorized_argv.as_deref(),
+                    profile,
+                    base_url,
                 )
                 .await
             }
@@ -1107,6 +1274,8 @@ The program is started as an explicit executable plus argument vector; free-form
                     token,
                     None,
                     authorized_argv.as_deref(),
+                    profile,
+                    base_url,
                 )
                 .await
             }
@@ -1128,6 +1297,8 @@ The program is started as an explicit executable plus argument vector; free-form
         token: &CancellationToken,
         auth_proof: Option<&crate::connector::InvocationAuthProof>,
         authorized_argv: Option<&[String]>,
+        profile: &ProfileSnapshot,
+        base_url: Option<&str>,
     ) -> (String, bool, Option<String>) {
         match tc.name.as_str() {
             "execute_shell" => {
@@ -2010,47 +2181,115 @@ The program is started as an explicit executable plus argument vector; free-form
                 }
             }
             "delegate_task" => {
-                let target_bot_id = tc.arguments["target_bot_id"].as_str().unwrap_or_default();
+                let target = tc.arguments["target_bot_id"].as_str().unwrap_or_default();
                 let objective = tc.arguments["objective"].as_str().unwrap_or_default();
                 let context_summary = tc.arguments["context_summary"].as_str().unwrap_or_default();
 
-                // Recursion check: Disallow deep delegation chains (max depth 3)
-                if run_id.contains("_child_") && run_id.matches("_child_").count() >= 3 {
+                if objective.trim().is_empty() {
                     return (
-                        "Max delegation recursion depth (3) exceeded".to_string(),
+                        "Delegation rejected: 'objective' must describe the sub-task for the teammate.".to_string(),
+                        true,
+                        None,
+                    );
+                }
+                if target.trim().is_empty() {
+                    return (
+                        "Delegation rejected: 'target_bot_id' must identify a registered teammate agent.".to_string(),
                         true,
                         None,
                     );
                 }
 
-                // Verify target bot exists
-                let bots = db.list_bots().unwrap_or_default();
-                let target_bot = match bots.iter().find(|b| b.id == target_bot_id) {
-                    Some(b) => b.clone(),
-                    None => {
-                        return (
-                            format!("Target bot '{}' not found in roster", target_bot_id),
-                            true,
-                            None,
-                        )
+                // ---- Stage D: durable delegation governance ----------------
+                // (1) The acting profile decides whether it may delegate, and
+                //     its manifest caps both chain depth and fan-out.
+                if !profile.delegation.enabled {
+                    return (
+                        format!(
+                            "Delegation rejected: agent '@{}' has delegation disabled in its profile.",
+                            profile.name
+                        ),
+                        true,
+                        None,
+                    );
+                }
+
+                // (2) Depth is walked from the durable agent_runs parent links,
+                //     never parsed out of run id strings.
+                let current_depth = db.delegation_depth(run_id).min(MAX_DELEGATION_DEPTH_WALK);
+                let max_depth = profile.delegation.max_depth as usize;
+                let new_depth = current_depth + 1;
+                if new_depth > max_depth {
+                    return (
+                        format!(
+                            "Delegation rejected: max delegation depth of {} exceeded (this task would run at depth {}); complete the work yourself instead.",
+                            max_depth, new_depth
+                        ),
+                        true,
+                        None,
+                    );
+                }
+
+                // (3) The fan-out budget counts every child this run has ever
+                //     created, so it survives restarts and is immune to races
+                //     with the roster status map.
+                let child_count = db.count_child_runs(run_id).unwrap_or(0);
+                let max_children = profile.delegation.max_children as i64;
+                if child_count >= max_children {
+                    return (
+                        format!(
+                            "Delegation rejected: budget of {} delegated tasks per run exhausted ({} already created).",
+                            max_children, child_count
+                        ),
+                        true,
+                        None,
+                    );
+                }
+
+                // (4) The target must be a registered, enabled teammate.
+                let target_profile = {
+                    let mut registry = self.registry.write().await;
+                    registry.ensure_fresh();
+                    match registry.resolve(target) {
+                        Ok(s) => s.clone(),
+                        Err(ResolveError::UnknownProfile(id)) => {
+                            return (
+                                format!(
+                                    "No registered teammate agent matches '{}'. Available specialist agents are listed in the agent roster.",
+                                    id
+                                ),
+                                true,
+                                None,
+                            )
+                        }
+                        Err(ResolveError::DisabledProfile(id)) => {
+                            return (
+                                format!(
+                                    "Teammate agent '{}' is disabled and cannot accept delegated tasks.",
+                                    id
+                                ),
+                                true,
+                                None,
+                            )
+                        }
+                        Err(ResolveError::InvalidProfile(id, reason)) => {
+                            return (
+                                format!(
+                                    "Teammate agent '{}' cannot accept delegation: invalid profile ({})",
+                                    id, reason
+                                ),
+                                true,
+                                None,
+                            )
+                        }
                     }
                 };
-
-                // Track bot status in roster
-                MultiBotOrchestrator::set_bot_task(target_bot_id, Some(objective));
-                struct BotRosterGuard(String);
-                impl Drop for BotRosterGuard {
-                    fn drop(&mut self) {
-                        MultiBotOrchestrator::set_bot_task(&self.0, None);
-                    }
-                }
-                let _roster_guard = BotRosterGuard(target_bot_id.to_string());
 
                 // Create child run record with unique ID
                 let child_run_id = format!(
                     "{}_child_{}_{}",
                     run_id,
-                    target_bot_id,
+                    target_profile.id,
                     &uuid::Uuid::new_v4().to_string()[..8]
                 );
                 let now = chrono::Utc::now().timestamp_millis();
@@ -2060,7 +2299,7 @@ The program is started as an explicit executable plus argument vector; free-form
                     .flatten()
                     .map(|r| r.model)
                     .unwrap_or_else(|| "nvidia/nemotron-3-ultra-550b-a55b".to_string());
-                let child_model = parent_model;
+                let child_model = parent_model.clone();
 
                 let child_run = AgentRun {
                     id: child_run_id.clone(),
@@ -2069,7 +2308,9 @@ The program is started as an explicit executable plus argument vector; free-form
                         .ok()
                         .flatten()
                         .and_then(|r| r.conversation_id),
-                    agent_id: target_bot_id.to_string(),
+                    // Canonical profile id so the child run resolves exactly
+                    // the target's profile even when the caller used an alias.
+                    agent_id: target_profile.id.clone(),
                     model: child_model.clone(),
                     prompt: objective.to_string(),
                     status: "running".to_string(),
@@ -2081,6 +2322,8 @@ The program is started as an explicit executable plus argument vector; free-form
                         serde_json::json!({
                             "context": context_summary,
                             "parent_run_id": run_id,
+                            "parent_agent": profile.id,
+                            "delegation_depth": new_depth,
                             "workspace_root": workspace_root.map(|p| p.to_string_lossy().to_string()),
                         })
                         .to_string(),
@@ -2089,18 +2332,49 @@ The program is started as an explicit executable plus argument vector; free-form
                 };
                 let _ = db.create_run(&child_run);
 
-                // Build specialized prompt for child agent
-                let child_sys_prompt = format!(
-                    "{}\nYou have been delegated the following sub-objective: {}\nContext: {}\nComplete this specialized task and report back clearly.",
-                    target_bot.system_prompt, objective, context_summary
+                // Track the teammate's live task in the roster; the guard
+                // clears exactly this (teammate, run) pair on every exit path.
+                MultiBotOrchestrator::set_bot_task(
+                    &target_profile.id,
+                    &child_run_id,
+                    Some(objective),
                 );
+                struct BotRosterGuard {
+                    bot_id: String,
+                    run_id: String,
+                }
+                impl Drop for BotRosterGuard {
+                    fn drop(&mut self) {
+                        MultiBotOrchestrator::set_bot_task(&self.bot_id, &self.run_id, None);
+                    }
+                }
+                let _roster_guard = BotRosterGuard {
+                    bot_id: target_profile.id.clone(),
+                    run_id: child_run_id.clone(),
+                };
+
+                // The child composes its own system prompt from its resolved
+                // profile (Stage C); the delegating agent supplies only the
+                // objective and context.
+                let child_task_message = if context_summary.trim().is_empty() {
+                    objective.to_string()
+                } else {
+                    format!(
+                        "{}\n\nContext from the delegating agent (@{}):\n{}",
+                        objective, profile.name, context_summary
+                    )
+                };
 
                 let child_history = vec![ChatMessage {
                     role: "user".to_string(),
-                    content: MessageContent::from_text(objective),
+                    content: MessageContent::from_text(child_task_message),
                     tool_calls: None,
                     tool_call_id: None,
                 }];
+
+                let child_sys_prompt =
+                    "The operating prompt for this delegated task is resolved from the teammate agent's profile."
+                        .to_string();
 
                 // Execute child agent turn with linked child cancellation token
                 let child_token = token.child_token();
@@ -2113,7 +2387,10 @@ The program is started as an explicit executable plus argument vector; free-form
                     &child_run_id,
                     &child_model,
                     &api_key,
-                    None,
+                    // Inference routing succeeds the parent's configured
+                    // endpoint, so delegated children run against the same
+                    // provider configuration as their parent run.
+                    base_url,
                     &child_sys_prompt,
                     child_history,
                     db.clone(),
@@ -2137,7 +2414,7 @@ The program is started as an explicit executable plus argument vector; free-form
                         (
                             format!(
                                 "Teammate @{} completed delegated objective:\n{}",
-                                target_bot.name, out
+                                target_profile.name, out
                             ),
                             false,
                             None,
@@ -2155,7 +2432,7 @@ The program is started as an explicit executable plus argument vector; free-form
                         (
                             format!(
                                 "Teammate @{} encountered an error during delegation: {}",
-                                target_bot.name, e
+                                target_profile.name, e
                             ),
                             true,
                             None,
