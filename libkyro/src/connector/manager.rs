@@ -507,14 +507,22 @@ impl ConnectorManager {
             if cid.trim().is_empty() {
                 return Err("GitHub OAuth requires a Client ID. Configure one in Kyro Settings or enter it in the connection modal.".to_string());
             }
-            let url = format!(
-                "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=repo,read:user,actions:read&code_challenge={}&code_challenge_method=S256",
-                cid, redirect_uri, state, code_challenge
-            );
+            let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize")
+                .map_err(|e| format!("Failed to parse GitHub OAuth URL: {}", e))?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("client_id", cid.trim());
+                query.append_pair("redirect_uri", &redirect_uri);
+                query.append_pair("state", &state);
+                // oauth app scopes are space-delimited; repo covers actions reads for private repos.
+                query.append_pair("scope", "repo read:user");
+                query.append_pair("code_challenge", &code_challenge);
+                query.append_pair("code_challenge_method", "S256");
+            }
             (
-                url,
+                url.to_string(),
                 "https://github.com/login/oauth/access_token".to_string(),
-                cid,
+                cid.trim().to_string(),
             )
         } else {
             let cid = client_id_opt

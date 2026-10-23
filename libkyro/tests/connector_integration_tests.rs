@@ -786,7 +786,16 @@ async fn test_connector_manager_oauth_flow_and_tools_governance() {
     assert!(gh_init.is_ok());
     let init_res = gh_init.unwrap();
     assert!(!init_res.session_id.is_empty());
-    assert!(init_res.auth_url.contains("github.com"));
+    let auth_url = reqwest::Url::parse(&init_res.auth_url).unwrap();
+    assert_eq!(auth_url.host_str(), Some("github.com"));
+    assert_eq!(auth_url.path(), "/login/oauth/authorize");
+    let auth_params = auth_url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(auth_params.get("scope").map(String::as_str), Some("repo read:user"));
+    assert_eq!(auth_params.get("code_challenge_method").map(String::as_str), Some("S256"));
+    assert!(!auth_params.get("scope").unwrap().contains("actions:read"));
 
     // 2. get_oauth_status
     let status = conn_mgr.get_oauth_status(&init_res.session_id).await;

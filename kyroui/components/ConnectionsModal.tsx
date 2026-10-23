@@ -1149,17 +1149,17 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
                   <div>
                     <label className="block text-xs text-neutral-300 mb-1 font-medium">
-                      OAuth Client ID (Optional)
+                      OAuth Client ID (required unless preconfigured)
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g. Ov23li... (Leave blank for default / env KYRO_GITHUB_CLIENT_ID)"
+                      placeholder="e.g. Ov23li... (GitHub OAuth App Client ID)"
                       value={oauthClientId}
                       onChange={(e) => setOauthClientId(e.target.value)}
                       className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
                     />
                     <p className="text-[11px] text-neutral-500 mt-1">
-                      Configure your own GitHub OAuth application Client ID if you prefer dedicated rate limits.
+                      Kyro needs a registered GitHub OAuth App Client ID. Enter your app's public ID here, or configure KYRO_GITHUB_CLIENT_ID in the process environment. To connect without an OAuth app, choose Personal Access Token.
                     </p>
                   </div>
 

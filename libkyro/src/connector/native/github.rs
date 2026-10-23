@@ -248,6 +248,52 @@ impl GitHubAdapter {
         Ok(val)
     }
 
+    fn parse_workflow_run_filters<'a>(
+        args: &'a Value,
+    ) -> Result<(Option<&'a str>, Option<&'a str>), String> {
+        const VALID_STATUSES: &[&str] = &[
+            "queued",
+            "in_progress",
+            "completed",
+            "requested",
+            "waiting",
+            "pending",
+        ];
+        const VALID_CONCLUSIONS: &[&str] = &[
+            "success",
+            "failure",
+            "neutral",
+            "cancelled",
+            "skipped",
+            "timed_out",
+            "action_required",
+            "stale",
+            "startup_failure",
+        ];
+
+        let status = args["status"].as_str();
+        let conclusion = args["conclusion"].as_str();
+
+        if let Some(value) = status {
+            if !VALID_STATUSES.contains(&value) {
+                return Err(format!("Invalid workflow run status filter '{}'", value));
+            }
+        }
+        if let Some(value) = conclusion {
+            if !VALID_CONCLUSIONS.contains(&value) {
+                return Err(format!("Invalid workflow run conclusion filter '{}'", value));
+            }
+            if status.is_some_and(|status| status != "completed") {
+                return Err(
+                    "A workflow run conclusion filter can only be combined with status='completed' or no status filter"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok((status, conclusion))
+    }
+
     fn extract_token(&self, secret_raw: &str) -> Result<String, String> {
         let trimmed = secret_raw.trim();
         if trimmed.starts_with('{') {
@@ -508,7 +554,8 @@ impl NativeConnectorAdapter for GitHubAdapter {
                         "owner": { "type": "string", "description": "Repository owner" },
                         "repo": { "type": "string", "description": "Repository name" },
                         "branch": { "type": "string", "description": "Optional branch filter" },
-                        "status": { "type": "string", "enum": ["completed", "in_progress", "queued", "failure", "success"], "description": "Workflow run status" },
+                        "status": { "type": "string", "enum": ["queued", "in_progress", "completed", "requested", "waiting", "pending"], "description": "Optional GitHub Actions workflow run status filter." },
+                        "conclusion": { "type": "string", "enum": ["success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required", "stale", "startup_failure"], "description": "Optional final conclusion filter. Use with status='completed' or omit status." },
                         "limit": { "type": "integer", "description": "Max runs to inspect (default 20, max 50)" }
                     },
                     "required": ["owner", "repo"]
@@ -932,9 +979,12 @@ impl NativeConnectorAdapter for GitHubAdapter {
                 Self::validate_github_ident(repo, "repo")?;
 
                 let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50);
-                let limit_str = limit.to_string();
+                let (status_val, conclusion_val) = Self::parse_workflow_run_filters(&args)?;
 
-                let mut q_params = vec![("per_page", limit_str.as_str())];
+                // the api only filters by run status; conclusions must be filtered locally.
+                let request_limit = if conclusion_val.is_some() { 100 } else { limit };
+                let request_limit_str = request_limit.to_string();
+                let mut q_params = vec![("per_page", request_limit_str.as_str())];
                 let branch_val = args["branch"].as_str();
                 if let Some(branch) = branch_val {
                     if branch.contains('/') && (branch.contains("..") || branch.contains('\0')) {
@@ -942,14 +992,10 @@ impl NativeConnectorAdapter for GitHubAdapter {
                     }
                     q_params.push(("branch", branch));
                 }
-                let status_val = args["status"].as_str();
                 if let Some(status) = status_val {
-                    if !["completed", "in_progress", "queued", "failure", "success"]
-                        .contains(&status)
-                    {
-                        return Err(format!("Invalid workflow status filter '{}'", status));
-                    }
                     q_params.push(("status", status));
+                } else if conclusion_val.is_some() {
+                    q_params.push(("status", "completed"));
                 }
 
                 let url = Self::build_url(
@@ -967,6 +1013,11 @@ impl NativeConnectorAdapter for GitHubAdapter {
                     .as_array()
                     .unwrap_or(&vec![])
                     .iter()
+                    .filter(|run| {
+                        conclusion_val
+                            .map(|expected| run["conclusion"].as_str() == Some(expected))
+                            .unwrap_or(true)
+                    })
                     .take(limit as usize)
                     .map(|r| {
                         json!({
