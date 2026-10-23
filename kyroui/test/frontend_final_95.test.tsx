@@ -288,6 +288,82 @@ describe("Phase C Frontend Coverage to >= 95%", () => {
             { category: "unknown", id: "unk-707", title: "Other resource", snippet: "Generic note" },
           ];
         }
+        if (cmd === "list_agent_profiles") {
+          return [
+            {
+              id: "apex-orchestrator",
+              name: "Apex",
+              avatar: "zap",
+              role: "General Workspace & Strategic Orchestrator",
+              description: "",
+              model_id: null,
+              origin: "builtin",
+              enabled: true,
+              runtime_disabled: false,
+              schema_version: 1,
+              version_label: "v1:aaa",
+              aliases: [],
+              validation_error: null,
+              source_path: null,
+              instructions: "",
+              tools_mode: "inherit",
+              tools_allow: [],
+              delegation_enabled: true,
+              delegation_max_depth: 3,
+              delegation_max_children: 4,
+              max_steps: 25,
+              is_builtin: true,
+            },
+            {
+              id: "forge-devops",
+              name: "Forge",
+              avatar: "wrench",
+              role: "DevOps, Code & Terminal Specialist",
+              description: "",
+              model_id: null,
+              origin: "builtin",
+              enabled: true,
+              runtime_disabled: false,
+              schema_version: 1,
+              version_label: "v1:bbb",
+              aliases: [],
+              validation_error: null,
+              source_path: null,
+              instructions: "",
+              tools_mode: "inherit",
+              tools_allow: [],
+              delegation_enabled: true,
+              delegation_max_depth: 3,
+              delegation_max_children: 4,
+              max_steps: 25,
+              is_builtin: true,
+            },
+            {
+              id: "scout-web",
+              name: "Scout",
+              avatar: "globe",
+              role: "Browser Automation & Web Researcher",
+              description: "",
+              model_id: null,
+              origin: "builtin",
+              enabled: true,
+              runtime_disabled: false,
+              schema_version: 1,
+              version_label: "v1:ccc",
+              aliases: [],
+              validation_error: null,
+              source_path: null,
+              instructions: "",
+              tools_mode: "inherit",
+              tools_allow: [],
+              delegation_enabled: true,
+              delegation_max_depth: 3,
+              delegation_max_children: 4,
+              max_steps: 25,
+              is_builtin: true,
+            },
+          ];
+        }
         return [];
       });
 
@@ -348,6 +424,10 @@ describe("Phase C Frontend Coverage to >= 95%", () => {
       fireEvent.click(screen.getByText("Settings & Vault"));
       expect(onOpenSettings).toHaveBeenCalledWith("vault");
 
+      // Teammate switch actions load from the registry asynchronously.
+      await waitFor(() => {
+        expect(screen.getByText("Switch to @Apex")).toBeInTheDocument();
+      });
       fireEvent.click(screen.getByText("Switch to @Apex"));
       expect(onSelectBot).toHaveBeenCalledWith(expect.objectContaining({ name: "Apex" }));
 
