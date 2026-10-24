@@ -776,3 +776,239 @@ fn test_tauri_csp_hardening_verification() {
         "CSP must set script-src 'self'"
     );
 }
+
+// ---------------------------------------------------------------------
+// File Organizer Governance and Filesystem Hardening
+// ---------------------------------------------------------------------
+
+#[test]
+fn organize_files_governance_requires_human_approval_regardless_of_persisted_permission() {
+    let (_dir, db) = temp_db("organizer_gov");
+
+    // 1. By default, organize_files_preview is allowed if policy is default/allow
+    let preview_args = serde_json::json!({
+        "directory": "/home/user/Downloads"
+    });
+    let dec_preview = decide(&db, "organize_files_preview", preview_args);
+    assert!(is_allow(&dec_preview));
+
+    // 2. Mutating tools (organize_files_execute and organize_files_undo) require approval by default
+    let exec_args = serde_json::json!({
+        "plan": {
+            "plan_id": "test-plan",
+            "target_directory": "/home/user/Downloads",
+            "operations": []
+        }
+    });
+    let dec_exec = decide(&db, "organize_files_execute", exec_args.clone());
+    assert!(is_approval(&dec_exec), "organize_files_execute must require approval");
+
+    let undo_args = serde_json::json!({
+        "transaction_id": "test-tx"
+    });
+    let dec_undo = decide(&db, "organize_files_undo", undo_args.clone());
+    assert!(is_approval(&dec_undo), "organize_files_undo must require approval");
+
+    // 3. Persisting "allow" permission must NEVER bypass required approval for mutating organizer tools
+    db.set_setting("mcp_perm:organize_files_execute", "allow")
+        .expect("save setting");
+    db.set_setting("mcp_perm:organize_files_undo", "allow")
+        .expect("save setting");
+
+    let dec_exec_persisted = decide(&db, "organize_files_execute", exec_args);
+    assert!(
+        is_approval(&dec_exec_persisted),
+        "persisted 'allow' must NOT bypass approval for organize_files_execute"
+    );
+
+    let dec_undo_persisted = decide(&db, "organize_files_undo", undo_args);
+    assert!(
+        is_approval(&dec_undo_persisted),
+        "persisted 'allow' must NOT bypass approval for organize_files_undo"
+    );
+
+    // 4. Deny policy or explicit block must result in Deny
+    db.set_setting("mcp_perm:organize_files_execute", "deny")
+        .expect("save deny");
+    let dec_exec_blocked = decide(&db, "organize_files_execute", serde_json::json!({}));
+    assert!(is_deny(&dec_exec_blocked), "blocked tool must be denied");
+}
+
+#[test]
+fn organize_files_rejects_unauthorized_paths_and_fails_closed() {
+    use kyro_lib::storage::organizer::FileOrganizer;
+    let (dir, db) = temp_db("organizer_unauth");
+    let test_folder = dir.join("target_dir");
+    std::fs::create_dir_all(&test_folder).unwrap();
+
+    // No authorized folders configured -> fails closed
+    let preview_err = FileOrganizer::preview_authorized(&db, &test_folder.to_string_lossy(), None);
+    assert!(
+        preview_err.is_err(),
+        "preview must fail when no folders are authorized"
+    );
+
+    // Add an authorized folder that is DIFFERENT from test_folder
+    let auth_dir = dir.join("other_dir");
+    std::fs::create_dir_all(&auth_dir).unwrap();
+    let canonical_auth = auth_dir.canonicalize().unwrap();
+    let folder_rec = kyro_lib::storage::AuthorizedFolderRecord {
+        id: "auth-1".to_string(),
+        path: canonical_auth.to_string_lossy().to_string(),
+        display_name: "Auth Folder".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&folder_rec).unwrap();
+
+    // Target folder is outside authorized folder -> rejected
+    let preview_outside = FileOrganizer::preview_authorized(&db, &test_folder.to_string_lossy(), None);
+    assert!(
+        preview_outside.is_err(),
+        "preview must reject target outside authorized folders"
+    );
+
+    // Path traversal payload -> rejected
+    let traversal = format!("{}/../target_dir", canonical_auth.to_string_lossy());
+    let preview_traversal = FileOrganizer::preview_authorized(&db, &traversal, None);
+    assert!(
+        preview_traversal.is_err(),
+        "preview must reject path traversal escaping authorized root"
+    );
+}
+
+#[test]
+fn organize_files_server_authoritative_anti_tampering_and_freshness() {
+    use kyro_lib::storage::organizer::FileOrganizer;
+    let (dir, db) = temp_db("organizer_integrity");
+    let target = dir.join("target_dir");
+    std::fs::create_dir_all(&target).unwrap();
+    let canonical_target = target.canonicalize().unwrap();
+
+    // Authorize target folder
+    let folder_rec = kyro_lib::storage::AuthorizedFolderRecord {
+        id: "auth-target".to_string(),
+        path: canonical_target.to_string_lossy().to_string(),
+        display_name: "Target".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&folder_rec).unwrap();
+
+    // Create a test file
+    let file_path = canonical_target.join("document.pdf");
+    std::fs::write(&file_path, "original-pdf-content").unwrap();
+
+    // 1. Generate preview plan
+    let plan = FileOrganizer::preview_authorized(&db, &canonical_target.to_string_lossy(), None).unwrap();
+    assert_eq!(plan.operations.len(), 1);
+
+    // 2. Tampered plan with modified destination path outside approved scope
+    let mut tampered_dest_plan = plan.clone();
+    tampered_dest_plan.operations[0].destination_path = PathBuf::from("/tmp/evil_location.pdf");
+    let tamper_res = FileOrganizer::execute_authorized(&db, &tampered_dest_plan);
+    assert!(
+        tamper_res.is_err(),
+        "executing tampered plan with modified destination must fail"
+    );
+
+    // 3. Tampered plan with injected operation
+    let mut tampered_injected_plan = plan.clone();
+    tampered_injected_plan.operations.push(kyro_lib::storage::organizer::PlannedFileOp {
+        source_path: PathBuf::from("/etc/passwd"),
+        destination_path: canonical_target.join("passwd"),
+        category: "Documents".to_string(),
+        reason: "injected".to_string(),
+        file_size: 100,
+        is_duplicate: false,
+        duplicate_of: None,
+        file_hash: None,
+        conflict: None,
+    });
+    let inject_res = FileOrganizer::execute_authorized(&db, &tampered_injected_plan);
+    assert!(
+        inject_res.is_err(),
+        "executing plan with injected operations must fail"
+    );
+
+    // 4. Freshness check: modify the source file content before execution
+    std::fs::write(&file_path, "modified-pdf-content-after-preview").unwrap();
+    let exec_stale = FileOrganizer::execute_authorized(&db, &plan).unwrap();
+    // The operation should not have moved the file because hash mismatch indicates staleness
+    assert_eq!(exec_stale.operations[0].status, "stale");
+    assert!(
+        file_path.exists(),
+        "stale source file must not be moved from original path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "modified-pdf-content-after-preview"
+    );
+
+    // 5. Replay protection: cannot execute a plan that has already been executed
+    let replay_res = FileOrganizer::execute_authorized(&db, &plan);
+    assert!(
+        replay_res.is_err(),
+        "re-executing an already executed plan must be rejected"
+    );
+}
+
+#[test]
+fn organize_files_symlink_exclusion_and_persistence_recovery() {
+    use kyro_lib::storage::organizer::FileOrganizer;
+    let (dir, db) = temp_db("organizer_symlink");
+    let target = dir.join("target_dir");
+    std::fs::create_dir_all(&target).unwrap();
+    let canonical_target = target.canonicalize().unwrap();
+
+    let folder_rec = kyro_lib::storage::AuthorizedFolderRecord {
+        id: "auth-symlink".to_string(),
+        path: canonical_target.to_string_lossy().to_string(),
+        display_name: "SymlinkTarget".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&folder_rec).unwrap();
+
+    // Create a regular file and a symlink
+    let reg_file = canonical_target.join("regular.txt");
+    std::fs::write(&reg_file, "regular text").unwrap();
+
+    let external_file = dir.join("external_secret.txt");
+    std::fs::write(&external_file, "secret").unwrap();
+
+    let symlink_file = canonical_target.join("symlink_escape.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external_file, &symlink_file).unwrap();
+
+    // Preview
+    let plan = FileOrganizer::preview_authorized(&db, &canonical_target.to_string_lossy(), None).unwrap();
+    // Symlink must be excluded / recorded in scan warnings and conflicts
+    assert!(
+        plan.scan_warnings.iter().any(|w| w.contains("Symlink")),
+        "scan warnings must note symlink"
+    );
+    assert_eq!(plan.conflicts_count, 1, "symlink counted as conflict");
+    assert_eq!(plan.planned_count, 1, "only 1 file planned to move");
+
+    // Execute
+    let tx = FileOrganizer::execute_authorized(&db, &plan).unwrap();
+    assert_eq!(tx.status, "partially_failed", "1 moved, 1 skipped symlink");
+    let completed_op = tx.operations.iter().find(|o| o.status == "completed").unwrap();
+    assert_eq!(completed_op.source_path, reg_file);
+
+    // Symlink still exists untouched
+    assert!(symlink_file.exists());
+    assert!(std::fs::symlink_metadata(&symlink_file).unwrap().is_symlink());
+
+    // Persistence recovery: query DB directly for transaction
+    let retrieved_tx = db.get_file_transaction(&tx.transaction_id).unwrap().unwrap();
+    assert_eq!(retrieved_tx.transaction_id, tx.transaction_id);
+    assert_eq!(retrieved_tx.status, "partially_failed");
+
+    // Undo authorized
+    let undone_tx = FileOrganizer::undo_authorized(&db, &tx.transaction_id).unwrap();
+    assert_eq!(undone_tx.status, "undone");
+    assert!(reg_file.exists(), "regular file must be restored");
+
+    // Status in DB must now be 'undone'
+    let updated_tx = db.get_file_transaction(&tx.transaction_id).unwrap().unwrap();
+    assert_eq!(updated_tx.status, "undone");
+}
