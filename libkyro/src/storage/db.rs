@@ -3545,7 +3545,9 @@ impl Database {
         if let Some(row) = rows.next()? {
             let json_str: String = row.get(0)?;
             let executed_at: Option<i64> = row.get(1)?;
-            if let Ok(plan) = serde_json::from_str::<crate::storage::organizer::OrganizationPlan>(&json_str) {
+            if let Ok(plan) =
+                serde_json::from_str::<crate::storage::organizer::OrganizationPlan>(&json_str)
+            {
                 Ok(Some((plan, executed_at)))
             } else {
                 Ok(None)

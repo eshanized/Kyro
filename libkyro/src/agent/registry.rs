@@ -25,6 +25,7 @@
 //! registry listing).
 
 use super::manifest::{self as manifest_mod, parse_manifest_with_source, AgentManifest};
+use crate::governance::TaskAuthorizationGrant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -187,6 +188,8 @@ pub struct RunConfigSnapshot {
     pub delegation_depth: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_grant: Option<TaskAuthorizationGrant>,
 }
 
 /// Strips non-routable contexts from a user prompt before parsing @mentions:

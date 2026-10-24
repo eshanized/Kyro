@@ -16,12 +16,144 @@ pub enum FileOp {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAutonomyMode {
+    Autonomous,
+    Supervised,
+}
+
+impl Default for TaskAutonomyMode {
+    fn default() -> Self {
+        TaskAutonomyMode::Autonomous
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineOpClass {
+    FileRead,
+    FileWrite,
+    FileOrganize,
+    SafeCommand,
+    LocalVerification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskAuthorizationGrant {
+    pub run_id: String,
+    pub mode: TaskAutonomyMode,
+    pub max_risk: RiskLevel,
+    pub allowed_operations: Vec<RoutineOpClass>,
+    pub workspace_root: Option<PathBuf>,
+    pub authorized_folders: Vec<PathBuf>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+impl TaskAuthorizationGrant {
+    pub fn new(
+        run_id: String,
+        workspace_root: Option<PathBuf>,
+        authorized_folders: Vec<PathBuf>,
+        mode: TaskAutonomyMode,
+    ) -> Self {
+        let now = chrono::Utc::now().timestamp_millis();
+        Self {
+            run_id,
+            mode,
+            max_risk: RiskLevel::Moderate,
+            allowed_operations: vec![
+                RoutineOpClass::FileRead,
+                RoutineOpClass::FileWrite,
+                RoutineOpClass::FileOrganize,
+                RoutineOpClass::SafeCommand,
+                RoutineOpClass::LocalVerification,
+            ],
+            workspace_root,
+            authorized_folders,
+            created_at: now,
+            expires_at: now + 3600 * 1000, // 1 hour lifetime
+        }
+    }
+
+    pub fn is_active(&self, current_run_id: &str, now: i64) -> bool {
+        self.run_id == current_run_id && now < self.expires_at
+    }
+
+    pub fn permits_op(&self, op: RoutineOpClass, risk: RiskLevel) -> bool {
+        self.mode == TaskAutonomyMode::Autonomous
+            && self.allowed_operations.contains(&op)
+            && risk <= self.max_risk
+    }
+
+    pub fn path_in_scope(&self, path: &Path) -> bool {
+        let resolved = if path.is_relative() {
+            if let Some(ref ws) = self.workspace_root {
+                ws.join(path)
+            } else {
+                path.to_path_buf()
+            }
+        } else {
+            path.to_path_buf()
+        };
+
+        let candidate = if let Ok(canon) = resolved.canonicalize() {
+            canon
+        } else {
+            resolved
+        };
+
+        // Check workspace root
+        if let Some(ref ws) = self.workspace_root {
+            let canon_ws = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+            if candidate.starts_with(&canon_ws) {
+                return true;
+            }
+        }
+
+        // Check authorized folders
+        for folder in &self.authorized_folders {
+            let canon_folder = folder.canonicalize().unwrap_or_else(|_| folder.clone());
+            if candidate.starts_with(&canon_folder) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionContext {
     pub run_id: String,
     pub agent_id: String,
     pub conversation_id: Option<String>,
     pub workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    pub task_grant: Option<TaskAuthorizationGrant>,
+}
+
+impl ExecutionContext {
+    pub fn new(
+        run_id: String,
+        agent_id: String,
+        conversation_id: Option<String>,
+        workspace_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            run_id,
+            agent_id,
+            conversation_id,
+            workspace_root,
+            task_grant: None,
+        }
+    }
+
+    pub fn with_task_grant(mut self, grant: TaskAuthorizationGrant) -> Self {
+        self.task_grant = Some(grant);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +578,403 @@ impl AuthorizationEngine {
         Ok(content)
     }
 
+    /// Resolves and validates the active task-scoped authorization grant.
+    /// Checks:
+    /// 1. Run ID match (strictly bounded to ctx.run_id, non-inheritable)
+    /// 2. Lifetime expiry (now < expires_at)
+    /// 3. Terminal state revocation (run status not terminal in DB)
+    pub fn resolve_active_task_grant(
+        db: &Database,
+        ctx: &ExecutionContext,
+    ) -> Option<TaskAuthorizationGrant> {
+        let grant = ctx.task_grant.clone().or_else(|| {
+            if let Ok(Some(r)) = db.get_run(&ctx.run_id) {
+                if let Some(ref cfg_str) = r.config_json {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cfg_str) {
+                        return v
+                            .get("task_grant")
+                            .and_then(|g| serde_json::from_value(g.clone()).ok());
+                    }
+                }
+            }
+            None
+        })?;
+
+        // 1. Strict run_id binding: grant cannot be inherited across runs or by delegated sub-agents
+        if grant.run_id != ctx.run_id {
+            log::warn!(
+                "[Security] Task grant run ID mismatch: approved for run '{}', attempted in run '{}'",
+                grant.run_id,
+                ctx.run_id
+            );
+            return None;
+        }
+
+        // 2. Lifetime expiry check
+        let now = chrono::Utc::now().timestamp_millis();
+        if now >= grant.expires_at {
+            log::warn!(
+                "[Security] Task grant for run '{}' expired at {}",
+                grant.run_id,
+                grant.expires_at
+            );
+            return None;
+        }
+
+        // 3. Durable lifecycle revocation: terminal status in database invalidates grant
+        if let Ok(Some(r)) = db.get_run(&ctx.run_id) {
+            if matches!(
+                r.status.as_str(),
+                "completed" | "succeeded" | "failed" | "cancelled"
+            ) {
+                log::warn!(
+                    "[Security] Task grant for run '{}' is revoked because run is in terminal status '{}'",
+                    grant.run_id,
+                    r.status
+                );
+                return None;
+            }
+        }
+
+        Some(grant)
+    }
+
+    fn evaluate_organize_execute(
+        db: &Database,
+        _ctx: &ExecutionContext,
+        active_grant: Option<&TaskAuthorizationGrant>,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        let plan_val = &args["plan"];
+        if plan_val.is_null() || !plan_val.is_object() {
+            return AuthDecision::Deny {
+                reason: "Missing or invalid 'plan' argument for organize_files_execute".to_string(),
+            };
+        }
+
+        let plan: crate::storage::organizer::OrganizationPlan =
+            match serde_json::from_value(plan_val.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return AuthDecision::Deny {
+                        reason: format!("Failed to parse organization plan: {}", e),
+                    };
+                }
+            };
+
+        // Prohibited system locations check
+        let target_str = plan.target_directory.to_string_lossy().to_lowercase();
+        for &prohibited in Self::PROHIBITED_PATHS {
+            if target_str.contains(prohibited) {
+                return AuthDecision::Deny {
+                    reason: format!(
+                        "Security rejection: Plan target directory references sensitive system location '{}'",
+                        prohibited
+                    ),
+                };
+            }
+        }
+
+        // Anti-tampering and freshness check against server-authoritative persisted plan
+        if let Ok(Some((stored_plan, executed_at))) = db.get_organization_plan(&plan.plan_id) {
+            // Replay protection: cannot execute an already executed plan
+            if executed_at.is_some() {
+                return AuthDecision::Deny {
+                    reason: "Plan has already been executed. Repeated execution of the same plan is prohibited.".to_string(),
+                };
+            }
+
+            // Verify submitted plan matches stored plan
+            if stored_plan.target_directory != plan.target_directory
+                || stored_plan.operations.len() != plan.operations.len()
+            {
+                return AuthDecision::Deny {
+                    reason: "Security rejection: Plan tampering detected. The submitted plan does not match the reviewed plan.".to_string(),
+                };
+            }
+
+            for (stored_op, sub_op) in stored_plan.operations.iter().zip(&plan.operations) {
+                if stored_op.source_path != sub_op.source_path
+                    || stored_op.destination_path != sub_op.destination_path
+                    || stored_op.file_hash != sub_op.file_hash
+                    || stored_op.category != sub_op.category
+                    || stored_op.is_duplicate != sub_op.is_duplicate
+                    || stored_op.conflict != sub_op.conflict
+                {
+                    return AuthDecision::Deny {
+                        reason: "Security rejection: Plan tampering detected on operation details."
+                            .to_string(),
+                    };
+                }
+            }
+        } else {
+            return AuthDecision::Deny {
+                reason: "Plan not found or expired. A valid server-persisted preview plan is required before execution.".to_string(),
+            };
+        }
+
+        // Check active bounded authorization grant
+        if let Some(grant) = active_grant {
+            if grant.mode == TaskAutonomyMode::Autonomous
+                && grant
+                    .allowed_operations
+                    .contains(&RoutineOpClass::FileOrganize)
+                && RiskLevel::Moderate <= grant.max_risk
+            {
+                let target_in_scope = grant.path_in_scope(&plan.target_directory);
+                let ops_in_scope = plan.operations.iter().all(|op| {
+                    grant.path_in_scope(&op.source_path)
+                        && grant.path_in_scope(&op.destination_path)
+                });
+
+                if target_in_scope && ops_in_scope {
+                    return AuthDecision::Allow;
+                }
+            }
+        }
+
+        // Outside active grant scope, no grant, or Supervised mode -> request targeted approval
+        AuthDecision::RequireApproval {
+            reason: "Executing file reorganization moves files into new directory locations."
+                .to_string(),
+            risk: RiskLevel::Moderate,
+            summary: "Move categorized files into organized folders".to_string(),
+        }
+    }
+
+    fn evaluate_organize_undo(
+        db: &Database,
+        _ctx: &ExecutionContext,
+        active_grant: Option<&TaskAuthorizationGrant>,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        let trx_id = if let Some(id) = args["transaction_id"].as_str() {
+            id
+        } else if let Some(id) = args["transaction"]["transaction_id"].as_str() {
+            id
+        } else {
+            return AuthDecision::RequireApproval {
+                reason: "Undoing file organization moves files back to their previous locations."
+                    .to_string(),
+                risk: RiskLevel::Moderate,
+                summary: "Reverse organized file moves".to_string(),
+            };
+        };
+
+        if let Ok(Some(trx)) = db.get_file_transaction(trx_id) {
+            let target_path = Path::new(&trx.target_directory);
+            if let Some(grant) = active_grant {
+                if grant.mode == TaskAutonomyMode::Autonomous
+                    && grant
+                        .allowed_operations
+                        .contains(&RoutineOpClass::FileOrganize)
+                    && RiskLevel::Moderate <= grant.max_risk
+                    && grant.path_in_scope(target_path)
+                {
+                    return AuthDecision::Allow;
+                }
+            }
+        }
+
+        AuthDecision::RequireApproval {
+            reason: "Undoing file organization moves files back to their previous locations."
+                .to_string(),
+            risk: RiskLevel::Moderate,
+            summary: "Reverse organized file moves".to_string(),
+        }
+    }
+
+    /// Evaluates tool authorization without access to a database instance (used by standalone helpers)
+    pub fn evaluate_without_db(
+        policy: &GovernancePolicy,
+        ctx: &ExecutionContext,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        let args_str = args.to_string();
+        if policy.require_takeover_for_credentials {
+            if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(&args_str) {
+                return AuthDecision::RequireTakeover { reason };
+            }
+        }
+
+        for domain in &policy.blocked_domains {
+            if args_str.to_lowercase().contains(&domain.to_lowercase()) {
+                return AuthDecision::Deny {
+                    reason: format!(
+                        "Operation targets blocked domain '{}' defined in governance policy",
+                        domain
+                    ),
+                };
+            }
+        }
+
+        match tool_name {
+            "execute_shell" | "bash" | "terminal" => {
+                Self::evaluate_shell_in_context(policy, ctx, args)
+            }
+            "read_file" => Self::evaluate_file_read(ctx, args),
+            "write_file" => Self::evaluate_file_write(ctx, args),
+            "create_artifact" => Self::evaluate_create_artifact(ctx, args),
+            "computer_action" => Self::evaluate_computer_action(policy, args),
+            "click_mark" => Self::evaluate_click_mark(policy, args),
+            "capture_screen" | "capture_grounded_screen" => AuthDecision::Allow,
+            "launch_ghost_app" => Self::evaluate_ghost_launch(policy, args),
+            "invoke_skill" => Self::evaluate_skill_invoke(policy, args),
+            "run_safe_experiment" => Self::evaluate_experiment(policy, args),
+            "organize_files_preview" => {
+                if policy.task_autonomy_mode == "Supervised" {
+                    AuthDecision::RequireApproval {
+                        reason: "Supervised mode requires approval for file organization preview"
+                            .to_string(),
+                        risk: RiskLevel::Safe,
+                        summary: format!(
+                            "Preview file organization for directory '{}'",
+                            args["directory"].as_str().unwrap_or("")
+                        ),
+                    }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            "organize_files_execute" => {
+                if let Some(ref grant) = ctx.task_grant {
+                    if grant.mode == TaskAutonomyMode::Autonomous
+                        && grant
+                            .allowed_operations
+                            .contains(&RoutineOpClass::FileOrganize)
+                        && RiskLevel::Moderate <= grant.max_risk
+                    {
+                        if let Some(target_dir) = args["plan"]["target_directory"].as_str() {
+                            if grant.path_in_scope(Path::new(target_dir)) {
+                                return AuthDecision::Allow;
+                            }
+                        }
+                    }
+                }
+                AuthDecision::RequireApproval {
+                    reason:
+                        "Executing file reorganization moves files into new directory locations."
+                            .to_string(),
+                    risk: RiskLevel::Moderate,
+                    summary: "Move categorized files into organized folders".to_string(),
+                }
+            }
+            "organize_files_undo" => {
+                if let Some(ref grant) = ctx.task_grant {
+                    if grant.mode == TaskAutonomyMode::Autonomous
+                        && grant
+                            .allowed_operations
+                            .contains(&RoutineOpClass::FileOrganize)
+                        && RiskLevel::Moderate <= grant.max_risk
+                    {
+                        return AuthDecision::Allow;
+                    }
+                }
+                AuthDecision::RequireApproval {
+                    reason:
+                        "Undoing file organization moves files back to their previous locations."
+                            .to_string(),
+                    risk: RiskLevel::Moderate,
+                    summary: "Reverse organized file moves".to_string(),
+                }
+            }
+            "rollback_code_checkpoint" => AuthDecision::RequireApproval {
+                reason: "Rolling back a code checkpoint restores previous file states.".to_string(),
+                risk: RiskLevel::Moderate,
+                summary: "Revert agent modified files to checkpoint state".to_string(),
+            },
+            "start_dev_server" | "audit_ui" => {
+                let target = args["path"].as_str().unwrap_or("");
+                AuthDecision::RequireApproval {
+                    reason: "Starting a project's development server executes repository-controlled code".to_string(),
+                    risk: RiskLevel::Moderate,
+                    summary: format!(
+                        "Start the development server of the project at '{}'",
+                        if target.is_empty() {
+                            "(discovered project)".to_string()
+                        } else {
+                            target.to_string()
+                        }
+                    ),
+                }
+            }
+            "browser_navigate" => {
+                let url = args["url"].as_str().unwrap_or("");
+                if url.trim().is_empty() {
+                    return AuthDecision::Deny {
+                        reason: "browser_navigate requires a 'url' parameter".to_string(),
+                    };
+                }
+                for domain in &policy.blocked_domains {
+                    if url.to_lowercase().contains(&domain.to_lowercase()) {
+                        return AuthDecision::Deny {
+                            reason: format!(
+                                "The requested URL targets the blocked domain '{}'",
+                                domain
+                            ),
+                        };
+                    }
+                }
+                AuthDecision::Allow
+            }
+            "browser_click" => {
+                const CONSEQUENTIAL: &[&str] = &[
+                    "delete",
+                    "remove",
+                    "purchase",
+                    "buy",
+                    "pay",
+                    "checkout",
+                    "send",
+                    "publish",
+                    "deploy",
+                    "confirm",
+                    "submit",
+                    "transfer",
+                    "upgrade",
+                    "subscribe",
+                    "invite",
+                    "sign out",
+                    "log out",
+                    "logout",
+                ];
+                let label = format!(
+                    "{} {}",
+                    args["name"].as_str().unwrap_or(""),
+                    args["text"].as_str().unwrap_or("")
+                )
+                .to_lowercase();
+                if CONSEQUENTIAL.iter().any(|c| label.contains(c)) {
+                    AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Activating the control '{}' may perform a consequential action",
+                            label.trim()
+                        ),
+                        risk: RiskLevel::Moderate,
+                        summary: format!("Activate the control: {}", label.trim()),
+                    }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            "browser_fill" => {
+                let value = args["value"].as_str().unwrap_or("");
+                if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(value) {
+                    AuthDecision::RequireTakeover { reason }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            "browser_open" | "stop_dev_server" | "browser_close" => AuthDecision::Allow,
+            _ => AuthDecision::RequireApproval {
+                reason: format!("Tool '{}' requires explicit authorization", tool_name),
+                risk: RiskLevel::Moderate,
+                summary: format!("Invoke tool '{}'", tool_name),
+            },
+        }
+    }
+
     /// Evaluate an authorization request through the centralized policy matrix
     pub fn evaluate(
         db: &Database,
@@ -475,6 +1004,19 @@ impl AuthorizationEngine {
             }
         }
 
+        // 3. Enforce explicit tool denial policies
+        let perm_key = format!("mcp_perm:{}", tool_name);
+        if let Ok(Some(policy_val)) = db.get_setting(&perm_key) {
+            if policy_val.trim().to_lowercase() == "deny" {
+                return AuthDecision::Deny {
+                    reason: format!("Tool '{}' is explicitly blocked by policy", tool_name),
+                };
+            }
+        }
+
+        // 4. Resolve active bounded authorization grant
+        let active_grant = Self::resolve_active_task_grant(db, ctx);
+
         match tool_name {
             "execute_shell" | "bash" | "terminal" => {
                 Self::evaluate_shell_in_context(&policy, ctx, args)
@@ -492,15 +1034,34 @@ impl AuthorizationEngine {
                 let perm_key = "mcp_perm:organize_files_preview";
                 if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
                     match policy_val.trim().to_lowercase().as_str() {
-                        "deny" => AuthDecision::Deny {
-                            reason: "File organization preview is explicitly blocked by policy".to_string(),
-                        },
-                        "ask" => AuthDecision::RequireApproval {
-                            reason: "File organization preview requires approval".to_string(),
-                            risk: RiskLevel::Safe,
-                            summary: format!("Preview file organization for directory '{}'", args["directory"].as_str().unwrap_or("")),
-                        },
-                        _ => AuthDecision::Allow,
+                        "deny" => {
+                            return AuthDecision::Deny {
+                                reason: "File organization preview is explicitly blocked by policy"
+                                    .to_string(),
+                            }
+                        }
+                        "ask" => {
+                            return AuthDecision::RequireApproval {
+                                reason: "File organization preview requires approval".to_string(),
+                                risk: RiskLevel::Safe,
+                                summary: format!(
+                                    "Preview file organization for directory '{}'",
+                                    args["directory"].as_str().unwrap_or("")
+                                ),
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if policy.task_autonomy_mode == "Supervised" {
+                    AuthDecision::RequireApproval {
+                        reason: "Supervised mode requires approval for file organization preview"
+                            .to_string(),
+                        risk: RiskLevel::Safe,
+                        summary: format!(
+                            "Preview file organization for directory '{}'",
+                            args["directory"].as_str().unwrap_or("")
+                        ),
                     }
                 } else {
                     AuthDecision::Allow
@@ -511,33 +1072,113 @@ impl AuthorizationEngine {
                 if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
                     if policy_val.trim().to_lowercase() == "deny" {
                         return AuthDecision::Deny {
-                            reason: "File organization execution is explicitly blocked by policy".to_string(),
+                            reason: "File organization execution is explicitly blocked by policy"
+                                .to_string(),
                         };
                     }
                 }
-                // Mutating tool: MUST require approval. Persisted permission CANNOT silently bypass!
-                AuthDecision::RequireApproval {
-                    reason: "Executing file reorganization moves files into new directory locations.".to_string(),
-                    risk: RiskLevel::Moderate,
-                    summary: "Move categorized files into organized folders".to_string(),
-                }
+                Self::evaluate_organize_execute(db, ctx, active_grant.as_ref(), args)
             }
             "organize_files_undo" => {
                 let perm_key = "mcp_perm:organize_files_undo";
                 if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
                     if policy_val.trim().to_lowercase() == "deny" {
                         return AuthDecision::Deny {
-                            reason: "File organization undo is explicitly blocked by policy".to_string(),
+                            reason: "File organization undo is explicitly blocked by policy"
+                                .to_string(),
                         };
                     }
                 }
-                // Mutating tool: MUST require approval. Persisted permission CANNOT silently bypass!
+                Self::evaluate_organize_undo(db, ctx, active_grant.as_ref(), args)
+            }
+            "rollback_code_checkpoint" => AuthDecision::RequireApproval {
+                reason: "Rolling back a code checkpoint restores previous file states.".to_string(),
+                risk: RiskLevel::Moderate,
+                summary: "Revert agent modified files to checkpoint state".to_string(),
+            },
+            "start_dev_server" | "audit_ui" => {
+                let target = args["path"].as_str().unwrap_or("");
                 AuthDecision::RequireApproval {
-                    reason: "Undoing file organization moves files back to their previous locations.".to_string(),
+                    reason: "Starting a project's development server executes repository-controlled code".to_string(),
                     risk: RiskLevel::Moderate,
-                    summary: "Reverse organized file moves".to_string(),
+                    summary: format!(
+                        "Start the development server of the project at '{}'",
+                        if target.is_empty() {
+                            "(discovered project)".to_string()
+                        } else {
+                            target.to_string()
+                        }
+                    ),
                 }
             }
+            "browser_navigate" => {
+                let url = args["url"].as_str().unwrap_or("");
+                if url.trim().is_empty() {
+                    return AuthDecision::Deny {
+                        reason: "browser_navigate requires a 'url' parameter".to_string(),
+                    };
+                }
+                for domain in &policy.blocked_domains {
+                    if url.to_lowercase().contains(&domain.to_lowercase()) {
+                        return AuthDecision::Deny {
+                            reason: format!(
+                                "The requested URL targets the blocked domain '{}'",
+                                domain
+                            ),
+                        };
+                    }
+                }
+                AuthDecision::Allow
+            }
+            "browser_click" => {
+                const CONSEQUENTIAL: &[&str] = &[
+                    "delete",
+                    "remove",
+                    "purchase",
+                    "buy",
+                    "pay",
+                    "checkout",
+                    "send",
+                    "publish",
+                    "deploy",
+                    "confirm",
+                    "submit",
+                    "transfer",
+                    "upgrade",
+                    "subscribe",
+                    "invite",
+                    "sign out",
+                    "log out",
+                    "logout",
+                ];
+                let label = format!(
+                    "{} {}",
+                    args["name"].as_str().unwrap_or(""),
+                    args["text"].as_str().unwrap_or("")
+                )
+                .to_lowercase();
+                if CONSEQUENTIAL.iter().any(|c| label.contains(c)) {
+                    AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Activating the control '{}' may perform a consequential action",
+                            label.trim()
+                        ),
+                        risk: RiskLevel::Moderate,
+                        summary: format!("Activate the control: {}", label.trim()),
+                    }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            "browser_fill" => {
+                let value = args["value"].as_str().unwrap_or("");
+                if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(value) {
+                    AuthDecision::RequireTakeover { reason }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            "browser_open" | "stop_dev_server" | "browser_close" => AuthDecision::Allow,
             _ => {
                 // MCP or custom external tool
                 Self::evaluate_mcp_or_custom(db, &policy, tool_name, args)
@@ -550,6 +1191,22 @@ impl AuthorizationEngine {
         Self::analyze_shell_command(policy, None, args).decision
     }
 
+    /// Analyses a shell command string against the configured shell policy.
+    pub fn analyze_shell_command(
+        policy: &GovernancePolicy,
+        workspace_root: Option<&Path>,
+        args: &serde_json::Value,
+    ) -> ShellAnalysis {
+        let dummy_ctx = workspace_root.map(|ws| ExecutionContext {
+            run_id: String::new(),
+            agent_id: String::new(),
+            conversation_id: None,
+            workspace_root: Some(ws.to_path_buf()),
+            task_grant: None,
+        });
+        Self::analyze_shell_command_in_context(policy, dummy_ctx.as_ref(), args)
+    }
+
     /// Evaluates a shell command with access to the workspace root so that
     /// path arguments can be constrained to the authorised working directory.
     pub fn evaluate_shell_in_context(
@@ -557,18 +1214,13 @@ impl AuthorizationEngine {
         ctx: &ExecutionContext,
         args: &serde_json::Value,
     ) -> AuthDecision {
-        Self::analyze_shell_command(policy, ctx.workspace_root.as_deref(), args).decision
+        Self::analyze_shell_command_in_context(policy, Some(ctx), args).decision
     }
 
-    /// Analyses a shell command string against the configured shell policy.
-    ///
-    /// The analysis is deliberately argument-aware: the executable name alone
-    /// is never sufficient for auto-approval.  Every flag is checked against
-    /// the executable's policy and every path-like argument is checked against
-    /// the protected-location list and the workspace boundary.
-    pub fn analyze_shell_command(
+    /// Analyses a shell command string against the configured shell policy and execution context.
+    pub fn analyze_shell_command_in_context(
         policy: &GovernancePolicy,
-        workspace_root: Option<&Path>,
+        ctx: Option<&ExecutionContext>,
         args: &serde_json::Value,
     ) -> ShellAnalysis {
         let cmd = match args["command"].as_str() {
@@ -683,6 +1335,39 @@ impl AuthorizationEngine {
                 requires_shell: true,
                 lexed_words: words,
             };
+        }
+
+        let workspace_root = ctx.and_then(|c| c.workspace_root.as_deref());
+
+        // Check if command is a routine local verification step permitted by active task grant
+        if let Some(grant) = ctx.and_then(|c| c.task_grant.as_ref()) {
+            if grant.mode == TaskAutonomyMode::Autonomous
+                && grant
+                    .allowed_operations
+                    .contains(&RoutineOpClass::LocalVerification)
+                && RiskLevel::Moderate <= grant.max_risk
+                && workspace_root.is_some()
+            {
+                if Self::is_local_verification_command(&executable, &words) {
+                    let mut paths_ok = true;
+                    for arg in &words[1..] {
+                        if !arg.starts_with('-') {
+                            if Self::check_path_argument(arg, workspace_root).is_some() {
+                                paths_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if paths_ok {
+                        return ShellAnalysis {
+                            decision: AuthDecision::Allow,
+                            argv: Some(words.clone()),
+                            requires_shell: false,
+                            lexed_words: words,
+                        };
+                    }
+                }
+            }
         }
 
         // Interpreters and shell wrappers can execute arbitrary code.
@@ -1007,7 +1692,35 @@ impl AuthorizationEngine {
         None
     }
 
-    /// Evaluates filesystem reads: canonical workspace confinement validation
+    fn is_local_verification_command(executable: &str, words: &[String]) -> bool {
+        let base = executable.rsplit('/').next().unwrap_or(executable);
+        match base {
+            "cargo" => {
+                if words.len() >= 2 {
+                    matches!(words[1].as_str(), "test" | "check" | "build" | "clippy")
+                } else {
+                    false
+                }
+            }
+            "npm" => {
+                if words.len() >= 2 {
+                    if words[1] == "test" {
+                        true
+                    } else if words[1] == "run" && words.len() >= 3 {
+                        matches!(words[2].as_str(), "test" | "build" | "check" | "lint")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            "pytest" => true,
+            _ => false,
+        }
+    }
+
+    /// Evaluates filesystem reads: canonical workspace / authorized folders confinement validation
     pub fn evaluate_file_read(ctx: &ExecutionContext, args: &serde_json::Value) -> AuthDecision {
         let path_str = match args["path"].as_str() {
             Some(p) if !p.trim().is_empty() => p.trim(),
@@ -1017,6 +1730,57 @@ impl AuthorizationEngine {
                 }
             }
         };
+
+        // 1. Prohibited sensitive paths check
+        let lower = path_str.to_lowercase();
+        for &prohibited in Self::PROHIBITED_PATHS {
+            if lower.contains(prohibited) {
+                return AuthDecision::Deny {
+                    reason: format!(
+                        "Filesystem access to sensitive system location '{}' is strictly prohibited",
+                        prohibited
+                    ),
+                };
+            }
+        }
+
+        // 2. Traversal verification
+        if path_str.contains("../") || path_str.contains("..\\") || path_str == ".." {
+            return AuthDecision::Deny {
+                reason: "Directory traversal ('..') escapes workspace root".into(),
+            };
+        }
+
+        // 3. Task grant evaluation if present
+        if let Some(ref grant) = ctx.task_grant {
+            let now = chrono::Utc::now().timestamp_millis();
+            if !grant.is_active(&ctx.run_id, now) || grant.mode == TaskAutonomyMode::Supervised {
+                return AuthDecision::RequireApproval {
+                    reason: if grant.mode == TaskAutonomyMode::Supervised {
+                        "Supervised mode requires approval for file reads".to_string()
+                    } else {
+                        "Active task authorization grant has expired or is invalid for this run"
+                            .to_string()
+                    },
+                    risk: RiskLevel::Safe,
+                    summary: format!("Read file '{}'", path_str),
+                };
+            }
+            if !grant.allowed_operations.contains(&RoutineOpClass::FileRead) {
+                return AuthDecision::RequireApproval {
+                    reason: "Task grant does not permit autonomous file reads".to_string(),
+                    risk: RiskLevel::Safe,
+                    summary: format!("Read file '{}'", path_str),
+                };
+            }
+            let p = Path::new(path_str);
+            if !grant.path_in_scope(p) {
+                return AuthDecision::Deny {
+                    reason: format!("Path '{}' is outside task authorized scope", path_str),
+                };
+            }
+            return AuthDecision::Allow;
+        }
 
         match Self::validate_path_confinement(ctx.workspace_root.as_deref(), path_str, FileOp::Read)
         {
@@ -1035,6 +1799,60 @@ impl AuthorizationEngine {
                 }
             }
         };
+
+        // 1. Prohibited sensitive paths check
+        let lower = path_str.to_lowercase();
+        for &prohibited in Self::PROHIBITED_PATHS {
+            if lower.contains(prohibited) {
+                return AuthDecision::Deny {
+                    reason: format!(
+                        "Filesystem access to sensitive system location '{}' is strictly prohibited",
+                        prohibited
+                    ),
+                };
+            }
+        }
+
+        // 2. Traversal verification
+        if path_str.contains("../") || path_str.contains("..\\") || path_str == ".." {
+            return AuthDecision::Deny {
+                reason: "Directory traversal ('..') escapes workspace root".into(),
+            };
+        }
+
+        // 3. Task grant evaluation if present
+        if let Some(ref grant) = ctx.task_grant {
+            let now = chrono::Utc::now().timestamp_millis();
+            if !grant.is_active(&ctx.run_id, now) || grant.mode == TaskAutonomyMode::Supervised {
+                return AuthDecision::RequireApproval {
+                    reason: if grant.mode == TaskAutonomyMode::Supervised {
+                        "Supervised mode requires approval for file writes".to_string()
+                    } else {
+                        "Active task authorization grant has expired or is invalid for this run"
+                            .to_string()
+                    },
+                    risk: RiskLevel::Safe,
+                    summary: format!("Write file '{}'", path_str),
+                };
+            }
+            if !grant
+                .allowed_operations
+                .contains(&RoutineOpClass::FileWrite)
+            {
+                return AuthDecision::RequireApproval {
+                    reason: "Task grant does not permit autonomous file writes".to_string(),
+                    risk: RiskLevel::Safe,
+                    summary: format!("Write file '{}'", path_str),
+                };
+            }
+            let p = Path::new(path_str);
+            if !grant.path_in_scope(p) {
+                return AuthDecision::Deny {
+                    reason: format!("Path '{}' is outside task authorized scope", path_str),
+                };
+            }
+            return AuthDecision::Allow;
+        }
 
         match Self::validate_path_confinement(
             ctx.workspace_root.as_deref(),

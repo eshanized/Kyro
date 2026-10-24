@@ -2441,3 +2441,312 @@ async fn test_pre_registry_install_bots_survive_and_legacy_prompts_ignored() {
         "profile snapshot must capture manifest instructions, not the legacy prompt"
     );
 }
+
+// ---------------------------------------------------------------------
+// Bounded Task-Level Autonomy End-to-End Agent Loop Tests (Section 7)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_bounded_task_autonomy_agent_loop_e2e_autonomous_flow() {
+    use kyro_lib::governance::{TaskAuthorizationGrant, TaskAutonomyMode};
+    use kyro_lib::storage::AuthorizedFolderRecord;
+
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_autonomous_loop");
+    let canonical_ws = ws_dir.path().canonicalize().unwrap();
+    let run_id = "run_autonomous_loop_e2e";
+
+    // 1. Authorize workspace in database
+    let folder_rec = AuthorizedFolderRecord {
+        id: "auth_ws_loop".to_string(),
+        path: canonical_ws.to_string_lossy().to_string(),
+        display_name: "Workspace Loop".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&folder_rec).unwrap();
+
+    // Create a dummy document in workspace
+    let doc_file = canonical_ws.join("doc.pdf");
+    std::fs::write(&doc_file, "sample pdf content").unwrap();
+
+    // 2. Create the run with a bounded Autonomous TaskAuthorizationGrant
+    let grant = TaskAuthorizationGrant::new(
+        run_id.to_string(),
+        Some(canonical_ws.clone()),
+        vec![canonical_ws.clone()],
+        TaskAutonomyMode::Autonomous,
+    );
+
+    let conv_id = format!("conv_{}", run_id);
+    let _ = db.create_conversation(&conv_id, "Autonomous Loop Test", "test-model");
+    let config_json = serde_json::json!({
+        "workspace_root": canonical_ws.to_string_lossy().to_string(),
+        "task_grant": grant,
+    })
+    .to_string();
+    let run = AgentRun {
+        id: run_id.to_string(),
+        conversation_id: Some(conv_id),
+        agent_id: "apex-orchestrator".to_string(),
+        model: "test-model".to_string(),
+        prompt: "Organize files and write summary autonomously".to_string(),
+        status: "running".to_string(),
+        created_at: chrono::Utc::now().timestamp_millis(),
+        started_at: Some(chrono::Utc::now().timestamp_millis()),
+        completed_at: None,
+        error: None,
+        config_json: Some(config_json),
+        parent_run_id: None,
+    };
+    db.create_run(&run).unwrap();
+
+    // 3. Multi-turn autonomous sequence:
+    // Turn 1: Model calls organize_files_preview
+    let dir_arg = canonical_ws.to_string_lossy().to_string();
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Turn 1: Generating preview plan...",
+                    "tool_calls": [
+                        {
+                            "id": "tc_turn1_preview",
+                            "type": "function",
+                            "function": {
+                                "name": "organize_files_preview",
+                                "arguments": serde_json::json!({ "directory": dir_arg }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Turn 2: Model performs routine file operations (write_file)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Turn 2: Writing summary of organized files...",
+                    "tool_calls": [
+                        {
+                            "id": "tc_turn2_write",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": serde_json::json!({
+                                    "path": "summary.md",
+                                    "content": "# Organization Summary\nFiles organized autonomously."
+                                }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // Turn 3: Model finishes the task
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Task completed autonomously without approval interruptions."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    // 4. Run the agent loop
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Please organize files and generate a summary."),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let res = engine
+        .run_step_with_connectors(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys",
+            history,
+            db.clone(),
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+
+    assert!(res.is_ok(), "Autonomous run must succeed: {:?}", res.err());
+    assert_eq!(
+        res.unwrap(),
+        "Task completed autonomously without approval interruptions."
+    );
+
+    // 5. Verification:
+    // File was written
+    let summary_path = canonical_ws.join("summary.md");
+    assert!(summary_path.exists(), "summary.md must have been created");
+    assert!(std::fs::read_to_string(&summary_path)
+        .unwrap()
+        .contains("Files organized autonomously"));
+
+    // Timeline event verification: NEVER entered waiting_approval
+    let events = db.get_run_events(run_id, None).unwrap();
+    assert!(
+        !events.iter().any(|e| e.event_type == "waiting_approval"),
+        "Autonomous run must NEVER enter waiting_approval state"
+    );
+}
+
+#[tokio::test]
+async fn test_bounded_task_autonomy_agent_loop_supervised_enters_waiting_approval() {
+    use kyro_lib::governance::{TaskAuthorizationGrant, TaskAutonomyMode};
+    use kyro_lib::storage::AuthorizedFolderRecord;
+
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_supervised_loop");
+    let canonical_ws = ws_dir.path().canonicalize().unwrap();
+    let run_id = "run_supervised_loop_e2e";
+
+    // 1. Authorize workspace in database
+    let folder_rec = AuthorizedFolderRecord {
+        id: "auth_ws_sup".to_string(),
+        path: canonical_ws.to_string_lossy().to_string(),
+        display_name: "Workspace Sup".to_string(),
+        added_at: 1000,
+    };
+    db.add_authorized_folder(&folder_rec).unwrap();
+
+    // 2. Create the run with Supervised TaskAuthorizationGrant
+    let grant = TaskAuthorizationGrant::new(
+        run_id.to_string(),
+        Some(canonical_ws.clone()),
+        vec![canonical_ws.clone()],
+        TaskAutonomyMode::Supervised, // Supervised mode!
+    );
+
+    let conv_id = format!("conv_{}", run_id);
+    let _ = db.create_conversation(&conv_id, "Supervised Loop Test", "test-model");
+    let config_json = serde_json::json!({
+        "workspace_root": canonical_ws.to_string_lossy().to_string(),
+        "task_grant": grant,
+    })
+    .to_string();
+    let run = AgentRun {
+        id: run_id.to_string(),
+        conversation_id: Some(conv_id),
+        agent_id: "apex-orchestrator".to_string(),
+        model: "test-model".to_string(),
+        prompt: "Perform supervised modification".to_string(),
+        status: "running".to_string(),
+        created_at: chrono::Utc::now().timestamp_millis(),
+        started_at: Some(chrono::Utc::now().timestamp_millis()),
+        completed_at: None,
+        error: None,
+        config_json: Some(config_json),
+        parent_run_id: None,
+    };
+    db.create_run(&run).unwrap();
+
+    // 3. Model attempts to execute a mutating operation (write_file)
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Attempting supervised file write...",
+                    "tool_calls": [
+                        {
+                            "id": "tc_sup_write",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": serde_json::json!({
+                                    "path": "supervised.txt",
+                                    "content": "supervised write content"
+                                }).to_string()
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // 4. Run the engine in background with a cancellation token
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Supervised write test"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let cancel_token = CancellationToken::new();
+    let token_clone = cancel_token.clone();
+    let db_clone = db.clone();
+    let run_id_str = run_id.to_string();
+    let base_url = server.base_url();
+
+    let loop_handle = tokio::spawn(async move {
+        engine
+            .run_step_with_connectors(
+                &run_id_str,
+                "test-model",
+                "test-key",
+                Some(&base_url),
+                "Sys",
+                history,
+                db_clone,
+                None,
+                None,
+                Some(token_clone),
+                |_| {},
+            )
+            .await
+    });
+
+    // 5. Poll database until run enters 'waiting_approval'
+    let mut entered_waiting_approval = false;
+    for _ in 0..50 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if let Ok(Some(r)) = db.get_run(run_id) {
+            if r.status == "waiting_approval" {
+                entered_waiting_approval = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        entered_waiting_approval,
+        "Supervised task must transition to 'waiting_approval' status"
+    );
+
+    // 6. Verify run event 'waiting_approval' was emitted
+    let events = db.get_run_events(run_id, None).unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "waiting_approval"),
+        "Timeline must contain 'waiting_approval' event"
+    );
+
+    // 7. Cancel token to terminate cleanly
+    cancel_token.cancel();
+    let _ = loop_handle.await;
+}

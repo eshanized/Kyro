@@ -237,6 +237,7 @@ export interface GovernancePolicy {
   computer_use_mode: string; // "FullAutonomous" | "ConfirmDestructive" | "AskAlways"
   require_takeover_for_credentials: boolean;
   blocked_domains: string[];
+  task_autonomy_mode?: string; // "Autonomous" | "Supervised"
 }
 
 export interface McpServerRecord {

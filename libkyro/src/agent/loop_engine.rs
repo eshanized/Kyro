@@ -1042,7 +1042,7 @@ The program is started as an explicit executable plus argument vector; free-form
             );
         }
 
-        let (configured_workspace, requires_isolated_worktree) =
+        let (configured_workspace, requires_isolated_worktree, persisted_task_grant) =
             if let Ok(Some(r)) = db.get_run(run_id) {
                 if let Some(ref cfg_str) = r.config_json {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(cfg_str) {
@@ -1058,22 +1058,25 @@ The program is started as an explicit executable plus argument vector; free-form
                             .get("isolated_worktree")
                             .map(|b| b.as_bool().unwrap_or(true))
                             .unwrap_or(iso_path.is_some());
+                        let grant: Option<crate::governance::TaskAuthorizationGrant> = v
+                            .get("task_grant")
+                            .and_then(|g| serde_json::from_value(g.clone()).ok());
 
                         if let Some(p) = iso_path {
-                            (Some(p), true)
+                            (Some(p), true, grant)
                         } else if let Some(p) = ws_path {
-                            (Some(p), is_isolated)
+                            (Some(p), is_isolated, grant)
                         } else {
-                            (None, false)
+                            (None, false, grant)
                         }
                     } else {
-                        (None, false)
+                        (None, false, None)
                     }
                 } else {
-                    (None, false)
+                    (None, false, None)
                 }
             } else {
-                (None, false)
+                (None, false, None)
             };
 
         // Fail-closed workspace containment: if isolation was requested, path MUST exist.
@@ -1127,6 +1130,7 @@ The program is started as an explicit executable plus argument vector; free-form
                 .flatten()
                 .and_then(|r| r.conversation_id),
             workspace_root: workspace_root.clone(),
+            task_grant: persisted_task_grant,
         };
 
         // The shell analysis is computed once, before authorisation, so that the
@@ -1135,9 +1139,9 @@ The program is started as an explicit executable plus argument vector; free-form
         // disagree about what runs.
         let shell_analysis = if matches!(tc.name.as_str(), "execute_shell" | "bash" | "terminal") {
             let policy = crate::governance::PolicyEngine::load(db);
-            Some(AuthorizationEngine::analyze_shell_command(
+            Some(AuthorizationEngine::analyze_shell_command_in_context(
                 &policy,
-                workspace_root.as_deref(),
+                Some(&ctx),
                 &tc.arguments,
             ))
         } else {
@@ -2458,6 +2462,7 @@ The program is started as an explicit executable plus argument vector; free-form
                     } else {
                         Some(context_summary.to_string())
                     },
+                    task_grant: None,
                 };
 
                 let child_run = AgentRun {

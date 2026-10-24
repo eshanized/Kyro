@@ -81,6 +81,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     computer_use_mode: "FullAutonomous",
     require_takeover_for_credentials: true,
     blocked_domains: ["chase.com", "bankofamerica.com", "paypal.com"],
+    task_autonomy_mode: "Autonomous",
   });
   const [sandbox, setSandbox] = useState<SandboxStatus | null>(null);
   const [health, setHealth] = useState<SystemHealthInfo | null>(null);
@@ -613,6 +614,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <option value="FullAutonomous">FullAutonomous (Free mouse & keyboard actions)</option>
                   <option value="ConfirmDestructive">ConfirmDestructive (Pause on close windows / delete shortcuts)</option>
                   <option value="AskAlways">AskAlways (Prompt human confirmation on all desktop inputs)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5">
+                  Task Autonomy Mode
+                </label>
+                <select
+                  value={policy.task_autonomy_mode || "Autonomous"}
+                  onChange={(e) => setPolicy({ ...policy, task_autonomy_mode: e.target.value })}
+                  className="w-full px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500"
+                >
+                  <option value="Autonomous">Autonomous (Run routine, in-scope actions without repeated prompts)</option>
+                  <option value="Supervised">Supervised (Prompt approval for individual operations)</option>
                 </select>
               </div>
 

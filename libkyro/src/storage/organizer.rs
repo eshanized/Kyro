@@ -163,7 +163,9 @@ impl FileOrganizer {
         if s == "~" {
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
         } else if let Some(rest) = s.strip_prefix("~/") {
-            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| path.to_path_buf())
+            dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| path.to_path_buf())
         } else {
             path.to_path_buf()
         }
@@ -378,7 +380,11 @@ impl FileOrganizer {
         let read_dir = match fs::read_dir(dir) {
             Ok(d) => d,
             Err(e) => {
-                warnings.push(format!("Failed to read directory '{}': {}", dir.display(), e));
+                warnings.push(format!(
+                    "Failed to read directory '{}': {}",
+                    dir.display(),
+                    e
+                ));
                 return Ok(());
             }
         };
@@ -387,7 +393,11 @@ impl FileOrganizer {
             let entry = match entry_res {
                 Ok(e) => e,
                 Err(e) => {
-                    warnings.push(format!("Failed to read entry in '{}': {}", dir.display(), e));
+                    warnings.push(format!(
+                        "Failed to read entry in '{}': {}",
+                        dir.display(),
+                        e
+                    ));
                     continue;
                 }
             };
@@ -397,7 +407,11 @@ impl FileOrganizer {
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
-                    warnings.push(format!("Failed to read metadata for '{}': {}", path.display(), e));
+                    warnings.push(format!(
+                        "Failed to read metadata for '{}': {}",
+                        path.display(),
+                        e
+                    ));
                     continue;
                 }
             };
@@ -497,7 +511,9 @@ impl FileOrganizer {
                     file_hash: op.file_hash.clone().unwrap_or_default(),
                     file_size: op.file_size,
                     status: "failed".to_string(),
-                    error: Some("Security rejection: source path is not a regular file".to_string()),
+                    error: Some(
+                        "Security rejection: source path is not a regular file".to_string(),
+                    ),
                 });
 
                 continue;
@@ -674,7 +690,6 @@ impl FileOrganizer {
                                             .to_string(),
                                     ),
                                 });
-            
                             } else {
                                 match fs::remove_file(&op.source_path) {
                                     Ok(_) => {
@@ -705,7 +720,6 @@ impl FileOrganizer {
                                                 rem_err
                                             )),
                                         });
-                    
                                     }
                                 }
                             }
@@ -722,14 +736,14 @@ impl FileOrganizer {
                                     e, copy_err
                                 )),
                             });
-        
                         }
                     }
                 }
             }
         }
 
-        let all_completed = !op_records.is_empty() && op_records.iter().all(|o| o.status == "completed");
+        let all_completed =
+            !op_records.is_empty() && op_records.iter().all(|o| o.status == "completed");
         let status = if all_completed {
             "completed".to_string()
         } else {
@@ -999,15 +1013,15 @@ impl FileOrganizer {
                 || stored_op.conflict != submitted_op.conflict
             {
                 return Err(
-                    "Security rejection: Plan tampering detected on operation details."
-                        .to_string(),
+                    "Security rejection: Plan tampering detected on operation details.".to_string(),
                 );
             }
         }
 
         // Verify target directory is still authorized
-        let canonical_target = check_path_authorized_in_folders(&stored_plan.target_directory, &folders)
-            .map_err(|e| format!("Access denied for target directory: {}", e))?;
+        let canonical_target =
+            check_path_authorized_in_folders(&stored_plan.target_directory, &folders)
+                .map_err(|e| format!("Access denied for target directory: {}", e))?;
 
         // Recheck authorization and containment immediately before execution
         for action in &stored_plan.operations {
@@ -1033,12 +1047,12 @@ impl FileOrganizer {
 
             let canon_dest = check_path_authorized_in_folders(&action.destination_path, &folders)
                 .map_err(|e| {
-                    format!(
-                        "Access denied for organization destination '{}': {}",
-                        action.destination_path.display(),
-                        e
-                    )
-                })?;
+                format!(
+                    "Access denied for organization destination '{}': {}",
+                    action.destination_path.display(),
+                    e
+                )
+            })?;
             if !canon_dest.starts_with(&canonical_target) {
                 return Err(format!(
                     "Security rejection: destination path '{}' escapes organization root",

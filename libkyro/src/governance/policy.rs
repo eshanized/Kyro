@@ -1,12 +1,18 @@
 use crate::storage::Database;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GovernancePolicy {
     pub shell_mode: String,        // "SafeAutoApprove", "AskAlways", "SandboxOnly"
     pub computer_use_mode: String, // "FullAutonomous", "ConfirmDestructive", "AskAlways"
     pub require_takeover_for_credentials: bool,
     pub blocked_domains: Vec<String>,
+    #[serde(default = "default_task_autonomy_mode")]
+    pub task_autonomy_mode: String, // "Autonomous", "Supervised"
+}
+
+fn default_task_autonomy_mode() -> String {
+    "Autonomous".to_string()
 }
 
 impl Default for GovernancePolicy {
@@ -21,6 +27,7 @@ impl Default for GovernancePolicy {
                 "wellsfargo.com".into(),
                 "paypal.com".into(),
             ],
+            task_autonomy_mode: default_task_autonomy_mode(),
         }
     }
 }

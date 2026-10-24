@@ -1,10 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RiskLevel {
     Safe,
     Moderate,
     Destructive,
+}
+
+impl RiskLevel {
+    pub fn is_at_most(&self, ceiling: RiskLevel) -> bool {
+        *self <= ceiling
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

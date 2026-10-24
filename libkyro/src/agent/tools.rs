@@ -1076,11 +1076,17 @@ pub async fn organize_files_undo(
     } else if let Some(id) = args["transaction"]["transaction_id"].as_str() {
         id.to_string()
     } else {
-        return ToolOutcome::fail("Missing 'transaction_id' or 'transaction' in arguments.".to_string());
+        return ToolOutcome::fail(
+            "Missing 'transaction_id' or 'transaction' in arguments.".to_string(),
+        );
     };
     match crate::storage::organizer::FileOrganizer::undo_authorized(db, &trx_id) {
         Ok(trx) => {
-            let count = trx.operations.iter().filter(|o| o.status == "undone").count();
+            let count = trx
+                .operations
+                .iter()
+                .filter(|o| o.status == "undone")
+                .count();
             ToolOutcome::ok(format!("Successfully reversed {} file operations.", count))
         }
         Err(e) => ToolOutcome::fail(e),
@@ -1140,123 +1146,31 @@ pub async fn diagnose_build_failure(args: &serde_json::Value) -> ToolOutcome {
     ToolOutcome::ok(serde_json::to_string_pretty(&diag).unwrap_or_default())
 }
 
-/// The authorisation decisions for the new tools.
+/// The authorisation decisions for tools (reconciled with the centralized AuthorizationEngine).
 pub fn evaluate_tool(
     policy: &crate::governance::GovernancePolicy,
     ctx: &ExecutionContext,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Option<AuthDecision> {
-    match tool_name {
-        "organize_files_execute" => Some(AuthDecision::RequireApproval {
-            reason: "Executing file reorganization moves files into new directory locations."
-                .to_string(),
-            risk: crate::execution::permissions::RiskLevel::Moderate,
-            summary: "Move categorized files into organized folders".to_string(),
-        }),
-        "organize_files_undo" => Some(AuthDecision::RequireApproval {
-            reason: "Undoing file organization moves files back to their previous locations."
-                .to_string(),
-            risk: crate::execution::permissions::RiskLevel::Moderate,
-            summary: "Reverse organized file moves".to_string(),
-        }),
-        "rollback_code_checkpoint" => Some(AuthDecision::RequireApproval {
-            reason: "Rolling back a code checkpoint restores previous file states.".to_string(),
-            risk: crate::execution::permissions::RiskLevel::Moderate,
-            summary: "Revert agent modified files to checkpoint state".to_string(),
-        }),
-        "start_dev_server" | "audit_ui" => {
-            let target = args["path"].as_str().unwrap_or("");
-            Some(AuthDecision::RequireApproval {
-                reason:
-                    "Starting a project's development server executes repository-controlled code"
-                        .to_string(),
-                risk: crate::execution::permissions::RiskLevel::Moderate,
-                summary: format!(
-                    "Start the development server of the project at '{}'",
-                    if target.is_empty() {
-                        "(discovered project)".to_string()
-                    } else {
-                        target.to_string()
-                    }
-                ),
-            })
-        }
-        "browser_navigate" => {
-            let url = args["url"].as_str().unwrap_or("");
-            if url.trim().is_empty() {
-                return Some(AuthDecision::Deny {
-                    reason: "browser_navigate requires a 'url' parameter".to_string(),
-                });
+    let dec =
+        crate::governance::AuthorizationEngine::evaluate_without_db(policy, ctx, tool_name, args);
+    match dec {
+        AuthDecision::Allow => {
+            if matches!(
+                tool_name,
+                "browser_open"
+                    | "stop_dev_server"
+                    | "browser_close"
+                    | "browser_click"
+                    | "browser_fill"
+            ) {
+                None
+            } else {
+                Some(AuthDecision::Allow)
             }
-            for domain in &policy.blocked_domains {
-                if url.to_lowercase().contains(&domain.to_lowercase()) {
-                    return Some(AuthDecision::Deny {
-                        reason: format!(
-                            "The requested URL targets the blocked domain '{}'",
-                            domain
-                        ),
-                    });
-                }
-            }
-            None
         }
-        "browser_click" => {
-            // Activating a control that could commit a destructive or
-            // transactional action requires explicit confirmation.
-            const CONSEQUENTIAL: &[&str] = &[
-                "delete",
-                "remove",
-                "purchase",
-                "buy",
-                "pay",
-                "checkout",
-                "send",
-                "publish",
-                "deploy",
-                "confirm",
-                "submit",
-                "transfer",
-                "upgrade",
-                "subscribe",
-                "invite",
-                "sign out",
-                "log out",
-                "logout",
-            ];
-            let label = format!(
-                "{} {}",
-                args["name"].as_str().unwrap_or(""),
-                args["text"].as_str().unwrap_or("")
-            )
-            .to_lowercase();
-            if CONSEQUENTIAL.iter().any(|c| label.contains(c)) {
-                return Some(AuthDecision::RequireApproval {
-                    reason: format!(
-                        "Activating the control '{}' may perform a consequential action",
-                        label.trim()
-                    ),
-                    risk: crate::execution::permissions::RiskLevel::Moderate,
-                    summary: format!("Activate the control: {}", label.trim()),
-                });
-            }
-            None
-        }
-        "browser_fill" => {
-            let value = args["value"].as_str().unwrap_or("");
-            if let Some(reason) =
-                crate::governance::TakeoverController::detect_sensitive_checkpoint(value)
-            {
-                return Some(AuthDecision::RequireTakeover { reason });
-            }
-            None
-        }
-        "browser_open" => None,
-        "stop_dev_server" | "browser_close" => {
-            let _ = ctx;
-            None
-        }
-        _ => None,
+        other => Some(other),
     }
 }
 
@@ -1291,6 +1205,7 @@ mod tests {
             agent_id: "a".into(),
             conversation_id: None,
             workspace_root: None,
+            task_grant: None,
         };
         let args = serde_json::json!({ "name": "Delete account" });
         let decision = evaluate_tool(&policy, &ctx, "browser_click", &args).unwrap();
@@ -1305,6 +1220,7 @@ mod tests {
             agent_id: "a".into(),
             conversation_id: None,
             workspace_root: None,
+            task_grant: None,
         };
         let args = serde_json::json!({ "name": "Open menu" });
         assert!(evaluate_tool(&policy, &ctx, "browser_click", &args).is_none());
@@ -1318,6 +1234,7 @@ mod tests {
             agent_id: "a".into(),
             conversation_id: None,
             workspace_root: None,
+            task_grant: None,
         };
         let args = serde_json::json!({ "url": "https://paypal.com/checkout" });
         let decision = evaluate_tool(&policy, &ctx, "browser_navigate", &args).unwrap();
@@ -1332,6 +1249,7 @@ mod tests {
             agent_id: "a".into(),
             conversation_id: None,
             workspace_root: None,
+            task_grant: None,
         };
         let args = serde_json::json!({ "value": "my credit card 4111 1111 1111 1111" });
         let decision = evaluate_tool(&policy, &ctx, "browser_fill", &args).unwrap();

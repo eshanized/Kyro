@@ -11,7 +11,6 @@ import {
   X,
   Layers,
   Clock,
-  ArrowRight,
 } from "lucide-react";
 import {
   OrganizationPlan,

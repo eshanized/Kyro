@@ -211,6 +211,7 @@ fn test_centralized_authorization_engine() {
         agent_id: "apex-orchestrator".to_string(),
         conversation_id: None,
         workspace_root: None,
+        task_grant: None,
     };
 
     // 1. Safe shell command -> Allow
@@ -672,6 +673,7 @@ fn test_end_to_end_agent_task_lifecycle_and_recovery() {
         agent_id: "apex-orchestrator".to_string(),
         conversation_id: Some("conv_e2e".to_string()),
         workspace_root: None,
+        task_grant: None,
     };
 
     let permitted_tool = serde_json::json!({ "command": "pwd" });
@@ -823,6 +825,7 @@ fn test_artifacts_lifecycle_and_path_security() {
         agent_id: "apex".into(),
         conversation_id: None,
         workspace_root: None,
+        task_grant: None,
     };
 
     let bad_traversal = serde_json::json!({
@@ -963,6 +966,7 @@ fn test_authorization_workspace_confinement_and_traversal() {
         agent_id: "apex".into(),
         conversation_id: None,
         workspace_root: None,
+        task_grant: None,
     };
     let dec = AuthorizationEngine::evaluate(
         &db,
@@ -981,6 +985,7 @@ fn test_authorization_workspace_confinement_and_traversal() {
         agent_id: "apex".into(),
         conversation_id: None,
         workspace_root: Some(workspace.clone()),
+        task_grant: None,
     };
     let dec_traversal = AuthorizationEngine::evaluate(
         &db,
@@ -1059,6 +1064,7 @@ fn test_authorization_shell_injection_multiline_and_compounds() {
         agent_id: "apex".into(),
         conversation_id: None,
         workspace_root: Some(temp_dir.clone()),
+        task_grant: None,
     };
 
     // Safe single command
@@ -1237,6 +1243,7 @@ fn test_mcp_untrusted_names_and_schema_validation() {
         agent_id: "apex".into(),
         conversation_id: None,
         workspace_root: Some(temp_dir.clone()),
+        task_grant: None,
     };
 
     // Tool name containing 'get' or 'read' must NOT automatically be considered read-only / auto-approved!
@@ -1744,6 +1751,7 @@ async fn test_github_connector_and_governance() {
         agent_id: "apex".into(),
         conversation_id: None,
         workspace_root: Some(temp_dir.clone()),
+        task_grant: None,
     };
 
     // A. Read operation -> automatically allowed

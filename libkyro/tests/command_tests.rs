@@ -1050,9 +1050,10 @@ async fn test_document_assistant_and_file_organization_commands() {
         .expect("transaction should exist");
     assert_eq!(retrieved.transaction_id, trx.transaction_id);
 
-    let listed_txs = list_file_transactions(state.clone(), Some(10))
-        .unwrap();
-    assert!(listed_txs.iter().any(|t| t.transaction_id == trx.transaction_id));
+    let listed_txs = list_file_transactions(state.clone(), Some(10)).unwrap();
+    assert!(listed_txs
+        .iter()
+        .any(|t| t.transaction_id == trx.transaction_id));
 
     // Test undo_file_transaction by transaction ID command
     let undone_count = undo_file_transaction(state.clone(), trx.transaction_id.clone())

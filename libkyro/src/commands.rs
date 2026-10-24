@@ -1080,6 +1080,35 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .await?;
     let effective_bot_id = resolved_profile.id.clone();
 
+    let policy = crate::governance::PolicyEngine::load(&state.db);
+    let autonomy_mode = match policy.task_autonomy_mode.trim().to_lowercase().as_str() {
+        "supervised" => crate::governance::TaskAutonomyMode::Supervised,
+        _ => crate::governance::TaskAutonomyMode::Autonomous,
+    };
+
+    let auth_folders: Vec<std::path::PathBuf> = state
+        .db
+        .list_authorized_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|f| std::path::PathBuf::from(f.path).canonicalize().ok())
+        .collect();
+
+    let ws_root = state
+        .db
+        .get_setting("workspace_root")
+        .ok()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.canonicalize().ok());
+
+    let task_grant = Some(crate::governance::TaskAuthorizationGrant::new(
+        effective_run_id.clone(),
+        ws_root,
+        auth_folders,
+        autonomy_mode,
+    ));
+
     let run_snapshot = RunConfigSnapshot {
         profile: resolved_profile.clone(),
         effective_model: selected_model.clone(),
@@ -1094,6 +1123,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         parent_agent: None,
         delegation_depth: Some(0),
         context_summary: None,
+        task_grant,
     };
     let mut cfg_value = serde_json::to_value(&run_snapshot).unwrap_or_default();
     if let Some(obj) = cfg_value.as_object_mut() {
@@ -1998,7 +2028,11 @@ pub async fn undo_file_organization(
     transaction: OrganizationTransaction,
 ) -> Result<usize, String> {
     let trx = FileOrganizer::undo_authorized(&state.db, &transaction.transaction_id)?;
-    let undone_count = trx.operations.iter().filter(|o| o.status == "undone").count();
+    let undone_count = trx
+        .operations
+        .iter()
+        .filter(|o| o.status == "undone")
+        .count();
     Ok(undone_count)
 }
 
@@ -2008,7 +2042,11 @@ pub async fn undo_file_transaction(
     transaction_id: String,
 ) -> Result<usize, String> {
     let trx = FileOrganizer::undo_authorized(&state.db, &transaction_id)?;
-    let undone_count = trx.operations.iter().filter(|o| o.status == "undone").count();
+    let undone_count = trx
+        .operations
+        .iter()
+        .filter(|o| o.status == "undone")
+        .count();
     Ok(undone_count)
 }
 
