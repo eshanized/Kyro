@@ -669,6 +669,13 @@ async fn test_agent_loop_checkpoints_and_file_organizer() {
         .unwrap();
     db.set_setting("mcp_perm:organize_files_preview", "allow")
         .unwrap();
+    db.add_authorized_folder(&kyro_lib::storage::AuthorizedFolderRecord {
+        id: "auth_chk".to_string(),
+        path: ws_dir.path().to_string_lossy().to_string(),
+        display_name: "Workspace".to_string(),
+        added_at: chrono::Utc::now().timestamp_millis(),
+    })
+    .unwrap();
 
     let test_file = ws_dir.path().join("code.rs");
     std::fs::write(&test_file, "fn main() {}").unwrap();
