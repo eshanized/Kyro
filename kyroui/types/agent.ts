@@ -514,9 +514,13 @@ export interface OrganizationPlan {
   plan_id: string;
   target_directory: string;
   total_scanned: number;
+  eligible_files?: number;
+  unmodified_count?: number;
+  planned_count?: number;
   duplicates_count: number;
   conflicts_count: number;
   operations: PlannedFileOp[];
+  scan_warnings?: string[];
 }
 
 export interface OrganizationOpRecord {
@@ -524,7 +528,7 @@ export interface OrganizationOpRecord {
   destination_path: string;
   file_hash: string;
   file_size: number;
-  status: "completed" | "failed" | "undone";
+  status: "completed" | "failed" | "skipped" | "stale" | "undone" | "copied_source_remains" | "undo_failed";
   error?: string | null;
 }
 
@@ -532,7 +536,7 @@ export interface OrganizationTransaction {
   transaction_id: string;
   target_directory: string;
   created_at: number;
-  status: "completed" | "partially_failed" | "undone";
+  status: "completed" | "partially_failed" | "failed" | "undone" | "partially_undone" | "undo_failed";
   operations: OrganizationOpRecord[];
 }
 
