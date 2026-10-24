@@ -199,6 +199,8 @@ fn main() {
             preview_file_organization,
             execute_file_organization,
             undo_file_organization,
+            undo_file_transaction,
+            get_file_transaction,
             analyze_document,
             compare_documents,
             explain_screen_capture,
