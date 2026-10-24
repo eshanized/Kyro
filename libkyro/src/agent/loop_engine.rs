@@ -2695,15 +2695,15 @@ The program is started as an explicit executable plus argument vector; free-form
                 (outcome.message, outcome.is_error, outcome.visual)
             }
             "organize_files_preview" => {
-                let outcome = tools::organize_files_preview(&tc.arguments).await;
+                let outcome = tools::organize_files_preview(&tc.arguments, db).await;
                 (outcome.message, outcome.is_error, outcome.visual)
             }
             "organize_files_execute" => {
-                let outcome = tools::organize_files_execute(&tc.arguments).await;
+                let outcome = tools::organize_files_execute(&tc.arguments, db).await;
                 (outcome.message, outcome.is_error, outcome.visual)
             }
             "organize_files_undo" => {
-                let outcome = tools::organize_files_undo(&tc.arguments).await;
+                let outcome = tools::organize_files_undo(&tc.arguments, db).await;
                 (outcome.message, outcome.is_error, outcome.visual)
             }
             "analyze_document" => {
