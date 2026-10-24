@@ -109,6 +109,157 @@ describe("Kyro Everyday Workflows & Modals", () => {
         expect(invoke).toHaveBeenCalledWith("undo_file_organization", { transaction: mockTx });
       });
     });
+
+    it("loads authorized folders and populates directory on chip click", async () => {
+      const mockFolders = [
+        { id: "f1", path: "/home/user/Documents", display_name: "My Documents", is_active: true, created_at: 1000 },
+        { id: "f2", path: "/home/user/Downloads", display_name: "Downloads", is_active: true, created_at: 1001 },
+      ];
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "list_authorized_folders") return Promise.resolve(mockFolders);
+        if (cmd === "list_file_transactions") return Promise.resolve([]);
+        return Promise.resolve(null);
+      });
+
+      render(<FileOrganizerModal isOpen={true} onClose={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(screen.getByText("My Documents")).toBeInTheDocument();
+        expect(screen.getByText("Downloads")).toBeInTheDocument();
+      });
+
+      const docChip = screen.getByText("My Documents");
+      fireEvent.click(docChip);
+
+      const pathInput = screen.getByPlaceholderText(/Enter absolute directory path/) as HTMLInputElement;
+      expect(pathInput.value).toBe("/home/user/Documents");
+    });
+
+    it("invalidates current plan when directory or settings change", async () => {
+      const mockPlan = {
+        plan_id: "plan-invalidate",
+        target_directory: "/home/user/Downloads",
+        total_scanned: 2,
+        duplicates_count: 0,
+        conflicts_count: 0,
+        scan_warnings: ["Symlink skipped: symlink.txt"],
+        operations: [
+          {
+            source_path: "/home/user/Downloads/note.txt",
+            destination_path: "/home/user/Downloads/Documents/note.txt",
+            category: "Documents",
+            reason: "Extension .txt",
+            file_size: 50,
+            is_duplicate: false,
+          },
+        ],
+      };
+
+      (invoke as any).mockImplementation((cmd: string) => {
+        if (cmd === "preview_file_organization") return Promise.resolve(mockPlan);
+        return Promise.resolve([]);
+      });
+
+      render(<FileOrganizerModal isOpen={true} onClose={vi.fn()} />);
+
+      const pathInput = screen.getByPlaceholderText(/Enter absolute directory path/);
+      fireEvent.change(pathInput, { target: { value: "/home/user/Downloads" } });
+      fireEvent.click(screen.getByText("Scan & Preview"));
+
+      await waitFor(() => {
+        expect(screen.getByText("Scan Warnings (1)")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Execute Organization/i })).toBeInTheDocument();
+      });
+
+      // Changing directory invalidates the plan
+      fireEvent.change(pathInput, { target: { value: "/home/user/Music" } });
+      expect(screen.queryByRole("button", { name: /Execute Organization/i })).not.toBeInTheDocument();
+      expect(screen.queryByText("Scan Warnings (1)")).not.toBeInTheDocument();
+    });
+
+    it("displays partial failures and per-file errors with undo recovery", async () => {
+      const mockPlan = {
+        plan_id: "plan-partial",
+        target_directory: "/home/user/Downloads",
+        total_scanned: 2,
+        duplicates_count: 0,
+        conflicts_count: 1,
+        operations: [
+          {
+            source_path: "/home/user/Downloads/fail.txt",
+            destination_path: "/home/user/Downloads/Documents/fail.txt",
+            category: "Documents",
+            reason: "Extension .txt",
+            file_size: 100,
+            is_duplicate: false,
+          },
+        ],
+      };
+
+      const mockPartialTx = {
+        transaction_id: "tx-partial-999",
+        target_directory: "/home/user/Downloads",
+        created_at: 1700000000,
+        status: "partially_failed" as const,
+        operations: [
+          {
+            source_path: "/home/user/Downloads/fail.txt",
+            destination_path: "/home/user/Downloads/Documents/fail.txt",
+            file_hash: "hash_fail",
+            file_size: 100,
+            status: "failed" as const,
+            error: "Source file modified or stale hash",
+          },
+        ],
+      };
+
+      const mockUndoneTx = {
+        ...mockPartialTx,
+        status: "undone" as const,
+        operations: [
+          {
+            ...mockPartialTx.operations[0],
+            status: "undone" as const,
+          },
+        ],
+      };
+
+      (invoke as any).mockImplementation((cmd: string, args: any) => {
+        if (cmd === "preview_file_organization") return Promise.resolve(mockPlan);
+        if (cmd === "execute_file_organization") return Promise.resolve(mockPartialTx);
+        if (cmd === "undo_file_organization") return Promise.resolve(1);
+        if (cmd === "get_file_transaction") return Promise.resolve(mockUndoneTx);
+        return Promise.resolve([]);
+      });
+
+      render(<FileOrganizerModal isOpen={true} onClose={vi.fn()} />);
+
+      const pathInput = screen.getByPlaceholderText(/Enter absolute directory path/);
+      fireEvent.change(pathInput, { target: { value: "/home/user/Downloads" } });
+      fireEvent.click(screen.getByText("Scan & Preview"));
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /Execute Organization/i })).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /Execute Organization/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/Partially organized/)).toBeInTheDocument();
+        expect(screen.getByText("Source file modified or stale hash")).toBeInTheDocument();
+        expect(screen.getByText("partially_failed")).toBeInTheDocument();
+      });
+
+      // Click Undo Transaction
+      fireEvent.click(screen.getByRole("button", { name: /Undo Transaction/i }));
+
+      await waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith("undo_file_organization", { transaction: mockPartialTx });
+        expect(invoke).toHaveBeenCalledWith("get_file_transaction", { transactionId: "tx-partial-999" });
+        expect(screen.getByText(/Successfully reversed 1 file moves/)).toBeInTheDocument();
+      });
+    });
   });
 
   describe("DocumentAssistantModal", () => {
