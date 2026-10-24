@@ -903,6 +903,29 @@ impl Database {
             )?;
         }
 
+        // Migration 11: File organization plans for server-authoritative integrity
+        let mut stmt11 = conn.prepare("SELECT 1 FROM schema_migrations WHERE version = 11")?;
+        let m11_exists = stmt11.exists([])?;
+        drop(stmt11);
+
+        if !m11_exists {
+            conn.execute_batch(
+                "BEGIN TRANSACTION;
+                CREATE TABLE IF NOT EXISTS file_organization_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    target_directory TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    executed_at INTEGER,
+                    plan_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_org_plans_dir ON file_organization_plans(target_directory);
+
+                INSERT INTO schema_migrations (version, name, applied_at)
+                VALUES (11, 'file_organization_plans_schema', strftime('%s', 'now') * 1000);
+                COMMIT;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -3491,6 +3514,55 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn save_organization_plan(
+        &self,
+        plan: &crate::storage::organizer::OrganizationPlan,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let payload = serde_json::to_string(plan).unwrap_or_default();
+        let target_dir = plan.target_directory.to_string_lossy().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO file_organization_plans (plan_id, target_directory, created_at, executed_at, plan_json)
+             VALUES (?1, ?2, ?3, NULL, ?4)
+             ON CONFLICT(plan_id) DO UPDATE SET target_directory = excluded.target_directory, plan_json = excluded.plan_json",
+            params![plan.plan_id, target_dir, now, payload],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_organization_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<(crate::storage::organizer::OrganizationPlan, Option<i64>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT plan_json, executed_at FROM file_organization_plans WHERE plan_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![plan_id])?;
+        if let Some(row) = rows.next()? {
+            let json_str: String = row.get(0)?;
+            let executed_at: Option<i64> = row.get(1)?;
+            if let Ok(plan) = serde_json::from_str::<crate::storage::organizer::OrganizationPlan>(&json_str) {
+                Ok(Some((plan, executed_at)))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn mark_organization_plan_executed(&self, plan_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE file_organization_plans SET executed_at = ?1 WHERE plan_id = ?2",
+            params![now, plan_id],
+        )?;
+        Ok(())
     }
 
     // --- Habit Learning ---
