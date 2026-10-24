@@ -12,6 +12,7 @@ import {
   GroundedScreenResult,
 } from "./types/agent";
 import { ToolCallCard } from "./components/ToolCallCard";
+import { evaluateVerificationOutcome } from "./components/TaskProgress";
 import { ThinkingIndicator } from "./components/ThinkingIndicator";
 import { TerminalView } from "./components/TerminalView";
 import { SettingsModal } from "./components/SettingsModal";
@@ -132,6 +133,8 @@ export const App: React.FC = () => {
   const [activePlan, setActivePlan] = useState<{
     id: string;
     runId: string;
+    conversationId?: string;
+    isBackendPlan?: boolean;
     goal: string;
     understanding: string;
     resources: string[];
@@ -360,9 +363,16 @@ export const App: React.FC = () => {
         let actionCompleted = false;
 
         for (const res of payload.tool_results || []) {
+          const outcome = evaluateVerificationOutcome(res);
           if (res.is_error) {
             hasToolError = true;
             const errSummary = `Error in ${res.name}: ${res.output.slice(0, 80)}`;
+            if (!newRemaining.includes(errSummary)) {
+              newRemaining.push(errSummary);
+            }
+          } else if (outcome.failed) {
+            hasToolError = true;
+            const errSummary = outcome.reason || `Error in ${res.name}: ${res.output.slice(0, 80)}`;
             if (!newRemaining.includes(errSummary)) {
               newRemaining.push(errSummary);
             }
@@ -371,7 +381,7 @@ export const App: React.FC = () => {
             if (!newAccomplished.includes(accSummary)) {
               newAccomplished.push(accSummary);
             }
-            if (/verify|test|check|inspect|diff|compare|validate/i.test(res.name)) {
+            if (outcome.verified) {
               hasVerification = true;
             } else {
               actionCompleted = true;
@@ -511,6 +521,7 @@ export const App: React.FC = () => {
     // selection of the "current" run is reset here.
     setActiveRunId(null);
     setActiveReasoning(null);
+    setActivePlan((prev) => (prev && prev.conversationId === activeConvId ? prev : null));
   }, [activeConvId]);
 
   useEffect(() => {
@@ -668,6 +679,7 @@ export const App: React.FC = () => {
       setConversations(updatedList);
 
       if (wasActive) {
+        setActivePlan(null);
         if (updatedList.length > 0) {
           const nextId = updatedList[0].id;
           setActiveConvId(nextId);
@@ -678,6 +690,9 @@ export const App: React.FC = () => {
           setLiveStepsByRun({});
         }
       } else {
+        if (activePlan && activePlan.conversationId === targetId) {
+          setActivePlan(null);
+        }
         if (!updatedList.some((c) => c.id === activeConvIdRef.current)) {
           if (updatedList.length > 0) {
             const nextId = updatedList[0].id;
@@ -904,6 +919,7 @@ export const App: React.FC = () => {
       setActivePlan({
         id: "plan_" + Date.now(),
         runId,
+        conversationId: convId,
         goal: fullPromptText,
         understanding: `Kyro received request: "${fullPromptText.trim()}". Proposed execution plan:`,
         resources: activeResources,
@@ -1107,30 +1123,30 @@ export const App: React.FC = () => {
   return (
     <div className="flex h-screen w-screen bg-[#0a0a0a] text-neutral-100 overflow-hidden font-sans select-none">
       {/* Sidebar */}
-      <div className="w-64 bg-[#0a0a0a] border-r border-neutral-800 flex flex-col justify-between">
-        <div className="p-4 flex flex-col h-full">
-          {/* Logo & HUD trigger */}
-          <div className="flex items-center justify-between pb-4 border-b border-neutral-800">
+      <div className="w-64 lg:w-72 bg-[#0c0c0c] border-r border-[#1f1f1f] flex flex-col justify-between shrink-0 select-none">
+        <div className="p-3.5 flex flex-col h-full overflow-hidden">
+          {/* Brand & Action Header */}
+          <div className="flex items-center justify-between pb-3.5 border-b border-[#1f1f1f]">
             <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-lg bg-[#141414] border border-neutral-800/80 flex items-center justify-center p-1 shadow-sm overflow-hidden">
+              <div className="w-8 h-8 rounded-lg bg-[#141414] border border-[#242424] flex items-center justify-center p-1.5 shadow-sm overflow-hidden shrink-0">
                 <KyroLogo className="w-full h-full" />
               </div>
-              <div>
-                <h1 className="font-semibold text-sm tracking-wide text-neutral-100">KYRO</h1>
-                <p className="text-[10px] text-neutral-400 font-mono">Autonomous OS</p>
+              <div className="min-w-0">
+                <h1 className="font-semibold text-sm tracking-wide text-neutral-100 leading-none">KYRO</h1>
+                <p className="text-[10px] text-neutral-400 font-mono mt-1">Autonomous OS</p>
               </div>
             </div>
             <div className="flex items-center gap-1">
               <button
                 onClick={() => setIsCommandPaletteOpen(true)}
-                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 rounded-lg transition"
+                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-[#1a1a1a] rounded-lg transition"
                 title="Quick Actions & Search (Ctrl+K)"
               >
                 <Command className="w-4 h-4" />
               </button>
               <button
                 onClick={() => invoke("toggle_hud_window")}
-                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 rounded-lg transition"
+                className="p-1.5 text-neutral-400 hover:text-neutral-100 hover:bg-[#1a1a1a] rounded-lg transition"
                 title="Toggle Floating HUD Widget"
               >
                 <ExternalLink className="w-4 h-4" />
@@ -1139,12 +1155,12 @@ export const App: React.FC = () => {
           </div>
 
           {/* Experience Mode Switcher */}
-          <div className="my-2 p-1 bg-[#141414] border border-neutral-800 rounded-xl grid grid-cols-2 gap-1 text-xs">
+          <div className="my-2.5 p-1 bg-[#141414] border border-[#222222] rounded-xl grid grid-cols-2 gap-1 text-xs">
             <button
               onClick={() => handleSetExperienceMode("everyday")}
               className={`py-1.5 px-2 rounded-lg font-medium flex items-center justify-center gap-1.5 transition ${
                 experienceMode === "everyday"
-                  ? "bg-neutral-800 text-neutral-100 shadow-sm"
+                  ? "bg-[#222222] text-neutral-100 shadow-sm"
                   : "text-neutral-400 hover:text-neutral-200"
               }`}
               title="Kyro Everyday: Screen intelligence, file organizer, document review & automations"
@@ -1169,15 +1185,15 @@ export const App: React.FC = () => {
           {/* New Chat Button */}
           <button
             onClick={handleNewConversation}
-            className="mb-3 w-full py-2 px-3 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 text-xs font-medium flex items-center justify-center gap-1.5 transition shadow-sm"
+            className="mb-3 w-full py-2 px-3 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 text-xs font-semibold flex items-center justify-center gap-1.5 transition shadow-sm"
           >
             <Plus className="w-4 h-4" /> New Session
           </button>
 
-          {/* Active Teammate & Model Badge */}
-          <div className="mb-3 p-3 bg-[#111111] border border-neutral-800 rounded-xl space-y-2">
+          {/* Active Teammate & Model Identity Card */}
+          <div className="mb-3 p-2.5 bg-[#121212] border border-[#1f1f1f] rounded-xl space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase font-mono tracking-wider text-neutral-400">
+              <span className="text-[9px] uppercase font-mono tracking-wider text-neutral-400">
                 Active Teammate
               </span>
               <button
@@ -1194,11 +1210,11 @@ export const App: React.FC = () => {
               <AgentAvatar
                 avatar={activeBot.avatar}
                 name={activeBot.name}
-                className="w-8 h-8 rounded-lg bg-black/40 border border-neutral-800/60 flex items-center justify-center text-neutral-200"
-                iconClassName="w-4 h-4"
+                className="w-7 h-7 rounded-lg bg-black/40 border border-[#242424] flex items-center justify-center text-neutral-200 shrink-0"
+                iconClassName="w-3.5 h-3.5"
               />
               <div className="min-w-0">
-                <div className="text-xs font-semibold text-neutral-100">@{activeBot.name}</div>
+                <div className="text-xs font-semibold text-neutral-100 truncate">@{activeBot.name}</div>
                 <div className="text-[10px] text-neutral-400 truncate">{activeBot.role}</div>
               </div>
             </div>
@@ -1208,7 +1224,7 @@ export const App: React.FC = () => {
               return (
                 <div
                   onClick={() => setIsSettingsOpen(true)}
-                  className="pt-2 border-t border-neutral-800 flex items-center justify-between text-[10px] font-mono text-neutral-400 cursor-pointer hover:text-neutral-200 transition"
+                  className="pt-2 border-t border-[#1f1f1f] flex items-center justify-between text-[10px] font-mono text-neutral-400 cursor-pointer hover:text-neutral-200 transition"
                   title={`Active model: ${selectedModel}. Click to configure in Settings.`}
                 >
                   <span className="flex items-center gap-1.5 truncate">
@@ -1219,7 +1235,7 @@ export const App: React.FC = () => {
                     )}
                     <span className="truncate">{info.label}</span>
                   </span>
-                  <span className="text-[9px] px-1 py-0.2 bg-neutral-900 rounded border border-neutral-800 text-neutral-300 shrink-0 ml-1">
+                  <span className="text-[9px] px-1 py-0.2 bg-neutral-900 rounded border border-[#242424] text-neutral-300 shrink-0 ml-1">
                     {info.badge}
                   </span>
                 </div>
@@ -1227,12 +1243,12 @@ export const App: React.FC = () => {
             })()}
           </div>
 
-          {/* Navigation Tools */}
-          <div className="space-y-1 mb-3">
+          {/* Navigation Destinations */}
+          <div className="space-y-1 mb-2.5">
             {experienceMode === "everyday" ? (
               <>
                 {/* Everyday Primary Destinations */}
-                <div className="mb-2 p-1 bg-[#141414] border border-neutral-800 rounded-xl space-y-0.5">
+                <div className="space-y-0.5 mb-2">
                   <div className="px-2 py-0.5 text-[9px] font-mono uppercase tracking-wider text-neutral-400">
                     Destinations
                   </div>
@@ -1240,8 +1256,8 @@ export const App: React.FC = () => {
                     onClick={() => setEverydayTab("ask")}
                     className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
                       everydayTab === "ask"
-                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
-                        : "text-neutral-400 hover:text-neutral-200"
+                        ? "bg-[#1c1c1c] text-neutral-100 font-semibold border border-[#282828] shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200 hover:bg-[#141414] border border-transparent"
                     }`}
                   >
                     <span className="flex items-center gap-2">
@@ -1254,8 +1270,8 @@ export const App: React.FC = () => {
                     onClick={() => setEverydayTab("today")}
                     className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
                       everydayTab === "today"
-                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
-                        : "text-neutral-400 hover:text-neutral-200"
+                        ? "bg-[#1c1c1c] text-neutral-100 font-semibold border border-[#282828] shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200 hover:bg-[#141414] border border-transparent"
                     }`}
                   >
                     <span className="flex items-center gap-2">
@@ -1268,8 +1284,8 @@ export const App: React.FC = () => {
                     onClick={() => setEverydayTab("tools")}
                     className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
                       everydayTab === "tools"
-                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
-                        : "text-neutral-400 hover:text-neutral-200"
+                        ? "bg-[#1c1c1c] text-neutral-100 font-semibold border border-[#282828] shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200 hover:bg-[#141414] border border-transparent"
                     }`}
                   >
                     <span className="flex items-center gap-2">
@@ -1282,8 +1298,8 @@ export const App: React.FC = () => {
                     onClick={() => setEverydayTab("routines")}
                     className={`w-full px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center justify-between transition ${
                       everydayTab === "routines"
-                        ? "bg-neutral-800 text-neutral-100 shadow-sm"
-                        : "text-neutral-400 hover:text-neutral-200"
+                        ? "bg-[#1c1c1c] text-neutral-100 font-semibold border border-[#282828] shadow-sm"
+                        : "text-neutral-400 hover:text-neutral-200 hover:bg-[#141414] border border-transparent"
                     }`}
                   >
                     <span className="flex items-center gap-2">
@@ -1293,42 +1309,44 @@ export const App: React.FC = () => {
                   </button>
                 </div>
 
-                <button
-                  onClick={() => setIsScreenExplainerOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-amber-200 bg-amber-950/20 hover:bg-amber-950/40 border border-amber-800/40 flex items-center gap-2 transition"
-                >
-                  <Camera className="w-4 h-4 text-amber-400" /> Explain Screen
-                </button>
-                <button
-                  onClick={() => setIsFileOrganizerOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/60 flex items-center gap-2 transition"
-                >
-                  <FolderTree className="w-4 h-4 text-neutral-400" /> Organize Files
-                </button>
-                <button
-                  onClick={() => setIsDocumentAssistantOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/60 flex items-center gap-2 transition"
-                >
-                  <FileText className="w-4 h-4 text-neutral-400" /> Document Assistant
-                </button>
-                <button
-                  onClick={() => handleOpenTeachTask("routines")}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-                >
-                  <Workflow className="w-4 h-4 text-neutral-400" /> Automations & Routines
-                </button>
-                <button
-                  onClick={() => setIsArtifactsOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-                >
-                  <Layers className="w-4 h-4 text-neutral-400" /> Artifacts Registry
-                </button>
-                <button
-                  onClick={() => setIsConnectionsOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
-                >
-                  <Plug className="w-4 h-4 text-neutral-400" /> App Connections
-                </button>
+                <div className="space-y-0.5 pt-1.5 border-t border-[#1a1a1a]">
+                  <button
+                    onClick={() => setIsScreenExplainerOpen(true)}
+                    className="w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-amber-200 bg-amber-950/20 hover:bg-amber-950/40 border border-amber-800/40 flex items-center gap-2 transition"
+                  >
+                    <Camera className="w-3.5 h-3.5 text-amber-400" /> Explain Screen
+                  </button>
+                  <button
+                    onClick={() => setIsFileOrganizerOpen(true)}
+                    className="w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  >
+                    <FolderTree className="w-3.5 h-3.5 text-neutral-400" /> Organize Files
+                  </button>
+                  <button
+                    onClick={() => setIsDocumentAssistantOpen(true)}
+                    className="w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-neutral-400" /> Document Assistant
+                  </button>
+                  <button
+                    onClick={() => handleOpenTeachTask("routines")}
+                    className="w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  >
+                    <Workflow className="w-3.5 h-3.5 text-neutral-400" /> Automations & Routines
+                  </button>
+                  <button
+                    onClick={() => setIsArtifactsOpen(true)}
+                    className="w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  >
+                    <Layers className="w-3.5 h-3.5 text-neutral-400" /> Artifacts Registry
+                  </button>
+                  <button
+                    onClick={() => setIsConnectionsOpen(true)}
+                    className="w-full px-2.5 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  >
+                    <Plug className="w-3.5 h-3.5 text-neutral-400" /> App Connections
+                  </button>
+                </div>
               </>
             ) : (
               <>
@@ -1345,51 +1363,51 @@ export const App: React.FC = () => {
                 </button>
                 <button
                   onClick={() => setIsConnectionsOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-neutral-800/80 flex items-center gap-2 transition"
+                  className="w-full px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
                 >
-                  <Plug className="w-4 h-4 text-neutral-400" /> App Connections
+                  <Plug className="w-3.5 h-3.5 text-neutral-400" /> App Connections
                 </button>
                 <button
                   onClick={() => setIsArtifactsOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  className="w-full px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
                 >
-                  <Layers className="w-4 h-4 text-neutral-400" /> Artifacts Registry
+                  <Layers className="w-3.5 h-3.5 text-neutral-400" /> Artifacts Registry
                 </button>
                 <button
                   onClick={() => handleOpenTeachTask("skills")}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  className="w-full px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
                 >
-                  <Workflow className="w-4 h-4 text-neutral-400" /> Teach-a-Task & Routines
+                  <Workflow className="w-3.5 h-3.5 text-neutral-400" /> Teach-a-Task & Routines
                 </button>
                 <button
                   onClick={() => setIsTeammatesOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  className="w-full px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
                 >
-                  <Users className="w-4 h-4 text-neutral-400" /> Teammate Roster
+                  <Users className="w-3.5 h-3.5 text-neutral-400" /> Teammate Roster
                 </button>
                 <button
                   onClick={() => setIsMcpOpen(true)}
-                  className="w-full px-3 py-2 rounded-lg text-xs font-medium text-neutral-300 hover:bg-neutral-800/60 hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
+                  className="w-full px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-300 hover:bg-[#161616] hover:text-neutral-100 border border-transparent flex items-center gap-2 transition"
                 >
-                  <Server className="w-4 h-4 text-neutral-400" /> MCP Tool Servers
+                  <Server className="w-3.5 h-3.5 text-neutral-400" /> MCP Tool Servers
                 </button>
               </>
             )}
           </div>
 
           {/* Conversations list */}
-          <div className="flex-1 overflow-y-auto space-y-1 pr-1 border-t border-neutral-800 pt-3">
-            <div className="text-[10px] uppercase font-mono tracking-wider text-neutral-500 mb-1.5 px-2">
+          <div className="flex-1 overflow-y-auto space-y-1 pr-1 border-t border-[#1f1f1f] pt-2.5">
+            <div className="text-[10px] uppercase font-mono tracking-wider text-neutral-400 mb-1.5 px-2">
               Recent Sessions
             </div>
             {conversations.map((c) => (
               <div
                 key={c.id}
                 onClick={() => setActiveConvId(c.id)}
-                className={`group px-3 py-2 rounded-lg text-xs cursor-pointer truncate transition flex items-center justify-between ${
+                className={`group px-2.5 py-1.5 rounded-lg text-xs cursor-pointer truncate transition flex items-center justify-between ${
                   activeConvId === c.id
-                    ? "bg-neutral-800 text-neutral-100 border border-neutral-700 font-medium"
-                    : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200 border border-transparent"
+                    ? "bg-[#1c1c1c] text-neutral-100 border border-[#282828] font-medium"
+                    : "text-neutral-400 hover:bg-[#141414] hover:text-neutral-200 border border-transparent"
                 }`}
               >
                 <span className="truncate">{c.title}</span>
@@ -1412,13 +1430,13 @@ export const App: React.FC = () => {
         </div>
 
         {/* Bottom Sidebar: Settings */}
-        <div className="p-3 border-t border-neutral-800 bg-[#0a0a0a]">
+        <div className="p-3 border-t border-[#1f1f1f] bg-[#0a0a0a]">
           <button
             onClick={() => {
               setSettingsInitialTab("model");
               setIsSettingsOpen(true);
             }}
-            className="w-full px-3 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800 transition flex items-center justify-between"
+            className="w-full px-3 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-100 hover:bg-[#141414] border border-transparent hover:border-[#222222] transition flex items-center justify-between"
           >
             <span className="flex items-center gap-2">
               <Settings className="w-4 h-4 text-neutral-400" /> Vault & Settings
@@ -1431,12 +1449,12 @@ export const App: React.FC = () => {
       {/* Main Workspace Area */}
       <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#0a0a0a]">
         {/* Top Navbar */}
-        <div className="h-14 px-6 border-b border-neutral-800 flex items-center justify-between bg-[#0a0a0a]">
+        <div className="h-14 px-6 border-b border-[#1f1f1f] flex items-center justify-between bg-[#0a0a0a]">
           <div className="flex items-center gap-3">
             <AgentAvatar
               avatar={activeBot.avatar}
               name={activeBot.name}
-              className="w-8 h-8 rounded-lg bg-neutral-900 border border-neutral-800 flex items-center justify-center text-neutral-200"
+              className="w-8 h-8 rounded-lg bg-[#141414] border border-[#242424] flex items-center justify-center text-neutral-200 shrink-0"
               iconClassName="w-4 h-4"
             />
             <div>
@@ -1451,57 +1469,12 @@ export const App: React.FC = () => {
             </div>
           </div>
 
-          {experienceMode === "everyday" && (
-            <div className="hidden md:flex items-center p-1 bg-[#141414] border border-neutral-800 rounded-xl text-xs font-medium">
-              <button
-                onClick={() => setEverydayTab("ask")}
-                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
-                  everydayTab === "ask"
-                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
-                    : "text-neutral-400 hover:text-neutral-200"
-                }`}
-              >
-                <MessageSquare className="w-3.5 h-3.5 text-neutral-300" /> Ask Kyro
-              </button>
-              <button
-                onClick={() => setEverydayTab("today")}
-                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
-                  everydayTab === "today"
-                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
-                    : "text-neutral-400 hover:text-neutral-200"
-                }`}
-              >
-                <Calendar className="w-3.5 h-3.5 text-sky-400" /> Today
-              </button>
-              <button
-                onClick={() => setEverydayTab("tools")}
-                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
-                  everydayTab === "tools"
-                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
-                    : "text-neutral-400 hover:text-neutral-200"
-                }`}
-              >
-                <Wrench className="w-3.5 h-3.5 text-amber-400" /> My Tools
-              </button>
-              <button
-                onClick={() => setEverydayTab("routines")}
-                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition ${
-                  everydayTab === "routines"
-                    ? "bg-neutral-800 text-neutral-100 font-semibold shadow-sm"
-                    : "text-neutral-400 hover:text-neutral-200"
-                }`}
-              >
-                <Clock className="w-3.5 h-3.5 text-purple-400" /> My Routines
-              </button>
-            </div>
-          )}
-
           <div className="flex items-center gap-2">
             {experienceMode === "everyday" ? (
               <>
                 <button
                   onClick={() => setIsOnboardingOpen(true)}
-                  className="px-2.5 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition font-medium"
+                  className="px-2.5 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition font-medium"
                   title="Start Interactive User Guide"
                 >
                   <HelpCircle className="w-3.5 h-3.5 text-neutral-400" /> Guide
@@ -1515,28 +1488,28 @@ export const App: React.FC = () => {
                 </button>
                 <button
                   onClick={() => setIsFileOrganizerOpen(true)}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Organize Files"
                 >
                   <FolderTree className="w-3.5 h-3.5 text-neutral-400" /> Organize
                 </button>
                 <button
                   onClick={() => setIsDocumentAssistantOpen(true)}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Local Document Assistant"
                 >
                   <FileText className="w-3.5 h-3.5 text-neutral-400" /> Documents
                 </button>
                 <button
                   onClick={() => setIsTimelineOpen(true)}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Inspect step-by-step history"
                 >
                   <History className="w-3.5 h-3.5 text-neutral-400" /> Timeline
                 </button>
                 <button
                   onClick={handleCaptureScreen}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Capture display snapshot"
                 >
                   <Camera className="w-3.5 h-3.5 text-neutral-400" /> Screen
@@ -1556,7 +1529,7 @@ export const App: React.FC = () => {
                   className={`px-3 py-1.5 border rounded-lg text-xs font-medium flex items-center gap-1.5 transition ${
                     isGhostMode
                       ? "bg-purple-950/40 text-purple-200 border-purple-700/60 shadow-sm"
-                      : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-400 border-neutral-800"
+                      : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-400 border-[#242424]"
                   }`}
                   title="Runs actions inside isolated virtual display (:99). Your physical mouse & screen stay 100% free!"
                 >
@@ -1567,28 +1540,28 @@ export const App: React.FC = () => {
                 </button>
                 <button
                   onClick={handleCaptureGrounded}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Detect UI elements and render numbered markers [1], [2], [3] for zero-miss clicks"
                 >
                   <Target className="w-3.5 h-3.5 text-neutral-400" /> Ground
                 </button>
                 <button
                   onClick={() => setIsTimelineOpen(true)}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Inspect step-by-step before/after diffs with click target rings"
                 >
                   <History className="w-3.5 h-3.5 text-neutral-400" /> Timeline
                 </button>
                 <button
                   onClick={handleCaptureScreen}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Capture display snapshot"
                 >
                   <Camera className="w-3.5 h-3.5 text-neutral-400" /> Screen
                 </button>
                 <button
                   onClick={() => invoke("toggle_overlay_window", { show: true })}
-                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
+                  className="px-3 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-300 flex items-center gap-1.5 transition"
                   title="Snip region of screen"
                 >
                   <Crop className="w-3.5 h-3.5 text-neutral-400" /> Snip
@@ -1598,7 +1571,7 @@ export const App: React.FC = () => {
                   className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition ${
                     showTerminal
                       ? "bg-neutral-800 text-neutral-100 border-neutral-700"
-                      : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-300 border-neutral-800"
+                      : "bg-[#121212] hover:bg-[#1a1a1a] text-neutral-300 border-[#242424]"
                   }`}
                 >
                   <Terminal className="w-3.5 h-3.5 text-neutral-400" /> PTY
@@ -1609,7 +1582,7 @@ export const App: React.FC = () => {
             {/* Quick Actions / Palette */}
             <button
               onClick={() => setIsCommandPaletteOpen(true)}
-              className="px-2.5 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-neutral-800 rounded-lg text-xs text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
+              className="px-2.5 py-1.5 bg-[#121212] hover:bg-[#1a1a1a] border border-[#242424] rounded-lg text-xs text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
               title="Global Command Palette (Ctrl+K)"
             >
               <Command className="w-3.5 h-3.5" />
@@ -1921,180 +1894,232 @@ export const App: React.FC = () => {
             )}
 
             {(!messages || messages.length === 0) && (!liveSteps || liveSteps.length === 0) ? (
-            <div className="h-full flex flex-col items-center justify-center text-center max-w-lg mx-auto space-y-4">
-              <div className="relative">
-                <div className="w-16 h-16 rounded-2xl bg-[#141414] border border-neutral-800 flex items-center justify-center p-3 shadow-lg">
-                  <KyroLogo className="w-full h-full" />
+            <div className="h-full flex flex-col items-center justify-center max-w-3xl mx-auto py-10 px-6 space-y-7 text-center">
+              {/* Brand and Teammate Header */}
+              <div className="flex flex-col items-center space-y-3">
+                <div className="relative">
+                  <div className="w-16 h-16 rounded-2xl bg-[#141414] border border-[#242424] flex items-center justify-center p-3 shadow-xl">
+                    <KyroLogo className="w-full h-full" />
+                  </div>
+                  <div className="absolute -bottom-1 -right-1 p-1 rounded-full bg-[#1c1c1c] border border-[#2e2e2e] shadow flex items-center justify-center">
+                    <AgentAvatar
+                      avatar={activeBot.avatar}
+                      name={activeBot.name}
+                      className="w-4 h-4 rounded-full bg-transparent flex items-center justify-center text-neutral-200"
+                      iconClassName="w-3 h-3"
+                    />
+                  </div>
                 </div>
-                <div className="absolute -bottom-1 -right-1 p-1 rounded-full bg-[#1c1c1c] border border-neutral-700/80 shadow flex items-center justify-center">
-                  <AgentAvatar
-                    avatar={activeBot.avatar}
-                    name={activeBot.name}
-                    className="w-4 h-4 rounded-full bg-transparent flex items-center justify-center text-neutral-200"
-                    iconClassName="w-3 h-3"
-                  />
-                </div>
-              </div>
 
-              {experienceMode === "everyday" ? (
-                <>
-                  <div>
-                    <h2 className="text-lg font-semibold text-neutral-100">
-                      Kyro Everyday Assistant
+                {experienceMode === "everyday" ? (
+                  <div className="space-y-2 max-w-xl">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#141414] border border-[#262626] text-xs font-medium text-neutral-300">
+                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Kyro Everyday Assistant</span>
+                    </div>
+                    <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-neutral-100">
+                      What should Kyro take care of?
                     </h2>
-                    <p className="text-xs text-neutral-400 leading-relaxed mt-1">
+                    <p className="text-sm text-neutral-400 leading-relaxed">
                       Understand screens, safely organize downloads, analyze documents, and automate repetitive tasks with zero developer jargon.
                     </p>
                   </div>
-                  <div className="grid grid-cols-2 gap-2.5 text-left w-full pt-1">
-                    <button
-                      onClick={() => setIsScreenExplainerOpen(true)}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-amber-800/40 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <Camera className="w-4 h-4 text-amber-400" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
-                          Explain Screen
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
-                        Diagnose visual errors, find buttons, and get grounded explanations.
-                      </p>
-                    </button>
-
-                    <button
-                      onClick={() => setIsFileOrganizerOpen(true)}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <FolderTree className="w-4 h-4 text-neutral-300" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
-                          Organize Files
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
-                        Categorize cluttered folders, find SHA-256 duplicates with safe undo.
-                      </p>
-                    </button>
-
-                    <button
-                      onClick={() => setIsDocumentAssistantOpen(true)}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <FileText className="w-4 h-4 text-neutral-300" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
-                          Document Assistant
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
-                        Parse text and PDFs locally. Extract key dates, actions & compare docs.
-                      </p>
-                    </button>
-
-                    <button
-                      onClick={() => handleOpenTeachTask("routines")}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <Workflow className="w-4 h-4 text-neutral-300" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
-                          Automate Routine
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
-                        Record and replay step-by-step browser & desktop automations.
-                      </p>
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div>
-                    <h2 className="text-lg font-semibold text-neutral-100 flex items-center justify-center gap-2">
+                ) : (
+                  <div className="space-y-2 max-w-xl">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-950/40 border border-purple-800/60 text-xs font-medium text-purple-300">
+                      <Code2 className="w-3.5 h-3.5 text-purple-400" />
                       <span>Kyro Autonomous Workspace</span>
-                      <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-purple-900/40 text-purple-300 border border-purple-800/60 font-semibold">
-                        DEV
-                      </span>
+                      <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-purple-900/60 text-purple-200 font-bold uppercase">DEV</span>
+                    </div>
+                    <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-neutral-100">
+                      Autonomous Developer Environment
                     </h2>
-                    <p className="text-xs text-neutral-400 leading-relaxed mt-1">
+                    <p className="text-sm text-neutral-400 leading-relaxed">
                       Local-first developer agent with managed dev-servers, reversible checkpoints, Build Doctor diagnostics, and responsive visual regression.
                     </p>
                   </div>
-                  <div className="grid grid-cols-2 gap-2.5 text-left w-full pt-1">
-                    <button
-                      onClick={() => {
-                        setDevWorkbenchTab("projects");
-                        setIsDevWorkbenchOpen(true);
-                      }}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-purple-800/40 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <Server className="w-4 h-4 text-purple-400" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                )}
+
+                {/* Subdued teammate context */}
+                <div className="flex items-center justify-center gap-2 pt-1 text-xs text-neutral-400">
+                  <div className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-[#111111] border border-[#1f1f1f]">
+                    <span className="text-neutral-500 font-mono text-[11px]">Ready with:</span>
+                    <span className="text-neutral-200 font-medium">@{activeBot.name}</span>
+                    <span className="text-neutral-500">•</span>
+                    <span className="text-neutral-400 text-[11px] truncate max-w-[240px]">{activeBot.role}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 4 Curated Task Cards */}
+              {experienceMode === "everyday" ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 text-left w-full pt-1">
+                  <button
+                    onClick={() => setIsScreenExplainerOpen(true)}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-amber-700/50 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-amber-950/30 border border-amber-800/40 text-amber-400 group-hover:bg-amber-950/50 transition">
+                          <Camera className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
+                          Explain Screen
+                        </span>
+                      </div>
+                      <p className="text-xs text-neutral-400 leading-relaxed">
+                        Diagnose visual errors, find buttons, and get grounded explanations.
+                      </p>
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => setIsFileOrganizerOpen(true)}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-neutral-700 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-[#1a1a1a] border border-[#282828] text-neutral-300 group-hover:bg-[#222] transition">
+                          <FolderTree className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
+                          Organize Files
+                        </span>
+                      </div>
+                      <p className="text-xs text-neutral-400 leading-relaxed">
+                        Categorize cluttered folders, find SHA-256 duplicates with safe undo.
+                      </p>
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => setIsDocumentAssistantOpen(true)}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-neutral-700 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-[#1a1a1a] border border-[#282828] text-neutral-300 group-hover:bg-[#222] transition">
+                          <FileText className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
+                          Document Assistant
+                        </span>
+                      </div>
+                      <p className="text-xs text-neutral-400 leading-relaxed">
+                        Parse text and PDFs locally. Extract key dates, actions & compare docs.
+                      </p>
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => handleOpenTeachTask("routines")}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-neutral-700 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-[#1a1a1a] border border-[#282828] text-neutral-300 group-hover:bg-[#222] transition">
+                          <Workflow className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
+                          Automate Routine
+                        </span>
+                      </div>
+                      <p className="text-xs text-neutral-400 leading-relaxed">
+                        Record and replay step-by-step browser & desktop automations.
+                      </p>
+                    </div>
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 text-left w-full pt-1">
+                  <button
+                    onClick={() => {
+                      setDevWorkbenchTab("projects");
+                      setIsDevWorkbenchOpen(true);
+                    }}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-purple-800/60 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-purple-950/40 border border-purple-800/50 text-purple-400 group-hover:bg-purple-950/60 transition">
+                          <Server className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
                           Dev Servers
                         </span>
                       </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
+                      <p className="text-xs text-neutral-400 leading-relaxed">
                         Discover local projects, start managed servers, and stream logs.
                       </p>
-                    </button>
+                    </div>
+                  </button>
 
-                    <button
-                      onClick={() => {
-                        setDevWorkbenchTab("checkpoints");
-                        setIsDevWorkbenchOpen(true);
-                      }}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <GitCommit className="w-4 h-4 text-neutral-300" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                  <button
+                    onClick={() => {
+                      setDevWorkbenchTab("checkpoints");
+                      setIsDevWorkbenchOpen(true);
+                    }}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-neutral-700 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-[#1a1a1a] border border-[#282828] text-neutral-300 group-hover:bg-[#222] transition">
+                          <GitCommit className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
                           Code Checkpoints
                         </span>
                       </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
+                      <p className="text-xs text-neutral-400 leading-relaxed">
                         Record Git-aware reversible snapshots with 1-click safe rollback.
                       </p>
-                    </button>
+                    </div>
+                  </button>
 
-                    <button
-                      onClick={() => {
-                        setDevWorkbenchTab("doctor");
-                        setIsDevWorkbenchOpen(true);
-                      }}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <Stethoscope className="w-4 h-4 text-neutral-300" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                  <button
+                    onClick={() => {
+                      setDevWorkbenchTab("doctor");
+                      setIsDevWorkbenchOpen(true);
+                    }}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-neutral-700 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-[#1a1a1a] border border-[#282828] text-neutral-300 group-hover:bg-[#222] transition">
+                          <Stethoscope className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
                           Build Doctor
                         </span>
                       </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
+                      <p className="text-xs text-neutral-400 leading-relaxed">
                         Parse compiler errors (Rust, TS, Vitest) and get instant repair patches.
                       </p>
-                    </button>
+                    </div>
+                  </button>
 
-                    <button
-                      onClick={() => {
-                        setDevWorkbenchTab("audit");
-                        setIsDevWorkbenchOpen(true);
-                      }}
-                      className="p-3 rounded-xl bg-[#141414] hover:bg-[#1a1a1a] border border-neutral-800 text-left transition group shadow-sm"
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <Eye className="w-4 h-4 text-neutral-300" />
-                        <span className="font-semibold text-xs text-neutral-200 group-hover:text-white">
+                  <button
+                    onClick={() => {
+                      setDevWorkbenchTab("audit");
+                      setIsDevWorkbenchOpen(true);
+                    }}
+                    className="p-4 rounded-xl bg-[#121212] hover:bg-[#181818] border border-[#242424] hover:border-neutral-700 text-left transition group shadow-sm flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-center gap-2.5 mb-2">
+                        <div className="p-2 rounded-lg bg-[#1a1a1a] border border-[#282828] text-neutral-300 group-hover:bg-[#222] transition">
+                          <Eye className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-sm text-neutral-200 group-hover:text-white transition">
                           Visual Baselines
                         </span>
                       </div>
-                      <p className="text-[11px] text-neutral-400 leading-snug">
+                      <p className="text-xs text-neutral-400 leading-relaxed">
                         Audit routes across viewports and compare against visual baselines.
                       </p>
-                    </button>
-                  </div>
-                </>
+                    </div>
+                  </button>
+                </div>
               )}
             </div>
           ) : (
@@ -2118,6 +2143,40 @@ export const App: React.FC = () => {
                     ) : (
                       <div className="whitespace-pre-wrap">{m.content}</div>
                     )}
+
+                    {/* Timeline tool calls for assistant messages */}
+                    {(() => {
+                      if (m.role !== "assistant" || !m.tool_calls_json) return null;
+                      try {
+                        const tcs = JSON.parse(m.tool_calls_json);
+                        if (!Array.isArray(tcs) || tcs.length === 0) return null;
+                        let obs: any[] = [];
+                        if (m.observations_json) {
+                          try {
+                            obs = JSON.parse(m.observations_json);
+                          } catch {}
+                        }
+                        return (
+                          <div className="space-y-2 mt-3 pt-2 border-t border-[#1f1f1f] w-full">
+                            {tcs.map((tc: any, idx: number) => {
+                              const res = Array.isArray(obs)
+                                ? obs.find((r: any) => r.tool_call_id === tc.id)
+                                : undefined;
+                              return (
+                                <ToolCallCard
+                                  key={`msg-tc-${tc.id || idx}`}
+                                  toolCall={tc}
+                                  result={res}
+                                  defaultExpanded={false}
+                                />
+                              );
+                            })}
+                          </div>
+                        );
+                      } catch {
+                        return null;
+                      }
+                    })()}
 
                     {/* Actions for assistant messages */}
                     {m.role === "assistant" && (
@@ -2183,13 +2242,17 @@ export const App: React.FC = () => {
                       </div>
                     </div>
                   )}
-                  {(step.tool_calls || []).map((tc, idx) => (
-                    <ToolCallCard
-                      key={`${step.step}-${tc.id || idx}`}
-                      toolCall={tc}
-                      result={(step.tool_results || []).find((r) => r.tool_call_id === tc.id)}
-                    />
-                  ))}
+                  {(step.tool_calls || []).map((tc, idx) => {
+                    const res = (step.tool_results || []).find((r) => r.tool_call_id === tc.id);
+                    return (
+                      <ToolCallCard
+                        key={`${step.step}-${tc.id || idx}`}
+                        toolCall={tc}
+                        result={res}
+                        defaultExpanded={!res}
+                      />
+                    );
+                  })}
                 </React.Fragment>
               ))}
 
@@ -2248,7 +2311,7 @@ export const App: React.FC = () => {
 
         {/* Quick Everyday Task Prompt Pills */}
         {experienceMode === "everyday" && (
-          <div className="px-4 py-2 border-t border-neutral-800/60 bg-[#0c0c0c] flex items-center gap-2 overflow-x-auto text-[11px]">
+          <div className="px-6 py-2.5 border-t border-[#1f1f1f] bg-[#0c0c0c] flex flex-wrap items-center gap-2 text-xs">
             <span className="text-neutral-400 font-medium shrink-0">Try asking:</span>
             {[
               "Find the invoice I downloaded last month",
@@ -2266,7 +2329,7 @@ export const App: React.FC = () => {
                   setPrompt(p);
                   setEverydayTab("ask");
                 }}
-                className="px-2.5 py-1 rounded-full bg-[#141414] hover:bg-[#1f1f1f] text-neutral-300 hover:text-white border border-neutral-800 whitespace-nowrap transition shrink-0"
+                className="px-2.5 py-1 rounded-lg bg-[#141414] hover:bg-[#1c1c1c] text-neutral-300 hover:text-white border border-[#242424] transition text-xs"
               >
                 {p}
               </button>
@@ -2275,8 +2338,8 @@ export const App: React.FC = () => {
         )}
 
         {/* Input Form with Voice Dictation & Attachments */}
-        <div className="p-4 border-t border-neutral-800 bg-[#0a0a0a]">
-          <form onSubmit={handleSubmit} className="flex items-center gap-2">
+        <div className="p-4 border-t border-[#1f1f1f] bg-[#0a0a0a]">
+          <form onSubmit={handleSubmit} className="flex items-end gap-2">
             {/* Hidden File Picker */}
             <input
               type="file"
@@ -2289,7 +2352,7 @@ export const App: React.FC = () => {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="p-3 rounded-xl bg-[#000000] hover:bg-neutral-900 border border-neutral-800 text-neutral-400 hover:text-neutral-200 transition"
+              className="p-3 rounded-xl bg-[#000000] hover:bg-neutral-900 border border-[#242424] text-neutral-400 hover:text-neutral-200 transition shrink-0"
               title="Attach a local text or image file"
             >
               <Paperclip className="w-4 h-4" />
@@ -2299,18 +2362,18 @@ export const App: React.FC = () => {
             <button
               type="button"
               onClick={toggleVoiceDictation}
-              className={`p-3 rounded-xl border transition ${
+              className={`p-3 rounded-xl border transition shrink-0 ${
                 isListening
                   ? "bg-red-950/40 text-red-400 border-red-700/60 animate-pulse"
-                  : "bg-[#000000] hover:bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-neutral-200"
+                  : "bg-[#000000] hover:bg-neutral-900 border-[#242424] text-neutral-400 hover:text-neutral-200"
               }`}
               title={isListening ? "Listening... click to stop" : "Voice Dictation (Speech to Text)"}
             >
               {isListening ? <Mic className="w-4 h-4 text-red-400 animate-bounce" /> : <MicOff className="w-4 h-4" />}
             </button>
 
-            <input
-              type="text"
+            <textarea
+              rows={2}
               placeholder={
                 isListening
                   ? "Listening to your voice..."
@@ -2318,15 +2381,21 @@ export const App: React.FC = () => {
               }
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSubmit(e as any);
+                }
+              }}
               disabled={isAgentRunning}
-              className="flex-1 px-4 py-3 bg-[#000000] border border-neutral-800 rounded-xl text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition"
+              className="flex-1 px-4 py-2.5 bg-[#000000] border border-[#242424] rounded-xl text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-500 resize-none transition"
             />
 
             {isAgentRunning ? (
               <button
                 type="button"
                 onClick={handleAbort}
-                className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-semibold uppercase tracking-wider flex items-center gap-2 shadow-sm transition"
+                className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-semibold uppercase tracking-wider flex items-center gap-2 shadow-sm transition shrink-0"
               >
                 <StopCircle className="w-4 h-4 fill-current" /> Stop
               </button>
@@ -2334,7 +2403,7 @@ export const App: React.FC = () => {
               <button
                 type="submit"
                 disabled={!prompt.trim() && !attachedFile}
-                className="px-5 py-3 rounded-xl bg-neutral-100 hover:bg-white disabled:opacity-40 text-neutral-950 text-xs font-medium flex items-center gap-2 shadow-sm transition"
+                className="px-5 py-3 rounded-xl bg-neutral-100 hover:bg-white disabled:opacity-40 text-neutral-950 text-xs font-semibold flex items-center gap-2 shadow-sm transition shrink-0"
               >
                 <Send className="w-4 h-4" /> Send
               </button>

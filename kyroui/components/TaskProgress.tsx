@@ -69,6 +69,8 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?:
     toolName === "execute_tests" ||
     toolName === "verify_checkpoint" ||
     toolName === "check_verification" ||
+    toolName.startsWith("verify_") ||
+    toolName.startsWith("validate_") ||
     (toolName === "execute_shell" &&
       Boolean(
         commandArg &&
