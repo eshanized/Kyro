@@ -444,6 +444,118 @@ impl ModelRouter {
         .await
     }
 
+    /// Complete using streamed SSE with live reasoning extraction and tool-call assembly
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_streamed<F>(
+        &self,
+        model: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel_token: Option<&CancellationToken>,
+        on_reasoning_delta: F,
+    ) -> Result<LlmResponse, String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        let endpoint = base_url.unwrap_or(NVIDIA_BASE_URL);
+        let selected_model = if model.is_empty() {
+            DEFAULT_NEMOTRON_MODEL
+        } else {
+            model
+        };
+
+        self.complete_streamed_with_retries(
+            endpoint,
+            api_key,
+            selected_model,
+            system_prompt,
+            messages,
+            tools,
+            cancel_token,
+            on_reasoning_delta,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_streamed_with_retries<F>(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel_token: Option<&CancellationToken>,
+        mut on_reasoning_delta: F,
+    ) -> Result<LlmResponse, String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        let max_retries = 3;
+        let mut last_error = String::new();
+
+        for attempt in 0..max_retries {
+            if let Some(token) = cancel_token {
+                if token.is_cancelled() {
+                    return Err("Agent run cancelled before model completion".to_string());
+                }
+            }
+
+            match self
+                .complete_streamed_openai_compatible(
+                    endpoint,
+                    api_key,
+                    model,
+                    system_prompt,
+                    messages,
+                    tools,
+                    cancel_token,
+                    &mut on_reasoning_delta,
+                )
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    let is_retryable = e.contains("429")
+                        || e.contains("503")
+                        || e.contains("502")
+                        || e.contains("timeout")
+                        || e.contains("connection");
+
+                    if is_retryable && attempt + 1 < max_retries {
+                        let delay = Duration::from_millis(500 * (1 << attempt));
+                        log::warn!(
+                            "Streamed model request attempt {} failed with retryable error: {}. Retrying in {:?}...",
+                            attempt + 1, e, delay
+                        );
+                        if let Some(token) = cancel_token {
+                            tokio::select! {
+                                _ = token.cancelled() => {
+                                    return Err("Model completion cancelled during retry delay".to_string());
+                                }
+                                _ = sleep(delay) => {}
+                            }
+                        } else {
+                            sleep(delay).await;
+                        }
+                        last_error = e;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err(format!(
+            "Streamed model completion failed after {} retries: {}",
+            max_retries, last_error
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn complete_with_retries(
         &self,
@@ -551,79 +663,7 @@ impl ModelRouter {
             }
         }
 
-        let mut oai_messages = Vec::new();
-        if !system_prompt.is_empty() {
-            oai_messages.push(serde_json::json!({
-                "role": "system",
-                "content": system_prompt
-            }));
-        }
-
-        for m in messages {
-            let content_val = match &m.content {
-                MessageContent::Text(t) => serde_json::Value::String(t.clone()),
-                MessageContent::Parts(parts) => {
-                    serde_json::to_value(parts).unwrap_or(serde_json::json!([]))
-                }
-            };
-
-            if let Some(ref tcs) = m.tool_calls {
-                let oai_tcs: Vec<serde_json::Value> = tcs
-                    .iter()
-                    .map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments.to_string()
-                            }
-                        })
-                    })
-                    .collect();
-                oai_messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": content_val,
-                    "tool_calls": oai_tcs
-                }));
-            } else if m.role == "tool" {
-                oai_messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "content": content_val
-                }));
-            } else {
-                oai_messages.push(serde_json::json!({
-                    "role": m.role,
-                    "content": content_val
-                }));
-            }
-        }
-
-        let mut payload = serde_json::json!({
-            "model": model,
-            "messages": oai_messages,
-            "temperature": 0.5,
-            "max_tokens": 4096,
-        });
-
-        if !tools.is_empty() {
-            let oai_tools: Vec<serde_json::Value> = tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
-                })
-                .collect();
-            payload["tools"] = serde_json::json!(oai_tools);
-            payload["tool_choice"] = serde_json::json!("auto");
-        }
+        let payload = build_chat_payload(model, system_prompt, messages, tools, false);
 
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
         let mut req = self
@@ -701,6 +741,459 @@ impl ModelRouter {
             content,
             tool_calls,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_streamed_openai_compatible<F>(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel_token: Option<&CancellationToken>,
+        on_reasoning_delta: &mut F,
+    ) -> Result<LlmResponse, String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        // Explicitly reject multimodal inputs when calling non-vision models to prevent silent dropping
+        let has_image_content = messages.iter().any(|m| match &m.content {
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+            _ => false,
+        });
+
+        if has_image_content {
+            let caps = self.capabilities_for(model).await;
+            if !caps.vision && !caps.image_input {
+                return Err(format!(
+                    "Selected model '{}' does not support multimodal/vision inputs. Please select a vision-capable model (e.g., Nemotron-Vision, Claude-3, or GPT-4o) to process images.",
+                    model
+                ));
+            }
+            for m in messages {
+                if let MessageContent::Parts(parts) = &m.content {
+                    for part in parts {
+                        if let ContentPart::ImageUrl { image_url } = part {
+                            validate_image_payload(&image_url.url, &caps)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let payload = build_chat_payload(model, system_prompt, messages, tools, true);
+
+        let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+
+        if !api_key.is_empty() {
+            req = req.header("authorization", format!("Bearer {}", api_key));
+        }
+
+        let res = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err("Model completion cancelled by user".to_string());
+                }
+                res_result = req.json(&payload).send() => {
+                    res_result.map_err(|e| format!("HTTP request error to model provider at {}: {}", url, e))?
+                }
+            }
+        } else {
+            req.json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request error to model provider at {}: {}", url, e))?
+        };
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("Model provider API error ({}): {}", status, text));
+        }
+
+        use futures_util::StreamExt;
+        let mut stream = res.bytes_stream();
+        let mut sse_buffer = SseBuffer::new();
+        let mut accumulator = StreamAccumulator::default();
+
+        let mut done = false;
+        while !done {
+            let next_chunk = if let Some(token) = cancel_token {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        return Err("Model completion cancelled by user".to_string());
+                    }
+                    chunk = stream.next() => chunk
+                }
+            } else {
+                stream.next().await
+            };
+
+            match next_chunk {
+                Some(Ok(bytes)) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    sse_buffer.push_chunk(&text);
+                    while let Some(line) = sse_buffer.next_line() {
+                        if accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))? {
+                            done = true;
+                            break;
+                        }
+                        if let Some(token) = cancel_token {
+                            if token.is_cancelled() {
+                                return Err("Model completion cancelled by user".to_string());
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(format!(
+                        "Network error while streaming model response: {}",
+                        e
+                    ));
+                }
+                None => {
+                    if let Some(line) = sse_buffer.flush_remaining() {
+                        let _ = accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))?;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(token) = cancel_token {
+            if token.is_cancelled() {
+                return Err("Model completion cancelled by user".to_string());
+            }
+        }
+
+        accumulator.finalize()
+    }
+}
+
+pub fn build_chat_payload(
+    model: &str,
+    system_prompt: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    stream: bool,
+) -> serde_json::Value {
+    let mut oai_messages = Vec::new();
+    if !system_prompt.is_empty() {
+        oai_messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        }));
+    }
+
+    for m in messages {
+        let content_val = match &m.content {
+            MessageContent::Text(t) => serde_json::Value::String(t.clone()),
+            MessageContent::Parts(parts) => {
+                serde_json::to_value(parts).unwrap_or(serde_json::json!([]))
+            }
+        };
+
+        if let Some(ref tcs) = m.tool_calls {
+            let oai_tcs: Vec<serde_json::Value> = tcs
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments.to_string()
+                        }
+                    })
+                })
+                .collect();
+            oai_messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": content_val,
+                "tool_calls": oai_tcs
+            }));
+        } else if m.role == "tool" {
+            oai_messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                "content": content_val
+            }));
+        } else {
+            oai_messages.push(serde_json::json!({
+                "role": m.role,
+                "content": content_val
+            }));
+        }
+    }
+
+    let mut payload = serde_json::json!({
+        "model": model,
+        "messages": oai_messages,
+        "temperature": 0.5,
+        "max_tokens": 4096,
+    });
+
+    if stream {
+        payload["stream"] = serde_json::json!(true);
+    }
+
+    let lower = model.to_lowercase();
+    if lower.contains("nemotron") {
+        payload["chat_template_kwargs"] = serde_json::json!({
+            "enable_thinking": true
+        });
+    }
+
+    if !tools.is_empty() {
+        let oai_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
+                })
+            })
+            .collect();
+        payload["tools"] = serde_json::json!(oai_tools);
+        payload["tool_choice"] = serde_json::json!("auto");
+    }
+
+    payload
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct PartialStreamedToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct StreamAccumulator {
+    pub content: String,
+    pub reasoning: String,
+    pub tool_calls: HashMap<usize, PartialStreamedToolCall>,
+    pub finish_reason: Option<String>,
+}
+
+impl StreamAccumulator {
+    pub fn process_sse_line<F>(&mut self, line: &str, mut on_reasoning: F) -> Result<bool, String>
+    where
+        F: FnMut(&str),
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(':') {
+            return Ok(false);
+        }
+
+        let data = if let Some(stripped) = trimmed.strip_prefix("data:") {
+            stripped.trim()
+        } else {
+            trimmed
+        };
+
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+
+        let val: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("Non-JSON SSE data ignored: {} ({})", data, e);
+                return Ok(false);
+            }
+        };
+
+        if let Some(err) = val.get("error") {
+            let msg = if let Some(m) = err.get("message").and_then(|m| m.as_str()) {
+                m.to_string()
+            } else {
+                err.to_string()
+            };
+            return Err(format!("Model provider stream error: {}", msg));
+        }
+
+        if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
+            if choices.is_empty() {
+                return Ok(false);
+            }
+            let choice = &choices[0];
+            if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                self.finish_reason = Some(fr.to_string());
+            }
+
+            if let Some(delta) = choice.get("delta") {
+                // Extract reasoning tokens
+                let reasoning_delta = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .or_else(|| delta.get("thinking"))
+                    .and_then(|r| r.as_str());
+
+                if let Some(rd) = reasoning_delta {
+                    if !rd.is_empty() {
+                        self.reasoning.push_str(rd);
+                        on_reasoning(rd);
+                    }
+                }
+
+                // Extract ordinary assistant content
+                if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+                    if !c.is_empty() {
+                        self.content.push_str(c);
+                    }
+                }
+
+                // Assemble streamed tool calls by index
+                if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        let entry = self.tool_calls.entry(idx).or_default();
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            entry.id.push_str(id);
+                        }
+                        if let Some(func) = tc.get("function") {
+                            if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                entry.name.push_str(name);
+                            }
+                            if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                entry.arguments.push_str(args);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(msg) = choice.get("message") {
+                // Support full message format (fallback for non-streaming mock responses / proxies)
+                let reasoning_delta = msg
+                    .get("reasoning_content")
+                    .or_else(|| msg.get("reasoning"))
+                    .or_else(|| msg.get("thinking"))
+                    .and_then(|r| r.as_str());
+
+                if let Some(rd) = reasoning_delta {
+                    if !rd.is_empty() {
+                        self.reasoning.push_str(rd);
+                        on_reasoning(rd);
+                    }
+                }
+
+                if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+                    if !c.is_empty() {
+                        self.content.push_str(c);
+                    }
+                }
+
+                if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for (i, tc) in tcs.iter().enumerate() {
+                        let idx = tc
+                            .get("index")
+                            .and_then(|idx| idx.as_u64())
+                            .unwrap_or(i as u64) as usize;
+                        let entry = self.tool_calls.entry(idx).or_default();
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            entry.id = id.to_string();
+                        }
+                        if let Some(func) = tc.get("function") {
+                            if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                entry.name = name.to_string();
+                            }
+                            if let Some(args) = func.get("arguments") {
+                                if let Some(s) = args.as_str() {
+                                    entry.arguments = s.to_string();
+                                } else {
+                                    entry.arguments = args.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    pub fn finalize(mut self) -> Result<LlmResponse, String> {
+        let mut sorted_indices: Vec<usize> = self.tool_calls.keys().cloned().collect();
+        sorted_indices.sort_unstable();
+
+        let mut final_tool_calls = Vec::new();
+        for idx in sorted_indices {
+            if let Some(tc) = self.tool_calls.remove(&idx) {
+                let args_str = if tc.arguments.trim().is_empty() {
+                    "{}"
+                } else {
+                    tc.arguments.trim()
+                };
+                let parsed_args: serde_json::Value =
+                    serde_json::from_str(args_str).map_err(|e| {
+                        format!(
+                            "Model returned malformed tool-call JSON for '{}': {}",
+                            tc.name, e
+                        )
+                    })?;
+                final_tool_calls.push(ToolCall {
+                    id: tc.id,
+                    name: tc.name,
+                    arguments: parsed_args,
+                });
+            }
+        }
+
+        Ok(LlmResponse {
+            content: self.content,
+            tool_calls: final_tool_calls,
+        })
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct SseBuffer {
+    buffer: String,
+}
+
+impl SseBuffer {
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+        }
+    }
+
+    pub fn push_chunk(&mut self, chunk_str: &str) {
+        self.buffer.push_str(chunk_str);
+    }
+
+    pub fn next_line(&mut self) -> Option<String> {
+        if let Some(idx) = self.buffer.find('\n') {
+            let line = self.buffer[..idx].trim_end_matches('\r').to_string();
+            self.buffer.drain(..=idx);
+            Some(line)
+        } else {
+            None
+        }
+    }
+
+    pub fn flush_remaining(&mut self) -> Option<String> {
+        if !self.buffer.trim().is_empty() {
+            let remaining = std::mem::take(&mut self.buffer);
+            Some(remaining.trim_end_matches('\r').to_string())
+        } else {
+            self.buffer.clear();
+            None
+        }
     }
 }
 
@@ -784,5 +1277,148 @@ mod tests {
         assert!(models.iter().any(|m| m.model_id == DEFAULT_NEMOTRON_MODEL));
         assert!(models.iter().any(|m| m.model_id == DEFAULT_VISION_MODEL));
         assert!(models.iter().any(|m| m.model_id == "openai/gpt-4o"));
+    }
+
+    #[test]
+    fn test_sse_buffer_split_chunks_and_flush() {
+        let mut buffer = SseBuffer::new();
+        buffer.push_chunk("data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Let");
+        assert!(buffer.next_line().is_none());
+
+        buffer.push_chunk("'s think\"}}]}\n\ndata: [DONE]\n");
+        let line1 = buffer.next_line().unwrap();
+        assert_eq!(
+            line1,
+            "data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Let's think\"}}]}"
+        );
+
+        let line2 = buffer.next_line().unwrap();
+        assert_eq!(line2, "");
+
+        let line3 = buffer.next_line().unwrap();
+        assert_eq!(line3, "data: [DONE]");
+
+        assert!(buffer.next_line().is_none());
+
+        // Test flush remaining without trailing newline
+        buffer.push_chunk("data: {\"remaining\": true}");
+        assert!(buffer.next_line().is_none());
+        assert_eq!(
+            buffer.flush_remaining(),
+            Some("data: {\"remaining\": true}".to_string())
+        );
+        assert!(buffer.flush_remaining().is_none());
+    }
+
+    #[test]
+    fn test_stream_accumulator_reasoning_and_content_separation() {
+        let mut accumulator = StreamAccumulator::default();
+        let mut emitted_reasoning = Vec::new();
+
+        let chunk1 =
+            "data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Thinking step 1. \"}}]}\n";
+        let chunk2 =
+            "data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Thinking step 2.\"}}]}\n";
+        let chunk3 = "data: {\"choices\": [{\"delta\": {\"content\": \"Here is \"}}]}\n";
+        let chunk4 = "data: {\"choices\": [{\"delta\": {\"content\": \"the actual answer.\"}}]}\n";
+        let chunk_done = "data: [DONE]\n";
+
+        for chunk in [chunk1, chunk2, chunk3, chunk4] {
+            let is_done = accumulator
+                .process_sse_line(chunk, |rd| emitted_reasoning.push(rd.to_string()))
+                .unwrap();
+            assert!(!is_done);
+        }
+
+        let is_done = accumulator
+            .process_sse_line(chunk_done, |rd| emitted_reasoning.push(rd.to_string()))
+            .unwrap();
+        assert!(is_done);
+
+        // Reasoning verified
+        assert_eq!(
+            emitted_reasoning,
+            vec!["Thinking step 1. ", "Thinking step 2."]
+        );
+        assert_eq!(accumulator.reasoning, "Thinking step 1. Thinking step 2.");
+
+        // Assistant content verified separate
+        assert_eq!(accumulator.content, "Here is the actual answer.");
+
+        let finalized = accumulator.finalize().unwrap();
+        // Crucial: finalized content must ONLY contain the assistant content, never reasoning!
+        assert_eq!(finalized.content, "Here is the actual answer.");
+        assert!(finalized.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_stream_accumulator_tool_call_reassembly() {
+        let mut accumulator = StreamAccumulator::default();
+
+        let line1 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_shell_1","function":{"name":"execute_shell","arguments":""}}]}}]}"#;
+        let line2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\": "}}]}}]}"#;
+        let line3 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"cargo test\"}"}}]}}]}"#;
+        let line4 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_read_2","function":{"name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}}]}}]}"#;
+
+        for line in [line1, line2, line3, line4] {
+            accumulator.process_sse_line(line, |_| {}).unwrap();
+        }
+
+        let resp = accumulator.finalize().unwrap();
+        assert_eq!(resp.tool_calls.len(), 2);
+
+        assert_eq!(resp.tool_calls[0].id, "call_shell_1");
+        assert_eq!(resp.tool_calls[0].name, "execute_shell");
+        assert_eq!(
+            resp.tool_calls[0].arguments,
+            serde_json::json!({ "command": "cargo test" })
+        );
+
+        assert_eq!(resp.tool_calls[1].id, "call_read_2");
+        assert_eq!(resp.tool_calls[1].name, "read_file");
+        assert_eq!(
+            resp.tool_calls[1].arguments,
+            serde_json::json!({ "path": "Cargo.toml" })
+        );
+    }
+
+    #[test]
+    fn test_stream_accumulator_provider_error() {
+        let mut accumulator = StreamAccumulator::default();
+        let error_chunk =
+            r#"data: {"error":{"message":"Rate limit exceeded for endpoint","type":"rate_limit"}}"#;
+        let res = accumulator.process_sse_line(error_chunk, |_| {});
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("Model provider stream error: Rate limit exceeded for endpoint"));
+    }
+
+    #[test]
+    fn test_build_chat_payload_nemotron_vs_other_models() {
+        let msg = vec![ChatMessage {
+            role: "user".to_string(),
+            content: MessageContent::from_text("Hello"),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        // 1. Nemotron gets chat_template_kwargs.enable_thinking
+        let nemotron_payload =
+            build_chat_payload(DEFAULT_NEMOTRON_MODEL, "sys prompt", &msg, &[], true);
+        assert_eq!(nemotron_payload["stream"], true);
+        assert_eq!(
+            nemotron_payload["chat_template_kwargs"]["enable_thinking"],
+            true
+        );
+
+        // 2. Other models (e.g. GPT-4o) do not get chat_template_kwargs
+        let gpt_payload = build_chat_payload("openai/gpt-4o", "sys prompt", &msg, &[], true);
+        assert_eq!(gpt_payload["stream"], true);
+        assert!(gpt_payload.get("chat_template_kwargs").is_none());
+
+        // 3. Non-streaming doesn't have stream: true
+        let non_streaming = build_chat_payload("openai/gpt-4o", "sys", &msg, &[], false);
+        assert!(non_streaming.get("stream").is_none());
     }
 }

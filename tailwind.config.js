@@ -9,7 +9,8 @@ export default {
     extend: {
       fontFamily: {
         sans: ["Roboto", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Helvetica Neue", "Arial", "sans-serif"],
-        mono: ["Geist Mono", "ui-monospace", "SFMono-Regular", "Menlo", "Monaco", "monospace"],
+        mono: ["Fira Code", "ui-monospace", "SFMono-Regular", "Menlo", "Monaco", "monospace"],
+        code: ["Fira Code", "ui-monospace", "SFMono-Regular", "Menlo", "Monaco", "monospace"],
       },
       colors: {
         background: "var(--background)",

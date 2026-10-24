@@ -28,8 +28,8 @@ export const TerminalView: React.FC = () => {
         cyan: "#38bdf8",
         white: "#ededed",
       },
-      fontFamily: 'var(--font-geist-mono, "Geist Mono", monospace)',
-      fontSize: 13,
+      fontFamily: 'var(--font-code, "Fira Code", monospace)',
+      fontSize: 12,
       lineHeight: 1.2,
       cursorBlink: true,
     });

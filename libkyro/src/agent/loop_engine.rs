@@ -50,6 +50,36 @@ pub struct AgentStepEvent {
     pub is_finished: bool,
 }
 
+/// The incremental event emitted as model reasoning tokens arrive.
+///
+/// Keeps raw provider reasoning separate from ordinary assistant conversation
+/// content and carries sufficient identity to route across concurrent and
+/// delegated runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentReasoningEvent {
+    /// The identifier of the run producing the reasoning.
+    pub run_id: String,
+    /// The conversation the run belongs to, when known.
+    pub conversation_id: Option<String>,
+    /// The agent producing the reasoning, when known.
+    pub agent_id: Option<String>,
+    /// The run this event was delegated from, for child-agent reasoning.
+    pub parent_run_id: Option<String>,
+    /// `true` when produced by a delegated child run.
+    pub is_child_run: bool,
+    /// The current step identifier.
+    pub step: usize,
+    /// Incremental reasoning chunk received.
+    pub delta: String,
+    /// Accumulated reasoning content for the step.
+    pub accumulated: String,
+    /// Stream lifecycle state: "start", "delta", "completed", "cancelled".
+    pub state: String,
+}
+
+/// Shared callback sink for live reasoning events across subtasks and steps.
+pub type ReasoningSink = Arc<std::sync::Mutex<Box<dyn FnMut(AgentReasoningEvent) + Send>>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub tool_call_id: String,
@@ -482,6 +512,44 @@ The program is started as an explicit executable plus argument vector; free-form
         api_key: &str,
         base_url: Option<&str>,
         // Ignored; the profile resolved from the registry is authoritative.
+        system_prompt: &str,
+        history: Vec<ChatMessage>,
+        db: Database,
+        mcp_manager: Option<McpManager>,
+        connector_manager: Option<Arc<crate::connector::ConnectorManager>>,
+        cancel_token: Option<CancellationToken>,
+        on_event: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(AgentStepEvent) + Send + 'static,
+    {
+        self.run_step_extended(
+            run_id,
+            model,
+            api_key,
+            base_url,
+            system_prompt,
+            history,
+            db,
+            mcp_manager,
+            connector_manager,
+            cancel_token,
+            on_event,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Execute an autonomous agent run step with both connector manager, local MCP support,
+    /// and live model reasoning event streaming.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_step_extended<F, R>(
+        &self,
+        run_id: &str,
+        model: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+        // Ignored; the profile resolved from the registry is authoritative.
         _system_prompt: &str,
         mut history: Vec<ChatMessage>,
         db: Database,
@@ -489,9 +557,11 @@ The program is started as an explicit executable plus argument vector; free-form
         connector_manager: Option<Arc<crate::connector::ConnectorManager>>,
         cancel_token: Option<CancellationToken>,
         mut on_event: F,
+        on_reasoning: R,
     ) -> Result<String, String>
     where
         F: FnMut(AgentStepEvent) + Send + 'static,
+        R: FnMut(AgentReasoningEvent) + Send + 'static,
     {
         let token = cancel_token.unwrap_or_default();
         self.register_run(run_id, token.clone(), model, api_key, base_url)
@@ -500,6 +570,9 @@ The program is started as an explicit executable plus argument vector; free-form
             run_id: run_id.to_string(),
             active_runs: self.active_runs.clone(),
         };
+
+        let reasoning_sender: ReasoningSink =
+            Arc::new(std::sync::Mutex::new(Box::new(on_reasoning)));
 
         if token.is_cancelled() || self.is_run_cancelled(run_id).await {
             return Err("Agent run was cancelled by user before execution started".to_string());
@@ -688,9 +761,13 @@ The program is started as an explicit executable plus argument vector; free-form
                 sleep(Duration::from_millis(400)).await;
             }
 
+            let mut accumulated_reasoning = String::new();
+            let mut has_started_reasoning = false;
+            let stream_sender = reasoning_sender.clone();
+
             let resp = match self
                 .router
-                .complete(
+                .complete_streamed(
                     model,
                     api_key,
                     base_url,
@@ -698,10 +775,49 @@ The program is started as an explicit executable plus argument vector; free-form
                     &history,
                     &tools,
                     Some(&token),
+                    |delta: &str| {
+                        accumulated_reasoning.push_str(delta);
+                        let state = if !has_started_reasoning {
+                            has_started_reasoning = true;
+                            "start".to_string()
+                        } else {
+                            "delta".to_string()
+                        };
+                        if let Ok(mut guard) = stream_sender.lock() {
+                            guard(AgentReasoningEvent {
+                                run_id: run_id.to_string(),
+                                conversation_id: run_conversation_id.clone(),
+                                agent_id: Some(active_agent_id.clone()),
+                                parent_run_id: run_parent_id.clone(),
+                                is_child_run,
+                                step,
+                                delta: delta.to_string(),
+                                accumulated: accumulated_reasoning.clone(),
+                                state,
+                            });
+                        }
+                    },
                 )
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    if has_started_reasoning {
+                        if let Ok(mut guard) = reasoning_sender.lock() {
+                            guard(AgentReasoningEvent {
+                                run_id: run_id.to_string(),
+                                conversation_id: run_conversation_id.clone(),
+                                agent_id: Some(active_agent_id.clone()),
+                                parent_run_id: run_parent_id.clone(),
+                                is_child_run,
+                                step,
+                                delta: String::new(),
+                                accumulated: accumulated_reasoning.clone(),
+                                state: "completed".to_string(),
+                            });
+                        }
+                    }
+                    r
+                }
                 Err(e) => {
                     {
                         let mut map = self.active_runs.lock().await;
@@ -811,6 +927,7 @@ The program is started as an explicit executable plus argument vector; free-form
                         &token,
                         &profile,
                         base_url,
+                        Some(reasoning_sender.clone()),
                     )
                     .await;
 
@@ -1009,6 +1126,7 @@ The program is started as an explicit executable plus argument vector; free-form
         token: &CancellationToken,
         profile: &ProfileSnapshot,
         base_url: Option<&str>,
+        reasoning_sink: Option<ReasoningSink>,
     ) -> (String, bool, Option<String>) {
         let canonical_name = canonical_tool_name(&tc.name);
 
@@ -1209,6 +1327,7 @@ The program is started as an explicit executable plus argument vector; free-form
                     authorized_argv.as_deref(),
                     profile,
                     base_url,
+                    reasoning_sink.clone(),
                 )
                 .await
             }
@@ -1307,6 +1426,7 @@ The program is started as an explicit executable plus argument vector; free-form
                                     authorized_argv.as_deref(),
                                     profile,
                                     base_url,
+                                    reasoning_sink.clone(),
                                 )
                                 .await;
                         } else if status.status == "denied" {
@@ -1352,6 +1472,7 @@ The program is started as an explicit executable plus argument vector; free-form
                     authorized_argv.as_deref(),
                     profile,
                     base_url,
+                    reasoning_sink.clone(),
                 )
                 .await
             }
@@ -1370,6 +1491,7 @@ The program is started as an explicit executable plus argument vector; free-form
                     authorized_argv.as_deref(),
                     profile,
                     base_url,
+                    reasoning_sink.clone(),
                 )
                 .await
             }
@@ -1393,6 +1515,7 @@ The program is started as an explicit executable plus argument vector; free-form
         authorized_argv: Option<&[String]>,
         profile: &ProfileSnapshot,
         base_url: Option<&str>,
+        reasoning_sink: Option<ReasoningSink>,
     ) -> (String, bool, Option<String>) {
         match tc.name.as_str() {
             "execute_shell" => {
@@ -2553,7 +2676,8 @@ The program is started as an explicit executable plus argument vector; free-form
                     Err(_) => String::new(),
                 };
 
-                let res = Box::pin(self.run_step_with_connectors(
+                let child_reasoning_sink = reasoning_sink.clone();
+                let res = Box::pin(self.run_step_extended(
                     &child_run_id,
                     &child_model,
                     &api_key,
@@ -2568,6 +2692,13 @@ The program is started as an explicit executable plus argument vector; free-form
                     connector_manager.cloned(),
                     Some(child_token),
                     |_| {},
+                    move |evt| {
+                        if let Some(ref sink) = child_reasoning_sink {
+                            if let Ok(mut guard) = sink.lock() {
+                                guard(evt);
+                            }
+                        }
+                    },
                 ))
                 .await;
 

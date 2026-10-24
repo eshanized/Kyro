@@ -68,7 +68,8 @@ export const CodeBlock: React.FC<{ code: string; language?: string }> = ({ code,
           }}
           codeTagProps={{
             style: {
-              fontFamily: 'var(--font-geist-mono, "Geist Mono", monospace)',
+              fontFamily: 'var(--font-code, "Fira Code", monospace)',
+              fontSize: "12px",
             },
           }}
         >

@@ -3,7 +3,8 @@ use crate::agent::vision::{VisualAnalysisContext, VisualAnalysisResult, VisualAn
 use crate::agent::{
     registry::{AgentRegistry, RunConfigSnapshot, ValidationState, DEFAULT_AGENT_ID},
     router::DEFAULT_NEMOTRON_MODEL,
-    AgentLoopEngine, AgentStepEvent, CancellationToken, ChatMessage, ProfileOrigin, RegistryEntry,
+    AgentLoopEngine, AgentReasoningEvent, AgentStepEvent, CancellationToken, ChatMessage,
+    ProfileOrigin, RegistryEntry,
 };
 use crate::audit::regression::{VisualBaseline, VisualRegressionEngine, VisualRegressionResult};
 use crate::computer_use::{
@@ -1178,11 +1179,12 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
     }
 
     let app_handle = app.clone();
+    let app_handle_reasoning = app.clone();
     // Do NOT wipe out abort state unconditionally on each turn!
 
     let result = state
         .engine
-        .run_step_with_connectors(
+        .run_step_extended(
             &effective_run_id,
             &selected_model,
             &api_key,
@@ -1195,6 +1197,9 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
             None,
             move |event: AgentStepEvent| {
                 let _ = app_handle.emit("agent:step", event);
+            },
+            move |reasoning: AgentReasoningEvent| {
+                let _ = app_handle_reasoning.emit("agent:reasoning", reasoning);
             },
         )
         .await;

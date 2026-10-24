@@ -5,12 +5,14 @@ import {
   Conversation,
   Message,
   AgentStepEvent,
+  AgentReasoningEvent,
   AgentProfileRecord,
   TakeoverStatus,
   ApprovalRequest,
   GroundedScreenResult,
 } from "./types/agent";
 import { ToolCallCard } from "./components/ToolCallCard";
+import { ThinkingIndicator } from "./components/ThinkingIndicator";
 import { TerminalView } from "./components/TerminalView";
 import { SettingsModal } from "./components/SettingsModal";
 import { TeachTaskModal } from "./components/TeachTaskModal";
@@ -184,6 +186,22 @@ export const App: React.FC = () => {
   // Agent State & Governance
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeRunIdRef.current = activeRunId;
+  }, [activeRunId]);
+
+  const [activeReasoning, setActiveReasoning] = useState<{
+    runId: string;
+    conversationId?: string | null;
+    agentId?: string | null;
+    parentRunId?: string | null;
+    isChildRun?: boolean;
+    step: number;
+    text: string;
+    isStreaming: boolean;
+  } | null>(null);
+  const [allProfiles, setAllProfiles] = useState<AgentProfileRecord[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequest[]>([]);
   /**
    * Live step events, grouped by the run that produced them.
@@ -408,6 +426,54 @@ export const App: React.FC = () => {
       if (belongsToActiveConversation) {
         setActiveRunId(payload.run_id);
       }
+      // Clear transient reasoning when step executes tools or completes
+      if ((payload.tool_calls && payload.tool_calls.length > 0) || payload.is_finished) {
+        setActiveReasoning(null);
+      }
+    });
+
+    // Listen to real-time agent reasoning deltas from provider streaming
+    const unlistenReasoningPromise = listen<AgentReasoningEvent>("agent:reasoning", (event) => {
+      const payload = event.payload;
+      if (!payload || !payload.run_id) return;
+
+      const currentConversation = activeConvIdRef.current;
+      if (
+        payload.conversation_id &&
+        currentConversation &&
+        payload.conversation_id !== currentConversation
+      ) {
+        return;
+      }
+
+      const currentRunId = activeRunIdRef.current;
+      if (currentRunId) {
+        const isMatchingRun =
+          payload.run_id === currentRunId || payload.parent_run_id === currentRunId;
+        if (!isMatchingRun) return;
+      }
+
+      const isTerminal = payload.state === "completed" || payload.state === "cancelled";
+
+      setActiveReasoning((prev) => {
+        const isSameContext = prev && prev.runId === payload.run_id && prev.step === payload.step;
+        const newText = payload.accumulated
+          ? payload.accumulated
+          : isSameContext
+          ? prev.text + payload.delta
+          : payload.delta;
+
+        return {
+          runId: payload.run_id,
+          conversationId: payload.conversation_id,
+          agentId: payload.agent_id,
+          parentRunId: payload.parent_run_id,
+          isChildRun: payload.is_child_run,
+          step: payload.step,
+          text: newText,
+          isStreaming: !isTerminal,
+        };
+      });
     });
 
     // Governance & Takeover polling
@@ -429,6 +495,7 @@ export const App: React.FC = () => {
     return () => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
       unlistenPromise.then((fn) => fn());
+      unlistenReasoningPromise.then((fn) => fn());
       clearInterval(pollInterval);
     };
   }, []);
@@ -443,6 +510,7 @@ export const App: React.FC = () => {
     // store, so switching back to it restores its timeline.  Only the
     // selection of the "current" run is reset here.
     setActiveRunId(null);
+    setActiveReasoning(null);
   }, [activeConvId]);
 
   useEffect(() => {
@@ -525,6 +593,7 @@ export const App: React.FC = () => {
         invoke<AgentProfileRecord[]>("list_agent_profiles"),
       ]);
       const profiles = Array.isArray(rawProfiles) ? rawProfiles : [];
+      setAllProfiles(profiles);
       const profile = profiles.find((p) => p.id === savedId && p.enabled && !p.validation_error);
       if (profile) {
         setActiveBot(profile);
@@ -815,6 +884,7 @@ export const App: React.FC = () => {
     setPrompt("");
     const runId = "run_" + crypto.randomUUID();
     setActiveRunId(runId);
+    setActiveReasoning(null);
     setIsAgentRunning(true);
     clearRunSteps(runId);
 
@@ -965,6 +1035,7 @@ export const App: React.FC = () => {
     } finally {
       setIsAgentRunning(false);
       setActiveRunId(null);
+      setActiveReasoning(null);
     }
   };
 
@@ -987,6 +1058,7 @@ export const App: React.FC = () => {
     );
     setIsAgentRunning(false);
     setActiveRunId(null);
+    setActiveReasoning(null);
   };
 
   const handleCaptureScreen = async () => {
@@ -1015,6 +1087,21 @@ export const App: React.FC = () => {
     } catch (err: any) {
       setNotice({ tone: "error", message: "Set-of-Marks grounding error: " + err });
     }
+  };
+
+  const resolveAgentDisplayName = (): string => {
+    if (activeReasoning?.isChildRun && activeReasoning.agentId) {
+      const cleanId = activeReasoning.agentId.replace(/^@/, "");
+      const matched = allProfiles.find(
+        (p) => p.id === cleanId || p.name.toLowerCase() === cleanId.toLowerCase()
+      );
+      if (matched) return `@${matched.name}`;
+      return `@${cleanId}`;
+    }
+    if (activeBot?.name && activeBot.name !== "Kyro") {
+      return `@${activeBot.name}`;
+    }
+    return "Kyro";
   };
 
   return (
@@ -2107,9 +2194,13 @@ export const App: React.FC = () => {
               ))}
 
               {isAgentRunning && (
-                <div className="flex items-center gap-2 text-xs text-neutral-400 font-mono py-1">
-                  <span className="w-2 h-2 rounded-full bg-neutral-400 animate-pulse" />
-                  <span>Kyro is processing...</span>
+                <div className="py-1">
+                  <ThinkingIndicator
+                    agentName={resolveAgentDisplayName()}
+                    reasoningText={activeReasoning?.text}
+                    isStreaming={activeReasoning?.isStreaming ?? true}
+                    statusText="Waiting for model response…"
+                  />
                 </div>
               )}
 

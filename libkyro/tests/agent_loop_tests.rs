@@ -1,5 +1,5 @@
 use kyro_lib::agent::cancellation::CancellationToken;
-use kyro_lib::agent::loop_engine::AgentLoopEngine;
+use kyro_lib::agent::loop_engine::{AgentLoopEngine, AgentReasoningEvent, AgentStepEvent};
 use kyro_lib::agent::registry::AgentRegistry;
 use kyro_lib::agent::router::{ChatMessage, MessageContent};
 use kyro_lib::governance::TakeoverController;
@@ -32,9 +32,14 @@ impl Drop for TestDir {
     }
 }
 
+enum MockResponse {
+    Json(serde_json::Value),
+    Raw(String, String),
+}
+
 struct MockLlmServer {
     addr: std::net::SocketAddr,
-    responses: Arc<Mutex<VecDeque<serde_json::Value>>>,
+    responses: Arc<Mutex<VecDeque<MockResponse>>>,
     /// Raw request bodies, in arrival order; lets tests assert exactly what the
     /// model server received (used by the registry migration verification).
     requests: Arc<Mutex<VecDeque<String>>>,
@@ -45,9 +50,8 @@ impl MockLlmServer {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let responses: Arc<Mutex<VecDeque<serde_json::Value>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        let requests: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let responses: Arc<Mutex<VecDeque<MockResponse>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let requests = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
 
         let resp_clone = responses.clone();
@@ -111,12 +115,13 @@ impl MockLlmServer {
                                 q.pop_front()
                             };
 
-                            let (status, body) = match maybe_resp {
-                                Some(val) => {
+                            let (content_type, status, body) = match maybe_resp {
+                                Some(MockResponse::Raw(ct, b)) => (ct, "200 OK".to_string(), b),
+                                Some(MockResponse::Json(val)) => {
                                     if val.get("error_code").is_some() {
-                                        ("500 Internal Server Error", val.to_string())
+                                        ("application/json".to_string(), "500 Internal Server Error".to_string(), val.to_string())
                                     } else {
-                                        ("200 OK", val.to_string())
+                                        ("application/json".to_string(), "200 OK".to_string(), val.to_string())
                                     }
                                 }
                                 None => {
@@ -129,13 +134,14 @@ impl MockLlmServer {
                                             "finish_reason": "stop"
                                         }]
                                     });
-                                    ("200 OK", default_stop.to_string())
+                                    ("application/json".to_string(), "200 OK".to_string(), default_stop.to_string())
                                 }
                             };
 
                             let resp_str = format!(
-                                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 status,
+                                content_type,
                                 body.len(),
                                 body
                             );
@@ -156,7 +162,17 @@ impl MockLlmServer {
     }
 
     async fn enqueue_response(&self, val: serde_json::Value) {
-        self.responses.lock().await.push_back(val);
+        self.responses
+            .lock()
+            .await
+            .push_back(MockResponse::Json(val));
+    }
+
+    async fn enqueue_raw_sse(&self, sse_data: &str) {
+        self.responses.lock().await.push_back(MockResponse::Raw(
+            "text/event-stream".to_string(),
+            sse_data.to_string(),
+        ));
     }
 
     fn base_url(&self) -> String {
@@ -2749,4 +2765,281 @@ async fn test_bounded_task_autonomy_agent_loop_supervised_enters_waiting_approva
     // 7. Cancel token to terminate cleanly
     cancel_token.cancel();
     let _ = loop_handle.await;
+}
+
+#[tokio::test]
+async fn test_agent_loop_streamed_reasoning_pipeline() {
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Step 1: Inspect request. \"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Step 2: Conclude safe.\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"Final answer without reasoning.\"}}]}\n\n\
+                    data: [DONE]\n\n";
+
+    let server = MockLlmServer::start().await;
+    server.enqueue_raw_sse(sse_body).await;
+
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_reasoning_pipeline");
+    let run_id = "run_streamed_reasoning_test";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Analyze architecture"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let reasoning_events = Arc::new(std::sync::Mutex::new(Vec::<AgentReasoningEvent>::new()));
+    let r_clone = reasoning_events.clone();
+
+    let step_events = Arc::new(std::sync::Mutex::new(Vec::<AgentStepEvent>::new()));
+    let s_clone = step_events.clone();
+
+    let result = engine
+        .run_step_extended(
+            run_id,
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys prompt",
+            history,
+            db.clone(),
+            None,
+            None,
+            None,
+            move |evt| {
+                s_clone.lock().unwrap().push(evt);
+            },
+            move |revt| {
+                r_clone.lock().unwrap().push(revt);
+            },
+        )
+        .await;
+
+    assert!(result.is_ok(), "Expected Ok result: {:?}", result);
+    let final_answer = result.unwrap();
+    assert_eq!(final_answer, "Final answer without reasoning.");
+
+    let revts = reasoning_events.lock().unwrap().clone();
+    assert!(!revts.is_empty(), "Must emit live reasoning events");
+    assert_eq!(revts[0].state, "start");
+    assert!(!revts[0].is_child_run);
+    assert_eq!(revts[0].delta, "Step 1: Inspect request. ");
+
+    let accumulated = revts.last().unwrap().accumulated.clone();
+    assert_eq!(
+        accumulated,
+        "Step 1: Inspect request. Step 2: Conclude safe."
+    );
+
+    // Verify reasoning did NOT contaminate assistant answer or step thought
+    let sevts = step_events.lock().unwrap().clone();
+    assert!(!sevts.is_empty());
+    assert!(!sevts[0].thought.contains("Step 1: Inspect request"));
+}
+
+#[tokio::test]
+async fn test_agent_loop_unsupported_reasoning_fallback() {
+    let server = MockLlmServer::start().await;
+    // Provider does not emit reasoning_content; only standard delta content
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Straightforward response without reasoning.\"}}]}\n\n\
+                    data: [DONE]\n\n";
+    server.enqueue_raw_sse(sse_body).await;
+
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_fallback");
+    let run_id = "run_fallback_test";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Explain fallback"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let reasoning_events = Arc::new(std::sync::Mutex::new(Vec::<AgentReasoningEvent>::new()));
+    let r_clone = reasoning_events.clone();
+
+    let result = engine
+        .run_step_extended(
+            run_id,
+            "openai/gpt-4o",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys prompt",
+            history,
+            db.clone(),
+            None,
+            None,
+            None,
+            |_| {},
+            move |revt| {
+                r_clone.lock().unwrap().push(revt);
+            },
+        )
+        .await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        result.unwrap(),
+        "Straightforward response without reasoning."
+    );
+
+    let revts = reasoning_events.lock().unwrap().clone();
+    // Honest fallback: when provider doesn't output reasoning, no fabricated reasoning events should be emitted
+    assert!(
+        revts.is_empty(),
+        "Should not fabricate reasoning when provider doesn't return reasoning tokens"
+    );
+}
+
+#[tokio::test]
+async fn test_agent_loop_stream_cancellation() {
+    let server = MockLlmServer::start().await;
+    // Chunk 1 starts reasoning
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Beginning lengthy reasoning...\"}}]}\n\n";
+    server.enqueue_raw_sse(sse_body).await;
+
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_cancel");
+    let run_id = "run_cancel_test";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Long task"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let token = CancellationToken::new();
+    let cancel_clone = token.clone();
+
+    // Cancel immediately when first reasoning token arrives
+    let result = engine
+        .run_step_extended(
+            run_id,
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys prompt",
+            history,
+            db.clone(),
+            None,
+            None,
+            Some(token),
+            |_| {},
+            move |_| {
+                cancel_clone.cancel();
+            },
+        )
+        .await;
+
+    assert!(result.is_err(), "Expected cancellation error");
+    assert!(result.unwrap_err().contains("cancelled"));
+}
+
+#[tokio::test]
+async fn test_agent_loop_delegated_task_reasoning_attribution() {
+    let server = MockLlmServer::start().await;
+    let (db, _td) = create_test_db();
+    let ws_dir = TestDir::new("ws_delegated");
+    let run_id = "run_parent_delegated";
+    create_test_run(&db, run_id, ws_dir.path());
+
+    db.set_setting("mcp_perm:delegate_task", "allow").unwrap();
+
+    // 1. Parent turn calls delegate_task tool
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Delegating to scout...",
+                    "tool_calls": [{
+                        "id": "call_delegate_1",
+                        "type": "function",
+                        "function": {
+                            "name": "delegate_task",
+                            "arguments": serde_json::json!({
+                                "target_bot_id": "scout-web",
+                                "objective": "Analyze website structure",
+                                "context_summary": "Looking for login forms"
+                            }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .await;
+
+    // 2. Child run streams reasoning tokens
+    let child_sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Scout examining DOM. \"}}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{\"content\":\"Found login form on /login.\"}}]}\n\n\
+                     data: [DONE]\n\n";
+    server.enqueue_raw_sse(child_sse).await;
+
+    // 3. Parent finishes
+    server
+        .enqueue_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Teammate Scout completed the analysis."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .await;
+
+    let engine = AgentLoopEngine::new();
+    let history = vec![ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::from_text("Audit web target"),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let reasoning_events = Arc::new(std::sync::Mutex::new(Vec::<AgentReasoningEvent>::new()));
+    let r_clone = reasoning_events.clone();
+
+    let result = engine
+        .run_step_extended(
+            run_id,
+            "test-model",
+            "test-key",
+            Some(&server.base_url()),
+            "Sys prompt",
+            history,
+            db.clone(),
+            None,
+            None,
+            None,
+            |_| {},
+            move |revt| {
+                r_clone.lock().unwrap().push(revt);
+            },
+        )
+        .await;
+
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+    let reply = result.unwrap();
+    assert_eq!(reply, "Teammate Scout completed the analysis.");
+
+    let evts = reasoning_events.lock().unwrap().clone();
+    assert!(!evts.is_empty(), "Should capture child reasoning events");
+
+    // Verify child attribution
+    let child_evts: Vec<_> = evts.into_iter().filter(|e| e.is_child_run).collect();
+    assert!(
+        !child_evts.is_empty(),
+        "Child reasoning events must have is_child_run == true"
+    );
+    assert_eq!(child_evts[0].parent_run_id, Some(run_id.to_string()));
+    assert_eq!(child_evts[0].agent_id, Some("scout-web".to_string()));
 }

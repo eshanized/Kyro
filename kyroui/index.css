@@ -3,13 +3,16 @@
 @import "@fontsource/roboto/500.css";
 @import "@fontsource/roboto/700.css";
 @import "@fontsource/roboto/900.css";
-@import "@fontsource/geist-mono";
+@import "@fontsource/fira-code";
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
+  /* Font tokens */
+  --font-code: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+
   /* Next.js default dark theme foundation */
   --background: #0a0a0a;
   --foreground: #ededed;
@@ -124,4 +127,75 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-hover);
+}
+
+/* Polished Thinking & Reasoning Animations */
+@keyframes kyro-dot-wave {
+  0%, 100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-2.5px);
+  }
+}
+
+@keyframes kyro-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes kyro-pulse-subtle {
+  0%, 100% {
+    border-color: #262626;
+    box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+  }
+  50% {
+    border-color: #383838;
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.03);
+  }
+}
+
+.animate-thinking-dot-1 {
+  animation: kyro-dot-wave 1.4s ease-in-out infinite;
+}
+
+.animate-thinking-dot-2 {
+  animation: kyro-dot-wave 1.4s ease-in-out 0.2s infinite;
+}
+
+.animate-thinking-dot-3 {
+  animation: kyro-dot-wave 1.4s ease-in-out 0.4s infinite;
+}
+
+.thinking-panel-glow {
+  animation: kyro-pulse-subtle 3s ease-in-out infinite;
+}
+
+.thinking-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.04) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-size: 200% 100%;
+  animation: kyro-shimmer 2.5s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-thinking-dot-1,
+  .animate-thinking-dot-2,
+  .animate-thinking-dot-3,
+  .thinking-panel-glow,
+  .thinking-shimmer {
+    animation: none !important;
+    transform: none !important;
+    opacity: 0.75 !important;
+  }
 }

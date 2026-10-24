@@ -16,17 +16,12 @@ pub enum FileOp {
     Delete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAutonomyMode {
+    #[default]
     Autonomous,
     Supervised,
-}
-
-impl Default for TaskAutonomyMode {
-    fn default() -> Self {
-        TaskAutonomyMode::Autonomous
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1347,25 +1342,24 @@ impl AuthorizationEngine {
                     .contains(&RoutineOpClass::LocalVerification)
                 && RiskLevel::Moderate <= grant.max_risk
                 && workspace_root.is_some()
+                && Self::is_local_verification_command(&executable, &words)
             {
-                if Self::is_local_verification_command(&executable, &words) {
-                    let mut paths_ok = true;
-                    for arg in &words[1..] {
-                        if !arg.starts_with('-') {
-                            if Self::check_path_argument(arg, workspace_root).is_some() {
-                                paths_ok = false;
-                                break;
-                            }
-                        }
+                let mut paths_ok = true;
+                for arg in &words[1..] {
+                    if !arg.starts_with('-')
+                        && Self::check_path_argument(arg, workspace_root).is_some()
+                    {
+                        paths_ok = false;
+                        break;
                     }
-                    if paths_ok {
-                        return ShellAnalysis {
-                            decision: AuthDecision::Allow,
-                            argv: Some(words.clone()),
-                            requires_shell: false,
-                            lexed_words: words,
-                        };
-                    }
+                }
+                if paths_ok {
+                    return ShellAnalysis {
+                        decision: AuthDecision::Allow,
+                        argv: Some(words.clone()),
+                        requires_shell: false,
+                        lexed_words: words,
+                    };
                 }
             }
         }

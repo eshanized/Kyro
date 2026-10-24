@@ -77,7 +77,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, result }) 
         <div className="p-3 border-t border-neutral-800 space-y-2 bg-[#0a0a0a]">
           <div>
             <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">Arguments</div>
-            <pre className="p-2 bg-[#000000] rounded border border-neutral-800 text-neutral-300 overflow-x-auto text-[11px]">
+            <pre className="p-2 bg-[#000000] rounded border border-neutral-800 text-neutral-300 overflow-x-auto font-mono text-[12px] leading-relaxed">
               {JSON.stringify(toolCall.arguments, null, 2)}
             </pre>
           </div>
@@ -86,7 +86,7 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({ toolCall, result }) 
             <div>
               <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">Output</div>
               <pre
-                className={`p-2 rounded border overflow-x-auto max-h-60 text-[11px] ${
+                className={`p-2 rounded border overflow-x-auto max-h-60 font-mono text-[12px] leading-relaxed ${
                   result.is_error
                     ? "bg-red-950/20 border-red-900/40 text-red-300"
                     : "bg-[#000000] border-neutral-800 text-neutral-300"

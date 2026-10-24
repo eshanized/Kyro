@@ -1013,7 +1013,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                                 </div>
 
                                 {fileDiff.unified_diff && (
-                                  <div className="max-h-36 overflow-y-auto p-2 bg-[#0c0c0c] rounded font-mono text-[10px] space-y-0.5 border border-neutral-900">
+                                  <div className="max-h-36 overflow-y-auto p-2 bg-[#0c0c0c] rounded font-mono text-[12px] space-y-0.5 border border-neutral-900">
                                     {fileDiff.unified_diff.split("\n").map((line, lIdx) => (
                                       <div
                                         key={lIdx}
@@ -1456,7 +1456,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                   </p>
 
                   {reconciliation.unified_diff && (
-                    <div className="p-3 bg-neutral-950 border border-neutral-800 rounded-lg max-h-48 overflow-y-auto font-mono text-[10px] space-y-0.5">
+                    <div className="p-3 bg-neutral-950 border border-neutral-800 rounded-lg max-h-48 overflow-y-auto font-mono text-[12px] space-y-0.5">
                       {reconciliation.unified_diff.split("\n").map((line, i) => (
                         <div
                           key={i}
@@ -1794,14 +1794,14 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                         <div className="space-y-2">
                           <div>
                             <div className="text-[10px] text-neutral-400 font-mono uppercase mb-1">Standard Output</div>
-                            <pre className="p-2 bg-neutral-900 border border-neutral-800 rounded font-mono text-[10px] text-neutral-300 max-h-32 overflow-y-auto whitespace-pre-wrap">
+                            <pre className="p-2 bg-neutral-900 border border-neutral-800 rounded font-mono text-[12px] text-neutral-300 max-h-32 overflow-y-auto whitespace-pre-wrap">
                               {selectedExperiment.stdout_tail || "(no stdout recorded)"}
                             </pre>
                           </div>
                           {selectedExperiment.stderr_tail && (
                             <div>
                               <div className="text-[10px] text-red-400 font-mono uppercase mb-1">Standard Error</div>
-                              <pre className="p-2 bg-neutral-900 border border-neutral-800 rounded font-mono text-[10px] text-red-300 max-h-24 overflow-y-auto whitespace-pre-wrap">
+                              <pre className="p-2 bg-neutral-900 border border-neutral-800 rounded font-mono text-[12px] text-red-300 max-h-24 overflow-y-auto whitespace-pre-wrap">
                                 {selectedExperiment.stderr_tail}
                               </pre>
                             </div>

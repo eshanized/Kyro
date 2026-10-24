@@ -90,6 +90,23 @@ export interface AgentStepEvent {
   is_finished: boolean;
 }
 
+export interface AgentReasoningEvent {
+  /** The run that produced the reasoning. */
+  run_id: string;
+  /** The conversation the run belongs to, when known. */
+  conversation_id?: string | null;
+  /** The agent producing the reasoning, when known. */
+  agent_id?: string | null;
+  /** The run this event was delegated from, for child-agent reasoning. */
+  parent_run_id?: string | null;
+  /** True when produced by a delegated child run. */
+  is_child_run?: boolean;
+  step: number;
+  delta: string;
+  accumulated: string;
+  state: "start" | "delta" | "completed" | "cancelled" | string;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;

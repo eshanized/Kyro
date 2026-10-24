@@ -478,7 +478,7 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
                   </div>
                 ) : (
                   /* Monospace Text/Markdown/Code Preview */
-                  <div className="flex-1 overflow-auto p-4 font-mono text-xs text-neutral-200 bg-[#000000] whitespace-pre-wrap leading-relaxed select-text">
+                  <div className="flex-1 overflow-auto p-4 font-mono text-[12px] text-neutral-200 bg-[#000000] whitespace-pre-wrap leading-relaxed select-text">
                     {previewContent || "(Empty content)"}
                   </div>
                 )}
