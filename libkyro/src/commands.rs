@@ -1964,15 +1964,7 @@ pub async fn preview_file_organization(
     directory: String,
     rule: Option<OrganizationRule>,
 ) -> Result<OrganizationPlan, String> {
-    let p = Path::new(&directory);
-    let folders = state.db.list_authorized_folders().unwrap_or_default();
-    if folders.is_empty() {
-        return Err("Access denied: No authorized folders configured. Please authorize folders in Settings first.".to_string());
-    }
-    let canonical_target = check_path_authorized_in_folders(p, &folders)
-        .map_err(|e| format!("Access denied for preview directory: {}", e))?;
-
-    FileOrganizer::preview(&canonical_target, rule)
+    FileOrganizer::preview_authorized(&state.db, &directory, rule)
 }
 
 #[tauri::command]
@@ -1980,42 +1972,7 @@ pub async fn execute_file_organization(
     plan: OrganizationPlan,
     state: tauri::State<'_, AppState>,
 ) -> Result<OrganizationTransaction, String> {
-    let folders = state.db.list_authorized_folders().unwrap_or_default();
-    if folders.is_empty() {
-        return Err("Access denied: No authorized folders configured.".to_string());
-    }
-
-    // Verify target directory
-    let target = &plan.target_directory;
-    let canonical_target = check_path_authorized_in_folders(target, &folders)
-        .map_err(|e| format!("Access denied for target directory: {}", e))?;
-
-    let mut canonical_plan = plan.clone();
-    canonical_plan.target_directory = canonical_target;
-
-    // Recheck permissions immediately before execution for both source and destination
-    for action in &mut canonical_plan.operations {
-        let src = &action.source_path;
-        let canon_src = check_path_authorized_in_folders(src, &folders).map_err(|e| {
-            format!(
-                "Access denied for organization source '{}': {}",
-                action.source_path.display(),
-                e
-            )
-        })?;
-        let dest = &action.destination_path;
-        let canon_dest = check_path_authorized_in_folders(dest, &folders).map_err(|e| {
-            format!(
-                "Access denied for organization destination '{}': {}",
-                action.destination_path.display(),
-                e
-            )
-        })?;
-        action.source_path = canon_src;
-        action.destination_path = canon_dest;
-    }
-
-    let trx = FileOrganizer::execute(&canonical_plan)?;
+    let trx = FileOrganizer::execute_authorized(&state.db, &plan)?;
     if let Ok(manifest_json) = serde_json::to_string_pretty(&trx) {
         let art_id = format!("art_{}", uuid::Uuid::new_v4());
         let rec = ArtifactRecord {
@@ -2038,38 +1995,21 @@ pub async fn execute_file_organization(
 #[tauri::command]
 pub async fn undo_file_organization(
     state: tauri::State<'_, AppState>,
-    mut transaction: OrganizationTransaction,
+    transaction: OrganizationTransaction,
 ) -> Result<usize, String> {
-    let folders = state.db.list_authorized_folders().unwrap_or_default();
-    if folders.is_empty() {
-        return Err("Access denied: No authorized folders configured.".to_string());
-    }
+    let trx = FileOrganizer::undo_authorized(&state.db, &transaction.transaction_id)?;
+    let undone_count = trx.operations.iter().filter(|o| o.status == "undone").count();
+    Ok(undone_count)
+}
 
-    let target = Path::new(&transaction.target_directory);
-    let canonical_target = check_path_authorized_in_folders(target, &folders)
-        .map_err(|e| format!("Access denied for rollback directory: {}", e))?;
-    transaction.target_directory = canonical_target.to_string_lossy().to_string();
-
-    for op in &mut transaction.operations {
-        let src = Path::new(&op.source_path);
-        let canon_src = check_path_authorized_in_folders(src, &folders).map_err(|e| {
-            format!(
-                "Access denied for rollback source '{}': {}",
-                op.source_path, e
-            )
-        })?;
-        let dest = Path::new(&op.destination_path);
-        let canon_dest = check_path_authorized_in_folders(dest, &folders).map_err(|e| {
-            format!(
-                "Access denied for rollback destination '{}': {}",
-                op.destination_path, e
-            )
-        })?;
-        op.source_path = canon_src.to_string_lossy().to_string();
-        op.destination_path = canon_dest.to_string_lossy().to_string();
-    }
-
-    FileOrganizer::undo(&mut transaction)
+#[tauri::command]
+pub async fn undo_file_transaction(
+    state: tauri::State<'_, AppState>,
+    transaction_id: String,
+) -> Result<usize, String> {
+    let trx = FileOrganizer::undo_authorized(&state.db, &transaction_id)?;
+    let undone_count = trx.operations.iter().filter(|o| o.status == "undone").count();
+    Ok(undone_count)
 }
 
 #[tauri::command]
@@ -2769,10 +2709,46 @@ pub fn list_file_transactions(
     state: State<AppState>,
     limit: Option<usize>,
 ) -> Result<Vec<OrganizationTransaction>, String> {
-    state
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = state
         .db
         .list_file_transactions(limit.unwrap_or(20))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|t| {
+            let p = Path::new(&t.target_directory);
+            check_path_authorized_in_folders(p, &folders).is_ok()
+        })
+        .collect();
+
+    Ok(filtered)
+}
+
+#[tauri::command]
+pub fn get_file_transaction(
+    state: State<AppState>,
+    transaction_id: String,
+) -> Result<Option<OrganizationTransaction>, String> {
+    let folders = state.db.list_authorized_folders().unwrap_or_default();
+    if folders.is_empty() {
+        return Ok(None);
+    }
+    if let Some(trx) = state
+        .db
+        .get_file_transaction(&transaction_id)
+        .map_err(|e| e.to_string())?
+    {
+        let p = Path::new(&trx.target_directory);
+        if check_path_authorized_in_folders(p, &folders).is_ok() {
+            return Ok(Some(trx));
+        }
+    }
+    Ok(None)
 }
 
 #[tauri::command]
