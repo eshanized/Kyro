@@ -488,6 +488,56 @@ impl AuthorizationEngine {
             "launch_ghost_app" => Self::evaluate_ghost_launch(&policy, args),
             "invoke_skill" => Self::evaluate_skill_invoke(&policy, args),
             "run_safe_experiment" => Self::evaluate_experiment(&policy, args),
+            "organize_files_preview" => {
+                let perm_key = "mcp_perm:organize_files_preview";
+                if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
+                    match policy_val.trim().to_lowercase().as_str() {
+                        "deny" => AuthDecision::Deny {
+                            reason: "File organization preview is explicitly blocked by policy".to_string(),
+                        },
+                        "ask" => AuthDecision::RequireApproval {
+                            reason: "File organization preview requires approval".to_string(),
+                            risk: RiskLevel::Safe,
+                            summary: format!("Preview file organization for directory '{}'", args["directory"].as_str().unwrap_or("")),
+                        },
+                        _ => AuthDecision::Allow,
+                    }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            "organize_files_execute" => {
+                let perm_key = "mcp_perm:organize_files_execute";
+                if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
+                    if policy_val.trim().to_lowercase() == "deny" {
+                        return AuthDecision::Deny {
+                            reason: "File organization execution is explicitly blocked by policy".to_string(),
+                        };
+                    }
+                }
+                // Mutating tool: MUST require approval. Persisted permission CANNOT silently bypass!
+                AuthDecision::RequireApproval {
+                    reason: "Executing file reorganization moves files into new directory locations.".to_string(),
+                    risk: RiskLevel::Moderate,
+                    summary: "Move categorized files into organized folders".to_string(),
+                }
+            }
+            "organize_files_undo" => {
+                let perm_key = "mcp_perm:organize_files_undo";
+                if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
+                    if policy_val.trim().to_lowercase() == "deny" {
+                        return AuthDecision::Deny {
+                            reason: "File organization undo is explicitly blocked by policy".to_string(),
+                        };
+                    }
+                }
+                // Mutating tool: MUST require approval. Persisted permission CANNOT silently bypass!
+                AuthDecision::RequireApproval {
+                    reason: "Undoing file organization moves files back to their previous locations.".to_string(),
+                    risk: RiskLevel::Moderate,
+                    summary: "Reverse organized file moves".to_string(),
+                }
+            }
             _ => {
                 // MCP or custom external tool
                 Self::evaluate_mcp_or_custom(db, &policy, tool_name, args)
