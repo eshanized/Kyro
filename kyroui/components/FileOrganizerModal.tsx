@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   FolderOpen,
@@ -10,11 +10,14 @@ import {
   FileText,
   X,
   Layers,
+  Clock,
+  ArrowRight,
 } from "lucide-react";
 import {
   OrganizationPlan,
   OrganizationTransaction,
   OrganizationRule,
+  AuthorizedFolderRecord,
 } from "../types/agent";
 
 interface FileOrganizerModalProps {
@@ -33,10 +36,57 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
   const [plan, setPlan] = useState<OrganizationPlan | null>(null);
   const [lastTransaction, setLastTransaction] =
     useState<OrganizationTransaction | null>(null);
+  const [authorizedFolders, setAuthorizedFolders] = useState<AuthorizedFolderRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (isOpen) {
+      loadAuthorizedFolders();
+      loadRecentTransactions();
+    }
+  }, [isOpen]);
+
+  const loadAuthorizedFolders = async () => {
+    try {
+      const folders = await invoke<AuthorizedFolderRecord[]>("list_authorized_folders");
+      setAuthorizedFolders(folders || []);
+    } catch {
+      // Fail quietly for unauthorized or test environments
+    }
+  };
+
+  const loadRecentTransactions = async () => {
+    try {
+      const txs = await invoke<OrganizationTransaction[]>("list_file_transactions", {
+        limit: 5,
+      });
+      if (txs && txs.length > 0 && !lastTransaction) {
+        setLastTransaction(txs[0]);
+      }
+    } catch {
+      // Fail quietly for test environments
+    }
+  };
+
   if (!isOpen) return null;
+
+  const handleDirectoryChange = (newDir: string) => {
+    setDirectory(newDir);
+    setPlan(null); // Invalidate previous plan whenever directory changes
+    setError(null);
+    setSuccessMessage(null);
+  };
+
+  const handleRecursiveChange = (val: boolean) => {
+    setRecursive(val);
+    setPlan(null); // Invalidate previous plan
+  };
+
+  const handleGroupDuplicatesChange = (val: boolean) => {
+    setGroupDuplicates(val);
+    setPlan(null); // Invalidate previous plan
+  };
 
   const handlePreview = async () => {
     if (!directory.trim()) {
@@ -82,9 +132,19 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
       );
       setLastTransaction(trx);
       const completed = trx.operations.filter((o) => o.status === "completed").length;
-      setSuccessMessage(
-        `Successfully organized ${completed} files into category folders. Transaction manifest saved.`
-      );
+      const failedOrSkipped = trx.operations.filter((o) => o.status !== "completed").length;
+
+      if (trx.status === "completed") {
+        setSuccessMessage(
+          `Successfully organized ${completed} files into category folders. Transaction manifest saved.`
+        );
+      } else if (trx.status === "partially_failed") {
+        setSuccessMessage(
+          `Partially organized: ${completed} files moved, ${failedOrSkipped} files skipped or failed. Review details below.`
+        );
+      } else {
+        setError(`Organization failed: No files were moved. Review details below.`);
+      }
       setPlan(null);
     } catch (e: any) {
       setError(e?.toString() || "Failed to execute organization.");
@@ -101,8 +161,38 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
       const undoneCount = await invoke<number>("undo_file_organization", {
         transaction: lastTransaction,
       });
-      setSuccessMessage(`Successfully reversed ${undoneCount} file moves back to original locations.`);
-      setLastTransaction(null);
+      try {
+        const updated = await invoke<OrganizationTransaction | null>(
+          "get_file_transaction",
+          { transactionId: lastTransaction.transaction_id }
+        );
+        if (updated) {
+          setLastTransaction(updated);
+          if (updated.status === "undone") {
+            setSuccessMessage(
+              `Successfully reversed ${undoneCount} file moves back to original locations.`
+            );
+          } else if (updated.status === "partially_undone") {
+            setSuccessMessage(
+              `Partially reversed ${undoneCount} file moves. Some files could not be restored; retry is available.`
+            );
+          } else {
+            setError(
+              `Undo failed to reverse files. Check permissions and occupancy.`
+            );
+          }
+        } else {
+          setSuccessMessage(
+            `Successfully reversed ${undoneCount} file moves back to original locations.`
+          );
+          setLastTransaction(null);
+        }
+      } catch {
+        setSuccessMessage(
+          `Successfully reversed ${undoneCount} file moves back to original locations.`
+        );
+        setLastTransaction(null);
+      }
     } catch (e: any) {
       setError(e?.toString() || "Failed to undo organization transaction.");
     } finally {
@@ -128,7 +218,7 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition"
+            className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -142,7 +232,7 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
                 type="text"
                 placeholder="Enter absolute directory path (e.g. /home/user/Downloads or ~/Desktop)"
                 value={directory}
-                onChange={(e) => setDirectory(e.target.value)}
+                onChange={(e) => handleDirectoryChange(e.target.value)}
                 className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3.5 py-2 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-green-500 transition"
               />
             </div>
@@ -166,12 +256,30 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
             )}
           </div>
 
+          {/* Authorized Folders Quick Picker */}
+          {authorizedFolders.length > 0 && (
+            <div className="flex items-center gap-2 text-xs text-zinc-400 overflow-x-auto py-1">
+              <span className="shrink-0 text-zinc-500">Authorized:</span>
+              {authorizedFolders.map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => handleDirectoryChange(f.path)}
+                  className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700/60 truncate max-w-xs transition cursor-pointer"
+                  title={f.path}
+                >
+                  {f.display_name || f.path.split("/").pop() || f.path}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="flex items-center space-x-6 text-xs text-zinc-300">
             <label className="flex items-center space-x-2 cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={groupDuplicates}
-                onChange={(e) => setGroupDuplicates(e.target.checked)}
+                onChange={(e) => handleGroupDuplicatesChange(e.target.checked)}
                 className="rounded border-zinc-700 bg-zinc-950 text-green-500 focus:ring-0"
               />
               <span>Detect & group duplicate files via SHA-256 hash</span>
@@ -180,7 +288,7 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
               <input
                 type="checkbox"
                 checked={recursive}
-                onChange={(e) => setRecursive(e.target.checked)}
+                onChange={(e) => handleRecursiveChange(e.target.checked)}
                 className="rounded border-zinc-700 bg-zinc-950 text-green-500 focus:ring-0"
               />
               <span>Scan subfolders recursively</span>
@@ -201,17 +309,36 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
             <span>{successMessage}</span>
           </div>
         )}
+        {plan?.scan_warnings && plan.scan_warnings.length > 0 && (
+          <div className="mx-6 mt-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs space-y-1">
+            <div className="flex items-center space-x-1.5 font-medium">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>Scan Warnings ({plan.scan_warnings.length})</span>
+            </div>
+            <ul className="list-disc list-inside space-y-0.5 text-zinc-400">
+              {plan.scan_warnings.map((w, idx) => (
+                <li key={idx}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {/* Content Area */}
         <div className="flex-1 overflow-y-auto p-6">
           {plan ? (
             <div className="space-y-4">
               {/* Stat Cards */}
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-4 gap-3">
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                  <div className="text-xs text-zinc-400">Files to Organize</div>
+                  <div className="text-xs text-zinc-400">Total Scanned</div>
                   <div className="text-xl font-bold text-zinc-100 mt-1">
                     {plan.total_scanned}
+                  </div>
+                </div>
+                <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                  <div className="text-xs text-zinc-400">Files to Move</div>
+                  <div className="text-xl font-bold text-green-400 mt-1">
+                    {plan.operations.filter((o) => !o.conflict).length}
                   </div>
                 </div>
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
@@ -221,11 +348,17 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
                   </div>
                 </div>
                 <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                  <div className="text-xs text-zinc-400">Potential Conflicts</div>
-                  <div className="text-xl font-bold text-zinc-100 mt-1">
+                  <div className="text-xs text-zinc-400">Conflicts / Skipped</div>
+                  <div className="text-xl font-bold text-zinc-300 mt-1">
                     {plan.conflicts_count}
                   </div>
                 </div>
+              </div>
+
+              {/* Target Directory Label */}
+              <div className="text-xs text-zinc-400 flex items-center space-x-1.5">
+                <span className="text-zinc-500">Target Root:</span>
+                <span className="font-mono text-zinc-300">{plan.target_directory}</span>
               </div>
 
               {/* Operations Table */}
@@ -234,7 +367,7 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
                   <thead className="bg-zinc-950 text-zinc-400 border-b border-zinc-800 font-medium">
                     <tr>
                       <th className="py-2.5 px-3">File Name</th>
-                      <th className="py-2.5 px-3">Category Folder</th>
+                      <th className="py-2.5 px-3">Destination Folder</th>
                       <th className="py-2.5 px-3">Status / Reason</th>
                       <th className="py-2.5 px-3">Size</th>
                     </tr>
@@ -259,12 +392,12 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
                           <td className="py-2 px-3 text-zinc-400">
                             {op.conflict ? (
                               <span className="text-red-400 flex items-center space-x-1">
-                                <AlertTriangle className="w-3.5 h-3.5" />
+                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                                 <span>{op.conflict}</span>
                               </span>
                             ) : op.is_duplicate ? (
                               <span className="text-amber-400 flex items-center space-x-1">
-                                <Copy className="w-3.5 h-3.5" />
+                                <Copy className="w-3.5 h-3.5 shrink-0" />
                                 <span>Identical content duplicate</span>
                               </span>
                             ) : (
@@ -273,6 +406,79 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
                           </td>
                           <td className="py-2 px-3 text-zinc-400">
                             {(op.file_size / 1024).toFixed(1)} KB
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : lastTransaction ? (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between p-3 rounded-lg bg-zinc-950 border border-zinc-800">
+                <div className="flex items-center space-x-2 text-xs text-zinc-300">
+                  <Clock className="w-4 h-4 text-zinc-500" />
+                  <span>Recent Transaction:</span>
+                  <span className="font-mono text-zinc-400">{lastTransaction.transaction_id}</span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] uppercase font-semibold ${
+                    lastTransaction.status === "completed"
+                      ? "bg-green-500/20 text-green-300 border border-green-500/30"
+                      : lastTransaction.status === "undone"
+                      ? "bg-blue-500/20 text-blue-300 border border-blue-500/30"
+                      : "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  }`}>
+                    {lastTransaction.status}
+                  </span>
+                </div>
+                {lastTransaction.status !== "undone" && (
+                  <button
+                    onClick={handleUndo}
+                    disabled={loading}
+                    className="flex items-center space-x-1.5 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/30 px-3 py-1 rounded text-xs font-medium transition cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Undo Transaction</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Transaction Operation Records */}
+              <div className="rounded-lg border border-zinc-800 overflow-hidden">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-zinc-950 text-zinc-400 border-b border-zinc-800 font-medium">
+                    <tr>
+                      <th className="py-2.5 px-3">File</th>
+                      <th className="py-2.5 px-3">Destination</th>
+                      <th className="py-2.5 px-3">Status</th>
+                      <th className="py-2.5 px-3">Error / Note</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/60">
+                    {lastTransaction.operations.map((op, idx) => {
+                      const srcName = op.source_path.split("/").pop() || op.source_path;
+                      const destName = op.destination_path.split("/").pop() || op.destination_path;
+                      return (
+                        <tr key={idx} className="hover:bg-zinc-800/30 transition">
+                          <td className="py-2 px-3 font-mono text-zinc-200 truncate max-w-xs">{srcName}</td>
+                          <td className="py-2 px-3 font-mono text-zinc-400 truncate max-w-xs">{destName}</td>
+                          <td className="py-2 px-3">
+                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium ${
+                              op.status === "completed"
+                                ? "bg-green-500/20 text-green-300 border border-green-500/30"
+                                : op.status === "undone"
+                                ? "bg-blue-500/20 text-blue-300 border border-blue-500/30"
+                                : "bg-red-500/20 text-red-300 border border-red-500/30"
+                            }`}>
+                              {op.status}
+                            </span>
+                          </td>
+                          <td className="py-2 px-3 text-zinc-400">
+                            {op.error ? (
+                              <span className="text-red-400">{op.error}</span>
+                            ) : (
+                              <span className="text-zinc-500">None</span>
+                            )}
                           </td>
                         </tr>
                       );
@@ -297,7 +503,7 @@ export const FileOrganizerModal: React.FC<FileOrganizerModalProps> = ({
           <div className="border-t border-zinc-800 px-6 py-4 flex items-center justify-between bg-zinc-950">
             <span className="text-xs text-zinc-400">
               {plan.conflicts_count > 0
-                ? `${plan.conflicts_count} conflicted files will be skipped automatically.`
+                ? `${plan.conflicts_count} conflicted/skipped files will not be moved.`
                 : "All operations validated and path-confined."}
             </span>
             <div className="flex space-x-3">
