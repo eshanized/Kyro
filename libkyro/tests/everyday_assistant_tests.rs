@@ -907,6 +907,7 @@ fn test_file_organizer_toctou_symlink_traversal_rejection() {
             duplicate_of: None,
             conflict: None,
         }],
+        ..Default::default()
     };
 
     let result = FileOrganizer::execute(&plan).unwrap();
@@ -1012,6 +1013,7 @@ fn test_dynamic_toctou_path_race_rejection_and_documentation() {
             duplicate_of: None,
             conflict: None,
         }],
+        ..Default::default()
     };
 
     // Simulate TOCTOU race: an attacker creates a symlink at the destination parent pointing to outside_forbidden
