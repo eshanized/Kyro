@@ -1043,8 +1043,27 @@ async fn test_document_assistant_and_file_organization_commands() {
     let trx = execute_file_organization(preview, state.clone())
         .await
         .unwrap();
-    let undo_count = undo_file_organization(state.clone(), trx).await.unwrap();
-    let _ = undo_count;
+
+    // Verify transaction retrieval and listing
+    let retrieved = get_file_transaction(state.clone(), trx.transaction_id.clone())
+        .unwrap()
+        .expect("transaction should exist");
+    assert_eq!(retrieved.transaction_id, trx.transaction_id);
+
+    let listed_txs = list_file_transactions(state.clone(), Some(10))
+        .unwrap();
+    assert!(listed_txs.iter().any(|t| t.transaction_id == trx.transaction_id));
+
+    // Test undo_file_transaction by transaction ID command
+    let undone_count = undo_file_transaction(state.clone(), trx.transaction_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(undone_count, 2);
+
+    let updated_tx = get_file_transaction(state.clone(), trx.transaction_id.clone())
+        .unwrap()
+        .expect("transaction should exist");
+    assert_eq!(updated_tx.status, "undone");
 }
 
 #[tokio::test]
