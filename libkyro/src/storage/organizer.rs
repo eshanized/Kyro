@@ -1,6 +1,7 @@
 //! Safe file organization subsystem with preview, content-hash duplicate detection,
 //! transaction manifests, path containment, and reversible undo.
 
+use crate::storage::db::{check_path_authorized_in_folders, Database};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -45,34 +46,59 @@ pub struct PlannedFileOp {
 }
 
 /// A full preview plan ready for inspection by the user or agent before execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrganizationPlan {
     pub plan_id: String,
     pub target_directory: PathBuf,
     pub total_scanned: usize,
+    #[serde(default)]
+    pub eligible_files: usize,
+    #[serde(default)]
+    pub unmodified_count: usize,
+    #[serde(default)]
+    pub planned_count: usize,
     pub duplicates_count: usize,
     pub conflicts_count: usize,
     pub operations: Vec<PlannedFileOp>,
+    #[serde(default)]
+    pub scan_warnings: Vec<String>,
+}
+
+impl Default for OrganizationPlan {
+    fn default() -> Self {
+        Self {
+            plan_id: String::new(),
+            target_directory: PathBuf::new(),
+            total_scanned: 0,
+            eligible_files: 0,
+            unmodified_count: 0,
+            planned_count: 0,
+            duplicates_count: 0,
+            conflicts_count: 0,
+            operations: Vec::new(),
+            scan_warnings: Vec::new(),
+        }
+    }
 }
 
 /// A recorded operation status in a transaction manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrganizationOpRecord {
     pub source_path: String,
     pub destination_path: String,
     pub file_hash: String,
     pub file_size: u64,
-    pub status: String, // "completed", "failed", "undone"
+    pub status: String, // "completed", "failed", "skipped", "stale", "undone", "copied_source_remains", "undo_failed"
     pub error: Option<String>,
 }
 
 /// A durable transaction manifest containing everything needed to review or reverse moves.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrganizationTransaction {
     pub transaction_id: String,
     pub target_directory: String,
     pub created_at: i64,
-    pub status: String, // "completed", "partially_failed", "undone"
+    pub status: String, // "completed", "partially_failed", "failed", "undone", "partially_undone", "undo_failed"
     pub operations: Vec<OrganizationOpRecord>,
 }
 
@@ -131,6 +157,18 @@ impl FileOrganizer {
         Ok(hex)
     }
 
+    /// Safely expands `~` or `~/...` to the user's home directory across platforms.
+    pub fn expand_tilde(path: &Path) -> PathBuf {
+        let s = path.to_string_lossy();
+        if s == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
+        } else if let Some(rest) = s.strip_prefix("~/") {
+            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        }
+    }
+
     /// Generates an inspection plan previewing all proposed moves and identifying conflicts.
     pub fn preview(
         root_dir: &Path,
@@ -153,17 +191,55 @@ impl FileOrganizer {
             .map_err(|e| format!("Failed to canonicalize root directory: {}", e))?;
 
         let rule = rule_opt.unwrap_or_default();
-        let mut entries = Vec::new();
-        Self::collect_files(&canonical_root, &rule, &mut entries)?;
-        entries.sort();
+        let mut eligible_files = Vec::new();
+        let mut symlinks = Vec::new();
+        let mut scan_warnings = Vec::new();
+        let mut total_scanned = 0;
+
+        Self::collect_files(
+            &canonical_root,
+            &rule,
+            &mut eligible_files,
+            &mut symlinks,
+            &mut scan_warnings,
+            &mut total_scanned,
+        )?;
+
+        eligible_files.sort();
+        symlinks.sort();
 
         let mut hash_map: HashMap<String, PathBuf> = HashMap::new();
         let mut planned_ops = Vec::new();
         let mut duplicates_count = 0;
         let mut conflicts_count = 0;
+        let mut unmodified_count = 0;
 
-        for source_path in entries {
-            let metadata = match fs::symlink_metadata(&source_path) {
+        // Process symlinks: symlinks are excluded from organization and reported as skipped items
+        for symlink_path in symlinks {
+            conflicts_count += 1;
+            scan_warnings.push(format!(
+                "Symlink skipped: '{}' is excluded from organization to prevent target redirection",
+                symlink_path.display()
+            ));
+            planned_ops.push(PlannedFileOp {
+                source_path: symlink_path.clone(),
+                destination_path: symlink_path.clone(),
+                category: "Symlink".to_string(),
+                reason: "Symbolic link excluded from organization".to_string(),
+                file_size: 0,
+                file_hash: None,
+                is_duplicate: false,
+                duplicate_of: None,
+                conflict: Some(
+                    "Skipped: Symbolic links are excluded from organization to prevent target redirection"
+                        .to_string(),
+                ),
+            });
+        }
+
+        // Process eligible regular files
+        for source_path in &eligible_files {
+            let metadata = match fs::symlink_metadata(source_path) {
                 Ok(m) => m,
                 Err(e) => {
                     conflicts_count += 1;
@@ -182,59 +258,25 @@ impl FileOrganizer {
                 }
             };
 
-            // Symlink containment check
-            if metadata.file_type().is_symlink() {
-                let target = match fs::read_link(&source_path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        conflicts_count += 1;
-                        planned_ops.push(PlannedFileOp {
-                            source_path: source_path.clone(),
-                            destination_path: source_path.clone(),
-                            category: "Symlink".to_string(),
-                            reason: "Broken symbolic link".to_string(),
-                            file_size: 0,
-                            file_hash: None,
-                            is_duplicate: false,
-                            duplicate_of: None,
-                            conflict: Some(format!("Broken link: {}", e)),
-                        });
-                        continue;
-                    }
-                };
-
-                let resolved = if target.is_absolute() {
-                    target
-                } else {
-                    source_path
-                        .parent()
-                        .unwrap_or(&canonical_root)
-                        .join(&target)
-                };
-
-                if let Ok(canon_target) = fs::canonicalize(&resolved) {
-                    if !canon_target.starts_with(&canonical_root) {
-                        conflicts_count += 1;
-                        planned_ops.push(PlannedFileOp {
-                            source_path: source_path.clone(),
-                            destination_path: source_path.clone(),
-                            category: "Symlink".to_string(),
-                            reason: "Symlink escapes target directory".to_string(),
-                            file_size: 0,
-                            file_hash: None,
-                            is_duplicate: false,
-                            duplicate_of: None,
-                            conflict: Some(
-                                "Security: Symlink target escapes directory boundary".to_string(),
-                            ),
-                        });
-                        continue;
-                    }
-                }
-            }
-
             let file_size = metadata.len();
-            let file_hash = Self::compute_sha256(&source_path).ok();
+            let file_hash = match Self::compute_sha256(source_path) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    conflicts_count += 1;
+                    planned_ops.push(PlannedFileOp {
+                        source_path: source_path.clone(),
+                        destination_path: source_path.clone(),
+                        category: "Error".to_string(),
+                        reason: "Failed to compute file content hash".to_string(),
+                        file_size,
+                        file_hash: None,
+                        is_duplicate: false,
+                        duplicate_of: None,
+                        conflict: Some(format!("Integrity check failure: {}", e)),
+                    });
+                    continue;
+                }
+            };
 
             let mut is_duplicate = false;
             let mut duplicate_of = None;
@@ -268,13 +310,14 @@ impl FileOrganizer {
             let target_subfolder = canonical_root.join(&category);
             let proposed_dest = target_subfolder.join(file_name);
 
-            let mut conflict = None;
             // Prevent self-moves if file is already in correct category folder
-            if proposed_dest == source_path {
+            if proposed_dest == *source_path {
+                unmodified_count += 1;
                 continue;
             }
 
-            if proposed_dest.exists() {
+            let mut conflict = None;
+            if proposed_dest.exists() || fs::symlink_metadata(&proposed_dest).is_ok() {
                 conflict = Some(format!(
                     "Destination already exists: '{}'",
                     proposed_dest.display()
@@ -295,7 +338,7 @@ impl FileOrganizer {
             };
 
             planned_ops.push(PlannedFileOp {
-                source_path,
+                source_path: source_path.clone(),
                 destination_path: proposed_dest,
                 category,
                 reason,
@@ -308,43 +351,81 @@ impl FileOrganizer {
         }
 
         let plan_id = format!("org_plan_{}", uuid::Uuid::new_v4());
+        let planned_count = planned_ops.iter().filter(|o| o.conflict.is_none()).count();
         Ok(OrganizationPlan {
             plan_id,
             target_directory: canonical_root,
-            total_scanned: planned_ops.len(),
+            total_scanned,
+            eligible_files: eligible_files.len(),
+            unmodified_count,
+            planned_count,
             duplicates_count,
             conflicts_count,
             operations: planned_ops,
+            scan_warnings,
         })
     }
 
-    /// Helper to recursively or flatly collect eligible regular files.
+    /// Helper to recursively or flatly collect eligible regular files and symlinks with error capture.
     fn collect_files(
         dir: &Path,
         rule: &OrganizationRule,
-        out: &mut Vec<PathBuf>,
+        eligible_files: &mut Vec<PathBuf>,
+        symlinks: &mut Vec<PathBuf>,
+        warnings: &mut Vec<String>,
+        total_scanned: &mut usize,
     ) -> Result<(), String> {
-        let read_dir =
-            fs::read_dir(dir).map_err(|e| format!("Failed to read '{}': {}", dir.display(), e))?;
+        let read_dir = match fs::read_dir(dir) {
+            Ok(d) => d,
+            Err(e) => {
+                warnings.push(format!("Failed to read directory '{}': {}", dir.display(), e));
+                return Ok(());
+            }
+        };
 
-        for entry in read_dir.flatten() {
+        for entry_res in read_dir {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(e) => {
+                    warnings.push(format!("Failed to read entry in '{}': {}", dir.display(), e));
+                    continue;
+                }
+            };
+
+            *total_scanned += 1;
             let path = entry.path();
-            if let Ok(file_type) = entry.file_type() {
-                if file_type.is_dir() {
-                    // Skip hidden dirs (e.g. .git, .kyro)
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with('.') {
-                            continue;
-                        }
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.push(format!("Failed to read metadata for '{}': {}", path.display(), e));
+                    continue;
+                }
+            };
+
+            if metadata.file_type().is_symlink() {
+                // Symlink: exclude from organization, do not recurse or follow
+                symlinks.push(path);
+            } else if metadata.is_dir() {
+                // Skip hidden dirs (e.g. .git, .kyro)
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') {
+                        continue;
                     }
-                    if rule.recursive {
-                        let _ = Self::collect_files(&path, rule, out);
-                    }
-                } else if file_type.is_file() || file_type.is_symlink() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !name.starts_with('.') {
-                            out.push(path);
-                        }
+                }
+                if rule.recursive {
+                    let _ = Self::collect_files(
+                        &path,
+                        rule,
+                        eligible_files,
+                        symlinks,
+                        warnings,
+                        total_scanned,
+                    );
+                }
+            } else if metadata.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !name.starts_with('.') {
+                        eligible_files.push(path);
                     }
                 }
             }
@@ -352,13 +433,13 @@ impl FileOrganizer {
         Ok(())
     }
 
-    /// Executes an inspected organization plan, enforcing path containment and recording a transaction manifest.
+    /// Executes an inspected organization plan, enforcing path containment, source freshness,
+    /// no-overwrite semantics, and recording a transaction manifest.
     pub fn execute(plan: &OrganizationPlan) -> Result<OrganizationTransaction, String> {
         let canonical_root = fs::canonicalize(&plan.target_directory)
             .map_err(|e| format!("Failed to canonicalize target directory: {}", e))?;
 
         let mut op_records = Vec::new();
-        let mut has_partial_failure = false;
 
         for op in &plan.operations {
             // Skip operations with pre-existing conflicts
@@ -368,13 +449,57 @@ impl FileOrganizer {
                     destination_path: op.destination_path.to_string_lossy().to_string(),
                     file_hash: op.file_hash.clone().unwrap_or_default(),
                     file_size: op.file_size,
-                    status: "failed".to_string(),
+                    status: "skipped".to_string(),
                     error: Some(format!(
                         "Skipped due to pre-existing conflict: {}",
                         conflict_msg
                     )),
                 });
-                has_partial_failure = true;
+
+                continue;
+            }
+
+            // Inspect source without following symlinks
+            let src_meta = match fs::symlink_metadata(&op.source_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    op_records.push(OrganizationOpRecord {
+                        source_path: op.source_path.to_string_lossy().to_string(),
+                        destination_path: op.destination_path.to_string_lossy().to_string(),
+                        file_hash: op.file_hash.clone().unwrap_or_default(),
+                        file_size: op.file_size,
+                        status: "failed".to_string(),
+                        error: Some(format!("Source path cannot be accessed: {}", e)),
+                    });
+
+                    continue;
+                }
+            };
+
+            // Reject source if it is a symlink or not a regular file
+            if src_meta.file_type().is_symlink() {
+                op_records.push(OrganizationOpRecord {
+                    source_path: op.source_path.to_string_lossy().to_string(),
+                    destination_path: op.destination_path.to_string_lossy().to_string(),
+                    file_hash: op.file_hash.clone().unwrap_or_default(),
+                    file_size: op.file_size,
+                    status: "failed".to_string(),
+                    error: Some("Security rejection: source path is a symbolic link".to_string()),
+                });
+
+                continue;
+            }
+
+            if !src_meta.is_file() {
+                op_records.push(OrganizationOpRecord {
+                    source_path: op.source_path.to_string_lossy().to_string(),
+                    destination_path: op.destination_path.to_string_lossy().to_string(),
+                    file_hash: op.file_hash.clone().unwrap_or_default(),
+                    file_size: op.file_size,
+                    status: "failed".to_string(),
+                    error: Some("Security rejection: source path is not a regular file".to_string()),
+                });
+
                 continue;
             }
 
@@ -390,7 +515,7 @@ impl FileOrganizer {
                         status: "failed".to_string(),
                         error: Some(format!("Source path cannot be canonicalized: {}", e)),
                     });
-                    has_partial_failure = true;
+
                     continue;
                 }
             };
@@ -404,7 +529,7 @@ impl FileOrganizer {
                     status: "failed".to_string(),
                     error: Some("Security rejection: source path escapes target root".to_string()),
                 });
-                has_partial_failure = true;
+
                 continue;
             }
 
@@ -419,7 +544,6 @@ impl FileOrganizer {
                         status: "failed".to_string(),
                         error: Some(format!("Failed to create destination folder: {}", e)),
                     });
-                    has_partial_failure = true;
                     continue;
                 }
                 match fs::canonicalize(dest_dir) {
@@ -436,7 +560,6 @@ impl FileOrganizer {
                                         .to_string(),
                                 ),
                             });
-                            has_partial_failure = true;
                             continue;
                         }
                     }
@@ -452,9 +575,41 @@ impl FileOrganizer {
                                 e
                             )),
                         });
-                        has_partial_failure = true;
                         continue;
                     }
+                }
+            }
+
+            // Verify source freshness & content integrity against previewed hash
+            let computed_current_hash = match Self::compute_sha256(&op.source_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    op_records.push(OrganizationOpRecord {
+                        source_path: op.source_path.to_string_lossy().to_string(),
+                        destination_path: op.destination_path.to_string_lossy().to_string(),
+                        file_hash: op.file_hash.clone().unwrap_or_default(),
+                        file_size: op.file_size,
+                        status: "failed".to_string(),
+                        error: Some(format!("Failed to recompute source file checksum: {}", e)),
+                    });
+                    continue;
+                }
+            };
+
+            if let Some(ref expected_hash) = op.file_hash {
+                if !expected_hash.is_empty() && &computed_current_hash != expected_hash {
+                    op_records.push(OrganizationOpRecord {
+                        source_path: op.source_path.to_string_lossy().to_string(),
+                        destination_path: op.destination_path.to_string_lossy().to_string(),
+                        file_hash: op.file_hash.clone().unwrap_or_default(),
+                        file_size: op.file_size,
+                        status: "stale".to_string(),
+                        error: Some(format!(
+                            "Source file modified since preview (expected hash {}, found {})",
+                            expected_hash, computed_current_hash
+                        )),
+                    });
+                    continue;
                 }
             }
 
@@ -470,12 +625,12 @@ impl FileOrganizer {
                         "Destination file already exists (preventing overwrite)".to_string(),
                     ),
                 });
-                has_partial_failure = true;
+
                 continue;
             }
 
-            // Perform atomic or cross-filesystem move using canonical source
-            match fs::rename(&canon_source, &op.destination_path) {
+            // Perform move using the verified source path (not canonicalized target of a link)
+            match fs::rename(&op.source_path, &op.destination_path) {
                 Ok(_) => {
                     op_records.push(OrganizationOpRecord {
                         source_path: op.source_path.to_string_lossy().to_string(),
@@ -488,22 +643,18 @@ impl FileOrganizer {
                 }
                 Err(e) => {
                     // Attempt copy + remove fallback for cross-filesystem moves
-                    match fs::copy(&canon_source, &op.destination_path) {
+                    match fs::copy(&op.source_path, &op.destination_path) {
                         Ok(_) => {
                             // Verify destination contents after copy
                             let mut copy_verified = true;
-                            if let Some(ref expected_hash) = op.file_hash {
-                                if !expected_hash.is_empty() {
-                                    match Self::compute_sha256(&op.destination_path) {
-                                        Ok(dest_hash) => {
-                                            if &dest_hash != expected_hash {
-                                                copy_verified = false;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            copy_verified = false;
-                                        }
+                            match Self::compute_sha256(&op.destination_path) {
+                                Ok(dest_hash) => {
+                                    if dest_hash != computed_current_hash {
+                                        copy_verified = false;
                                     }
+                                }
+                                Err(_) => {
+                                    copy_verified = false;
                                 }
                             }
 
@@ -523,9 +674,9 @@ impl FileOrganizer {
                                             .to_string(),
                                     ),
                                 });
-                                has_partial_failure = true;
+            
                             } else {
-                                match fs::remove_file(&canon_source) {
+                                match fs::remove_file(&op.source_path) {
                                     Ok(_) => {
                                         op_records.push(OrganizationOpRecord {
                                             source_path: op
@@ -554,7 +705,7 @@ impl FileOrganizer {
                                                 rem_err
                                             )),
                                         });
-                                        has_partial_failure = true;
+                    
                                     }
                                 }
                             }
@@ -571,17 +722,18 @@ impl FileOrganizer {
                                     e, copy_err
                                 )),
                             });
-                            has_partial_failure = true;
+        
                         }
                     }
                 }
             }
         }
 
-        let status = if has_partial_failure {
-            "partially_failed".to_string()
-        } else {
+        let all_completed = !op_records.is_empty() && op_records.iter().all(|o| o.status == "completed");
+        let status = if all_completed {
             "completed".to_string()
+        } else {
+            "partially_failed".to_string()
         };
 
         Ok(OrganizationTransaction {
@@ -614,9 +766,22 @@ impl FileOrganizer {
             let dest_path = PathBuf::from(&op.destination_path);
             let orig_path = PathBuf::from(&op.source_path);
 
-            if !dest_path.exists() {
+            // Verify destination exists and is not a symlink
+            let dest_meta = match fs::symlink_metadata(&dest_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    op.error = Some(format!(
+                        "Cannot undo: file no longer exists or cannot be read at destination '{}': {}",
+                        dest_path.display(),
+                        e
+                    ));
+                    continue;
+                }
+            };
+
+            if dest_meta.file_type().is_symlink() {
                 op.error = Some(format!(
-                    "Cannot undo: file no longer exists at destination '{}'",
+                    "Cannot undo: destination file at '{}' has been replaced by a symbolic link",
                     dest_path.display()
                 ));
                 continue;
@@ -735,20 +900,231 @@ impl FileOrganizer {
             }
         }
 
-        let all_undone = transaction
+        let completed_ops = transaction
             .operations
             .iter()
             .filter(|o| o.status == "completed" || o.status == "undone")
-            .all(|o| o.status == "undone");
+            .count();
 
-        transaction.status = if all_undone && reversed_count > 0 {
+        let all_undone = completed_ops > 0
+            && transaction
+                .operations
+                .iter()
+                .filter(|o| o.status == "completed" || o.status == "undone")
+                .all(|o| o.status == "undone");
+
+        transaction.status = if all_undone {
             "undone".to_string()
         } else if reversed_count > 0 {
             "partially_undone".to_string()
         } else {
             "undo_failed".to_string()
         };
+
         Ok(reversed_count)
+    }
+
+    /// Shared orchestration for generating a preview plan with authorized folder validation
+    /// and server-authoritative persistence.
+    pub fn preview_authorized(
+        db: &Database,
+        target_dir_str: &str,
+        rule_opt: Option<OrganizationRule>,
+    ) -> Result<OrganizationPlan, String> {
+        let folders = db.list_authorized_folders().unwrap_or_default();
+        if folders.is_empty() {
+            return Err("Access denied: No authorized folders configured. Please authorize folders in Settings first.".to_string());
+        }
+
+        let trimmed = target_dir_str.trim();
+        if trimmed.is_empty() {
+            return Err("Access denied: Directory path cannot be empty.".to_string());
+        }
+
+        let raw_path = PathBuf::from(trimmed);
+        let expanded = Self::expand_tilde(&raw_path);
+        let canonical_target = check_path_authorized_in_folders(&expanded, &folders)
+            .map_err(|e| format!("Access denied for preview directory: {}", e))?;
+
+        let plan = Self::preview(&canonical_target, rule_opt)?;
+        db.save_organization_plan(&plan)
+            .map_err(|e| format!("Failed to record organization plan in database: {}", e))?;
+
+        Ok(plan)
+    }
+
+    /// Shared orchestration for executing a plan with server-authoritative anti-tampering verification,
+    /// source freshness checking, authorized folder containment, and database persistence.
+    pub fn execute_authorized(
+        db: &Database,
+        plan: &OrganizationPlan,
+    ) -> Result<OrganizationTransaction, String> {
+        let folders = db.list_authorized_folders().unwrap_or_default();
+        if folders.is_empty() {
+            return Err("Access denied: No authorized folders configured.".to_string());
+        }
+
+        // Server-authoritative plan verification
+        let (stored_plan, executed_at) = db
+            .get_organization_plan(&plan.plan_id)
+            .map_err(|e| format!("Failed to retrieve stored plan: {}", e))?
+            .ok_or_else(|| {
+                "Plan not found or expired. Please generate a fresh preview before executing."
+                    .to_string()
+            })?;
+
+        if executed_at.is_some() {
+            return Err(
+                "Plan has already been executed. Repeated execution of the same plan is prohibited."
+                    .to_string(),
+            );
+        }
+
+        // Verify submitted plan matches stored plan exactly
+        if stored_plan.target_directory != plan.target_directory
+            || stored_plan.operations.len() != plan.operations.len()
+        {
+            return Err(
+                "Security rejection: Plan tampering detected. The submitted plan does not match the reviewed plan."
+                    .to_string(),
+            );
+        }
+
+        for (stored_op, submitted_op) in stored_plan.operations.iter().zip(&plan.operations) {
+            if stored_op.source_path != submitted_op.source_path
+                || stored_op.destination_path != submitted_op.destination_path
+                || stored_op.file_hash != submitted_op.file_hash
+                || stored_op.category != submitted_op.category
+                || stored_op.is_duplicate != submitted_op.is_duplicate
+                || stored_op.conflict != submitted_op.conflict
+            {
+                return Err(
+                    "Security rejection: Plan tampering detected on operation details."
+                        .to_string(),
+                );
+            }
+        }
+
+        // Verify target directory is still authorized
+        let canonical_target = check_path_authorized_in_folders(&stored_plan.target_directory, &folders)
+            .map_err(|e| format!("Access denied for target directory: {}", e))?;
+
+        // Recheck authorization and containment immediately before execution
+        for action in &stored_plan.operations {
+            if action.conflict.is_some() {
+                // Conflicted or skipped operations will not be executed or moved
+                continue;
+            }
+
+            let canon_src = check_path_authorized_in_folders(&action.source_path, &folders)
+                .map_err(|e| {
+                    format!(
+                        "Access denied for organization source '{}': {}",
+                        action.source_path.display(),
+                        e
+                    )
+                })?;
+            if !canon_src.starts_with(&canonical_target) {
+                return Err(format!(
+                    "Security rejection: source path '{}' escapes organization root",
+                    action.source_path.display()
+                ));
+            }
+
+            let canon_dest = check_path_authorized_in_folders(&action.destination_path, &folders)
+                .map_err(|e| {
+                    format!(
+                        "Access denied for organization destination '{}': {}",
+                        action.destination_path.display(),
+                        e
+                    )
+                })?;
+            if !canon_dest.starts_with(&canonical_target) {
+                return Err(format!(
+                    "Security rejection: destination path '{}' escapes organization root",
+                    action.destination_path.display()
+                ));
+            }
+        }
+
+        // Execute using authoritative stored plan
+        let trx = Self::execute(&stored_plan)?;
+
+        // Persist transaction to SQLite
+        db.record_file_transaction(&trx)
+            .map_err(|e| format!("Failed to record file transaction in database: {}", e))?;
+
+        // Mark plan executed to prevent reuse
+        let _ = db.mark_organization_plan_executed(&stored_plan.plan_id);
+
+        Ok(trx)
+    }
+
+    /// Shared orchestration for reversing a transaction with server-authoritative record loading,
+    /// authorized folder validation, and persistent status update.
+    pub fn undo_authorized(
+        db: &Database,
+        transaction_id: &str,
+    ) -> Result<OrganizationTransaction, String> {
+        let folders = db.list_authorized_folders().unwrap_or_default();
+        if folders.is_empty() {
+            return Err("Access denied: No authorized folders configured.".to_string());
+        }
+
+        let mut stored_trx = db
+            .get_file_transaction(transaction_id)
+            .map_err(|e| format!("Database error retrieving transaction: {}", e))?
+            .ok_or_else(|| format!("Transaction '{}' not found in database.", transaction_id))?;
+
+        if stored_trx.status == "undone" {
+            return Err("Transaction has already been undone.".to_string());
+        }
+
+        let target = Path::new(&stored_trx.target_directory);
+        let canonical_target = check_path_authorized_in_folders(target, &folders)
+            .map_err(|e| format!("Access denied for rollback directory: {}", e))?;
+        stored_trx.target_directory = canonical_target.to_string_lossy().to_string();
+
+        for op in &stored_trx.operations {
+            if op.status != "completed" {
+                continue;
+            }
+            let src = Path::new(&op.source_path);
+            let canon_src = check_path_authorized_in_folders(src, &folders).map_err(|e| {
+                format!(
+                    "Access denied for rollback source '{}': {}",
+                    op.source_path, e
+                )
+            })?;
+            if !canon_src.starts_with(&canonical_target) {
+                return Err(format!(
+                    "Security rejection: rollback source '{}' escapes target root",
+                    op.source_path
+                ));
+            }
+
+            let dest = Path::new(&op.destination_path);
+            let canon_dest = check_path_authorized_in_folders(dest, &folders).map_err(|e| {
+                format!(
+                    "Access denied for rollback destination '{}': {}",
+                    op.destination_path, e
+                )
+            })?;
+            if !canon_dest.starts_with(&canonical_target) {
+                return Err(format!(
+                    "Security rejection: rollback destination '{}' escapes target root",
+                    op.destination_path
+                ));
+            }
+        }
+
+        let _undone_count = Self::undo(&mut stored_trx)?;
+
+        // Persist updated transaction state to SQLite
+        db.record_file_transaction(&stored_trx)
+            .map_err(|e| format!("Failed to update transaction in database: {}", e))?;
+
+        Ok(stored_trx)
     }
 }
 
