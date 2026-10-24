@@ -312,9 +312,9 @@ Use the element references and names to drive the other browser tools.".to_strin
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "transaction": { "type": "object", "description": "The transaction object returned by organize_files_execute" }
-                },
-                "required": ["transaction"]
+                    "transaction_id": { "type": "string", "description": "The transaction ID returned by organize_files_execute" },
+                    "transaction": { "type": "object", "description": "The transaction object returned by organize_files_execute (optional if transaction_id provided)" }
+                }
             }),
         },
         ToolDefinition {
@@ -1034,41 +1034,55 @@ pub async fn browser_close(
 }
 
 /// Handles the `organize_files_preview` tool.
-pub async fn organize_files_preview(args: &serde_json::Value) -> ToolOutcome {
+pub async fn organize_files_preview(
+    args: &serde_json::Value,
+    db: &crate::storage::db::Database,
+) -> ToolOutcome {
     let dir = args["directory"].as_str().unwrap_or_default();
     let recursive = args["recursive"].as_bool().unwrap_or(false);
     let rule = crate::storage::organizer::OrganizationRule {
         recursive,
         ..Default::default()
     };
-    match crate::storage::organizer::FileOrganizer::preview(Path::new(dir), Some(rule)) {
+    match crate::storage::organizer::FileOrganizer::preview_authorized(db, dir, Some(rule)) {
         Ok(plan) => ToolOutcome::ok(serde_json::to_string_pretty(&plan).unwrap_or_default()),
         Err(e) => ToolOutcome::fail(e),
     }
 }
 
 /// Handles the `organize_files_execute` tool.
-pub async fn organize_files_execute(args: &serde_json::Value) -> ToolOutcome {
+pub async fn organize_files_execute(
+    args: &serde_json::Value,
+    db: &crate::storage::db::Database,
+) -> ToolOutcome {
     let plan: crate::storage::organizer::OrganizationPlan =
         match serde_json::from_value(args["plan"].clone()) {
             Ok(p) => p,
             Err(e) => return ToolOutcome::fail(format!("Invalid plan argument: {}", e)),
         };
-    match crate::storage::organizer::FileOrganizer::execute(&plan) {
+    match crate::storage::organizer::FileOrganizer::execute_authorized(db, &plan) {
         Ok(trx) => ToolOutcome::ok(serde_json::to_string_pretty(&trx).unwrap_or_default()),
         Err(e) => ToolOutcome::fail(e),
     }
 }
 
 /// Handles the `organize_files_undo` tool.
-pub async fn organize_files_undo(args: &serde_json::Value) -> ToolOutcome {
-    let mut trx: crate::storage::organizer::OrganizationTransaction =
-        match serde_json::from_value(args["transaction"].clone()) {
-            Ok(t) => t,
-            Err(e) => return ToolOutcome::fail(format!("Invalid transaction argument: {}", e)),
-        };
-    match crate::storage::organizer::FileOrganizer::undo(&mut trx) {
-        Ok(count) => ToolOutcome::ok(format!("Successfully reversed {} file operations.", count)),
+pub async fn organize_files_undo(
+    args: &serde_json::Value,
+    db: &crate::storage::db::Database,
+) -> ToolOutcome {
+    let trx_id = if let Some(id) = args["transaction_id"].as_str() {
+        id.to_string()
+    } else if let Some(id) = args["transaction"]["transaction_id"].as_str() {
+        id.to_string()
+    } else {
+        return ToolOutcome::fail("Missing 'transaction_id' or 'transaction' in arguments.".to_string());
+    };
+    match crate::storage::organizer::FileOrganizer::undo_authorized(db, &trx_id) {
+        Ok(trx) => {
+            let count = trx.operations.iter().filter(|o| o.status == "undone").count();
+            ToolOutcome::ok(format!("Successfully reversed {} file operations.", count))
+        }
         Err(e) => ToolOutcome::fail(e),
     }
 }
@@ -1139,6 +1153,12 @@ pub fn evaluate_tool(
                 .to_string(),
             risk: crate::execution::permissions::RiskLevel::Moderate,
             summary: "Move categorized files into organized folders".to_string(),
+        }),
+        "organize_files_undo" => Some(AuthDecision::RequireApproval {
+            reason: "Undoing file organization moves files back to their previous locations."
+                .to_string(),
+            risk: crate::execution::permissions::RiskLevel::Moderate,
+            summary: "Reverse organized file moves".to_string(),
         }),
         "rollback_code_checkpoint" => Some(AuthDecision::RequireApproval {
             reason: "Rolling back a code checkpoint restores previous file states.".to_string(),
