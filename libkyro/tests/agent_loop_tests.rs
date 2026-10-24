@@ -2070,12 +2070,11 @@ async fn test_agent_loop_audit_ui_tool_validation() {
     // Spawn background task to deny dev server start approval if requested
     let db_clone = db.clone();
     tokio::spawn(async move {
-        for _ in 0..50 {
+        for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             if let Ok(pending) = db_clone.list_pending_approvals() {
-                if let Some(req) = pending.first() {
+                for req in pending {
                     let _ = db_clone.resolve_approval_request(&req.id, "denied", "tester");
-                    break;
                 }
             }
         }

@@ -56,6 +56,26 @@ export function parseArgsSafe(raw: string): string[] {
   });
 }
 
+export function formatAuthType(authType: string): string {
+  switch (authType) {
+    case "oauth_browser":
+      return "Browser OAuth 2.0";
+    case "pat_or_oauth":
+      return "OAuth or Personal Token";
+    case "pat_token":
+      return "Personal Access Token";
+    case "api_key":
+      return "API Key";
+    case "bearer_token":
+    case "token":
+      return "Bearer Token";
+    case "none":
+      return "No Auth Required";
+    default:
+      return authType.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+}
+
 export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
   isOpen,
   onClose,
@@ -143,7 +163,11 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
   const handleOpenConnect = (item: ConnectorCatalogItem) => {
     setConnectingItem(item);
-    setAuthMethod(item.auth_type === "pat_or_oauth" ? "oauth" : "pat");
+    if (item.auth_type === "oauth_browser" || item.auth_type === "pat_or_oauth") {
+      setAuthMethod("oauth");
+    } else {
+      setAuthMethod("pat");
+    }
     setTokenInput("");
     setAccountIdentifierInput("");
     setDisplayNameInput(`${item.name} Account`);
@@ -151,6 +175,8 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
     setAllowPrivateNetwork(false);
     setOauthSession(null);
     setOauthPolling(false);
+    setOauthClientId("");
+    setOauthClientSecret("");
   };
 
   const handleStartOAuth = async () => {
@@ -223,8 +249,9 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
             setOauthSession(null);
             setConnectingItem(null);
             setIsSubmittingConnect(false);
+            const identity = summary.display_name || summary.account_identifier;
             showMessage(
-              `Successfully connected GitHub account: @${summary.account_identifier}!`,
+              `Successfully connected account: ${identity}!`,
               "success"
             );
             await loadAllData();
@@ -624,7 +651,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                               )}
                             </div>
                             <div className="text-[11px] text-neutral-400">
-                              Auth: <span className="font-mono text-neutral-300">{item.auth_type}</span>
+                              Auth: <span className="font-medium text-neutral-300">{formatAuthType(item.auth_type)}</span>
                             </div>
                           </div>
                         </div>
@@ -1054,7 +1081,12 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
         {/* CONNECT MODAL DIALOG */}
         {connectingItem && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4">
+          <div
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="kyro-connect-title"
+          >
             <div className="w-full max-w-md bg-[#121212] border border-[#262626] rounded-2xl shadow-2xl p-6 space-y-4">
               <div className="flex items-center justify-between border-b border-[#262626] pb-3">
                 <div className="flex items-center gap-2.5">
@@ -1062,23 +1094,29 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                     <ServiceIcon id={connectingItem.id} name={connectingItem.name} className="w-4 h-4" />
                   </div>
                   <div>
-                    <h3 className="text-sm font-bold text-neutral-100">Connect {connectingItem.name}</h3>
-                    <p className="text-[11px] text-neutral-400">Authenticating via {connectingItem.auth_type}</p>
+                    <h3 id="kyro-connect-title" className="text-sm font-bold text-neutral-100">
+                      Connect {connectingItem.name}
+                    </h3>
+                    <p className="text-[11px] text-neutral-400">
+                      Authenticating via {formatAuthType(connectingItem.auth_type)}
+                    </p>
                   </div>
                 </div>
                 <button
+                  type="button"
                   onClick={() => {
                     handleCancelOAuth();
                     setConnectingItem(null);
                   }}
-                  className="text-neutral-400 hover:text-white"
+                  className="text-neutral-400 hover:text-white transition p-1"
+                  aria-label="Close connect dialog"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
-              {/* GitHub Auth Mode Switcher */}
-              {connectingItem.id === "github" && !oauthPolling && (
+              {/* Strategy Switcher for dual-mode connectors (e.g. GitHub) */}
+              {connectingItem.auth_type === "pat_or_oauth" && !oauthPolling && (
                 <div className="flex rounded-lg bg-[#0a0a0a] p-1 border border-[#262626]">
                   <button
                     type="button"
@@ -1117,7 +1155,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                       Complete authorization in your browser window. Kyro's local loopback server is securely awaiting the callback.
                     </p>
                   </div>
-                  <div className="p-2 bg-[#0a0a0a] border border-[#262626] rounded text-[11px] font-mono text-neutral-400 break-all">
+                  <div className="p-2 bg-[#0a0a0a] border border-[#262626] rounded text-[11px] font-mono text-neutral-400 break-all select-text">
                     Callback: {oauthSession.redirectUri}
                   </div>
                   <div className="flex items-center justify-center gap-3 pt-2">
@@ -1132,52 +1170,104 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                     <button
                       type="button"
                       onClick={handleCancelOAuth}
-                      className="px-3 py-1.5 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg text-xs font-medium"
+                      className="px-3 py-1.5 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg text-xs font-medium transition"
                     >
                       Cancel
                     </button>
                   </div>
                 </div>
-              ) : connectingItem.id === "github" && authMethod === "oauth" ? (
+              ) : authMethod === "oauth" ? (
+                /* OAuth Configuration Forms */
                 <div className="space-y-4">
-                  <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed">
-                    <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
-                      <Shield className="w-4 h-4 text-neutral-300" /> Secure Browser PKCE Flow
-                    </div>
-                    Sign in with your GitHub account directly in your system browser. This flow requires credentials for a registered GitHub OAuth App; your GitHub password is never entered into Kyro.
-                  </div>
+                  {connectingItem.id === "google" || connectingItem.id.startsWith("google") ? (
+                    <>
+                      <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed">
+                        <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
+                          <Shield className="w-4 h-4 text-neutral-300" /> Google Workspace OAuth 2.0 PKCE
+                        </div>
+                        Sign in with your Google account directly in your system browser. Kyro uses loopback authorization with PKCE to securely access Gmail and Google Calendar with explicit approval requirements. Your Google password is never seen by Kyro.
+                      </div>
 
-                  <div>
-                    <label className="block text-xs text-neutral-300 mb-1 font-medium">
-                      OAuth Client ID (required unless preconfigured)
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Ov23li... (GitHub OAuth App Client ID)"
-                      value={oauthClientId}
-                      onChange={(e) => setOauthClientId(e.target.value)}
-                      className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
-                    />
-                    <p className="text-[11px] text-neutral-500 mt-1">
-                      Kyro needs a registered GitHub OAuth App Client ID. Enter your app's public ID here, or configure KYRO_GITHUB_CLIENT_ID in the process environment. To connect without an OAuth app, choose Personal Access Token.
-                    </p>
-                  </div>
+                      <div>
+                        <label className="block text-xs text-neutral-300 mb-1 font-medium">
+                          OAuth Client ID (optional if preconfigured in environment)
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="e.g. 123456789-xyz.apps.googleusercontent.com"
+                          value={oauthClientId}
+                          onChange={(e) => setOauthClientId(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
+                        />
+                        <p className="text-[11px] text-neutral-500 mt-1">
+                          Leave empty to use KYRO_GOOGLE_CLIENT_ID from environment or settings.
+                        </p>
+                      </div>
+                    </>
+                  ) : connectingItem.id === "github" ? (
+                    <>
+                      <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed">
+                        <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
+                          <Shield className="w-4 h-4 text-neutral-300" /> Secure Browser PKCE Flow
+                        </div>
+                        Sign in with your GitHub account directly in your system browser. This flow requires credentials for a registered GitHub OAuth App; your GitHub password is never entered into Kyro.
+                      </div>
 
-                  <div>
-                    <label className="block text-xs text-neutral-300 mb-1 font-medium">
-                      OAuth Client Secret (required unless preconfigured)
-                    </label>
-                    <input
-                      type="password"
-                      placeholder="GitHub OAuth App Client Secret"
-                      value={oauthClientSecret}
-                      onChange={(e) => setOauthClientSecret(e.target.value)}
-                      className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
-                    />
-                    <p className="text-[11px] text-neutral-500 mt-1">
-                      GitHub requires the OAuth App client secret to exchange the authorization code. Enter it here or configure KYRO_GITHUB_CLIENT_SECRET in Kyro's process environment. Kyro stores the completed account credentials in its secure Vault. To avoid configuring an OAuth App, choose Personal Access Token.
-                    </p>
-                  </div>
+                      <div>
+                        <label className="block text-xs text-neutral-300 mb-1 font-medium">
+                          OAuth Client ID (required unless preconfigured)
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="e.g. Ov23li... (GitHub OAuth App Client ID)"
+                          value={oauthClientId}
+                          onChange={(e) => setOauthClientId(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
+                        />
+                        <p className="text-[11px] text-neutral-500 mt-1">
+                          Kyro needs a registered GitHub OAuth App Client ID. Enter your app's public ID here, or configure KYRO_GITHUB_CLIENT_ID in the process environment. To connect without an OAuth app, choose Personal Access Token.
+                        </p>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-neutral-300 mb-1 font-medium">
+                          OAuth Client Secret (required unless preconfigured)
+                        </label>
+                        <input
+                          type="password"
+                          placeholder="GitHub OAuth App Client Secret"
+                          value={oauthClientSecret}
+                          onChange={(e) => setOauthClientSecret(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
+                        />
+                        <p className="text-[11px] text-neutral-500 mt-1">
+                          GitHub requires the OAuth App client secret to exchange the authorization code. Enter it here or configure KYRO_GITHUB_CLIENT_SECRET in Kyro's process environment. Kyro stores completed account credentials in its secure Vault.
+                        </p>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-300 leading-relaxed">
+                        <div className="font-semibold text-neutral-100 mb-1 flex items-center gap-1.5">
+                          <Shield className="w-4 h-4 text-neutral-300" /> {connectingItem.name} Browser Authorization
+                        </div>
+                        Sign in with your {connectingItem.name} account directly in your system browser using secure OAuth 2.0 PKCE.
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-neutral-300 mb-1 font-medium">
+                          OAuth Client ID (optional if preconfigured)
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="OAuth App Client ID"
+                          value={oauthClientId}
+                          onChange={(e) => setOauthClientId(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#262626] rounded-lg text-xs text-neutral-100 font-mono placeholder:text-neutral-600 focus:outline-none focus:border-neutral-400"
+                        />
+                      </div>
+                    </>
+                  )}
 
                   <div className="pt-2 flex justify-end gap-2">
                     <button
@@ -1199,7 +1289,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                         </>
                       ) : (
                         <>
-                          <ExternalLink className="w-3.5 h-3.5" /> Launch GitHub Sign-In
+                          <ExternalLink className="w-3.5 h-3.5" /> Launch {connectingItem.name} Sign-In
                         </>
                       )}
                     </button>
@@ -1226,7 +1316,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                       type="text"
                       value={accountIdentifierInput}
                       onChange={(e) => setAccountIdentifierInput(e.target.value)}
-                      placeholder="e.g. your GitHub username"
+                      placeholder={connectingItem.id === "github" ? "e.g. your GitHub username" : "e.g. username, email, or account ID"}
                       className="w-full px-3 py-2 bg-[#0a0c10] border border-[#262626] rounded-lg text-xs text-neutral-100 focus:outline-none focus:border-neutral-400"
                     />
                   </div>
@@ -1267,7 +1357,9 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                     <label className="block text-xs text-neutral-300 mb-1">
                       {connectingItem.id === "remote_mcp"
                         ? "Bearer Token (Optional)"
-                        : "Personal Access Token / API Key"}
+                        : connectingItem.auth_type === "api_key"
+                        ? "API Key"
+                        : "Personal Access Token"}
                     </label>
                     <input
                       type="password"

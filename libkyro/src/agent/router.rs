@@ -505,6 +505,12 @@ impl ModelRouter {
                 }
             }
 
+            let mut deltas_emitted_this_attempt = false;
+            let mut tracking_delta_sink = |delta: &str| {
+                deltas_emitted_this_attempt = true;
+                on_reasoning_delta(delta);
+            };
+
             match self
                 .complete_streamed_openai_compatible(
                     endpoint,
@@ -514,12 +520,23 @@ impl ModelRouter {
                     messages,
                     tools,
                     cancel_token,
-                    &mut on_reasoning_delta,
+                    &mut tracking_delta_sink,
                 )
                 .await
             {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
+                    // Do not duplicate partial reasoning after a retry.
+                    // Once user-visible deltas have been emitted, abort further retries
+                    // so partial reasoning is never replayed or duplicated.
+                    if deltas_emitted_this_attempt {
+                        log::warn!(
+                            "Streamed model request failed mid-stream after emitting visible tokens: {}. Halting retries to prevent reasoning duplication.",
+                            e
+                        );
+                        return Err(e);
+                    }
+
                     let is_retryable = e.contains("429")
                         || e.contains("503")
                         || e.contains("502")
@@ -840,8 +857,7 @@ impl ModelRouter {
 
             match next_chunk {
                 Some(Ok(bytes)) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    sse_buffer.push_chunk(&text);
+                    sse_buffer.push_bytes(&bytes);
                     while let Some(line) = sse_buffer.next_line() {
                         if accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))? {
                             done = true;
@@ -862,7 +878,12 @@ impl ModelRouter {
                 }
                 None => {
                     if let Some(line) = sse_buffer.flush_remaining() {
-                        let _ = accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))?;
+                        if accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))? {
+                            done = true;
+                        }
+                    }
+                    if !done && accumulator.finish_reason.is_none() {
+                        return Err("Network stream ended prematurely before model completed response".to_string());
                     }
                     break;
                 }
@@ -1163,17 +1184,68 @@ impl StreamAccumulator {
 #[derive(Default, Debug)]
 pub struct SseBuffer {
     buffer: String,
+    byte_buffer: Vec<u8>,
 }
 
 impl SseBuffer {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
+            byte_buffer: Vec::new(),
         }
     }
 
+    /// Push an already-decoded text chunk (backward-compatibility).
     pub fn push_chunk(&mut self, chunk_str: &str) {
         self.buffer.push_str(chunk_str);
+    }
+
+    /// Incrementally push raw bytes from transport stream, safely handling
+    /// multi-byte UTF-8 code points split across chunk boundaries without loss.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        self.byte_buffer.extend_from_slice(bytes);
+        self.drain_valid_utf8();
+    }
+
+    fn drain_valid_utf8(&mut self) {
+        let mut start = 0;
+        loop {
+            if start >= self.byte_buffer.len() {
+                self.byte_buffer.clear();
+                break;
+            }
+            match std::str::from_utf8(&self.byte_buffer[start..]) {
+                Ok(valid_str) => {
+                    self.buffer.push_str(valid_str);
+                    self.byte_buffer.clear();
+                    break;
+                }
+                Err(err) => {
+                    let valid_len = err.valid_up_to();
+                    if valid_len > 0 {
+                        let valid_str = std::str::from_utf8(&self.byte_buffer[start..start + valid_len])
+                            .expect("valid UTF-8 prefix verified by from_utf8");
+                        self.buffer.push_str(valid_str);
+                        start += valid_len;
+                    }
+
+                    match err.error_len() {
+                        Some(invalid_len) => {
+                            // Truly invalid byte sequence: emit replacement char and skip invalid bytes
+                            self.buffer.push(std::char::REPLACEMENT_CHARACTER);
+                            start += invalid_len;
+                        }
+                        None => {
+                            // Incomplete multi-byte sequence at buffer tail: retain for next chunk
+                            if start > 0 {
+                                self.byte_buffer.drain(..start);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn next_line(&mut self) -> Option<String> {
@@ -1187,6 +1259,12 @@ impl SseBuffer {
     }
 
     pub fn flush_remaining(&mut self) -> Option<String> {
+        if !self.byte_buffer.is_empty() {
+            let lossy = String::from_utf8_lossy(&self.byte_buffer);
+            self.buffer.push_str(&lossy);
+            self.byte_buffer.clear();
+        }
+
         if !self.buffer.trim().is_empty() {
             let remaining = std::mem::take(&mut self.buffer);
             Some(remaining.trim_end_matches('\r').to_string())
@@ -1420,5 +1498,172 @@ mod tests {
         // 3. Non-streaming doesn't have stream: true
         let non_streaming = build_chat_payload("openai/gpt-4o", "sys", &msg, &[], false);
         assert!(non_streaming.get("stream").is_none());
+    }
+
+    #[test]
+    fn test_sse_buffer_split_utf8_multibyte_characters() {
+        let mut buffer = SseBuffer::new();
+
+        // Rocket emoji 🚀 is 4 bytes: [0xF0, 0x9F, 0x9A, 0x80]
+        // Euro symbol € is 3 bytes: [0xE2, 0x82, 0xAC]
+        // Japanese text 'こんにちは' is 3 bytes per char
+        let payload = "data: {\"reasoning\": \"Planning: 🚀 launch €100 こんにちは\"}\n";
+        let bytes = payload.as_bytes();
+
+        // Split right through the middle of the 4-byte rocket emoji:
+        // Find position of 🚀 in bytes
+        let rocket_idx = payload.find('🚀').unwrap();
+        let split_pos_1 = rocket_idx + 2; // Split 2 bytes into the 4-byte sequence
+
+        let chunk1 = &bytes[..split_pos_1];
+        let chunk2 = &bytes[split_pos_1..];
+
+        buffer.push_bytes(chunk1);
+        // The line is not finished yet, and the incomplete UTF-8 bytes must not be corrupted
+        assert!(buffer.next_line().is_none());
+
+        buffer.push_bytes(chunk2);
+        let line = buffer.next_line().expect("full line decoded after second chunk");
+        assert_eq!(line, "data: {\"reasoning\": \"Planning: 🚀 launch €100 こんにちは\"}");
+        assert!(!line.contains('\u{FFFD}'), "Split UTF-8 sequence must never be corrupted with replacement characters");
+    }
+
+    #[tokio::test]
+    async fn test_complete_streamed_retry_does_not_duplicate_reasoning() {
+        use tokio::net::TcpListener;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conn_count_clone = connection_count.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let count = conn_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        // Read request headers until \r\n\r\n
+                        let mut buf = [0u8; 1024];
+                        let mut received = Vec::new();
+                        loop {
+                            let n = socket.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            received.extend_from_slice(&buf[..n]);
+                            if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        if count == 0 {
+                            // Emit HTTP response and first delta, then drop connection prematurely
+                            let sse_part = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                            let _ = socket.write_all(sse_part.as_bytes()).await;
+                            let line = "data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Initial partial reasoning... \"}}]}\n\n";
+                            let _ = socket.write_all(line.as_bytes()).await;
+                            let _ = socket.flush().await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            // Terminate stream abruptly without [DONE]
+                            let _ = socket.shutdown().await;
+                        } else {
+                            // If a buggy client retried after reasoning was emitted:
+                            let sse_part = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                            let _ = socket.write_all(sse_part.as_bytes()).await;
+                            let line = "data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Duplicated reasoning!\"}}]}\n\n";
+                            let _ = socket.write_all(line.as_bytes()).await;
+                            let line2 = "data: [DONE]\n\n";
+                            let _ = socket.write_all(line2.as_bytes()).await;
+                            let _ = socket.flush().await;
+                        }
+                    });
+                }
+            }
+        });
+
+        let router = ModelRouter::new();
+        let mut emitted_reasoning = Vec::new();
+
+        let endpoint = format!("http://{}", addr);
+        let res = router.complete_streamed(
+            "test-model",
+            "test-key",
+            Some(&endpoint),
+            "sys",
+            &[],
+            &[],
+            None,
+            |delta| {
+                emitted_reasoning.push(delta.to_string());
+            },
+        ).await;
+
+        // The stream emitted partial reasoning before failing abruptly.
+        // It must NOT retry, preserving the partial stream state without duplication.
+        assert!(res.is_err(), "Stream that failed mid-stream after emission must return Err");
+        assert_eq!(emitted_reasoning, vec!["Initial partial reasoning... "]);
+        assert_eq!(connection_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_complete_streamed_cancellation_during_reasoning() {
+        use tokio::net::TcpListener;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let mut received = Vec::new();
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buf[..n]);
+                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let sse_part = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n";
+                let _ = socket.write_all(sse_part.as_bytes()).await;
+                let line = "data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"First delta. \"}}]}\n\n";
+                let _ = socket.write_all(line.as_bytes()).await;
+                let _ = socket.flush().await;
+                // Wait indefinitely to simulate an active, long-running streaming response
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+
+        let router = ModelRouter::new();
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        let mut emitted = Vec::new();
+        let endpoint = format!("http://{}", addr);
+
+        let res = router.complete_streamed(
+            "test-model",
+            "test-key",
+            Some(&endpoint),
+            "sys",
+            &[],
+            &[],
+            Some(&cancel_token),
+            |delta| {
+                emitted.push(delta.to_string());
+                cancel_clone.cancel();
+            },
+        ).await;
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_lowercase().contains("cancel"), "Expected cancellation error, got: {}", err);
+        assert_eq!(emitted, vec!["First delta. "]);
     }
 }
