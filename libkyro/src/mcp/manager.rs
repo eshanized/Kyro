@@ -155,10 +155,16 @@ impl McpManager {
             }
         }
 
-        // Add unambiguous aliases to registry
+        // Add unambiguous aliases to registry — but never a name reserved by
+        // a platform built-in tool (Bug 13): built-in dispatch always wins
+        // the name, so such an alias would be authorised as connector policy
+        // while the built-in implementation executes. The tool remains
+        // reachable through its namespaced `mcp__{server}__{tool}` identity.
         let mut aliases = Vec::new();
         for entry in new_registry.values() {
-            if raw_name_counts.get(&entry.raw_name) == Some(&1) {
+            if raw_name_counts.get(&entry.raw_name) == Some(&1)
+                && !crate::agent::tools::is_reserved_builtin_tool_name(&entry.raw_name)
+            {
                 aliases.push((entry.raw_name.clone(), entry.clone()));
             }
         }

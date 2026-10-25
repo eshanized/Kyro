@@ -2,7 +2,9 @@ use super::cancellation::CancellationToken;
 use super::registry::{
     canonical_tool_name, AgentRegistry, ProfileSnapshot, ResolveError, RunConfigSnapshot,
 };
-use super::router::{ChatMessage, MessageContent, ModelRouter, ToolCall, ToolDefinition};
+use super::router::{
+    ChatMessage, MessageContent, ModelRouter, ToolCall, ToolDefinition, DEFAULT_VISION_MODEL,
+};
 use crate::agent::tools::{self, ToolOutcome};
 use crate::browser::BrowserAutomationManager;
 use crate::computer_use::{capture_screen, ComputerAction, InputController};
@@ -1007,11 +1009,32 @@ The program is started as an explicit executable plus argument vector; free-form
                             b64,
                         )
                     } else {
-                        // Text-only model: Run visual analyzer fallback and return structured summary
+                        // Text-only model: Run visual analyzer fallback and return structured summary.
+                        // (Bug 15) The fallback vision model may live on a
+                        // different provider than the run model, so its
+                        // endpoint and credential are resolved for the vision
+                        // model itself; an unavailable credential degrades to
+                        // the analyzer's honest "not analyzed" report.
+                        let fallback_vision_model = DEFAULT_VISION_MODEL.to_string();
+                        let vis_api_key = if let Ok(route) =
+                            ModelRouter::resolve_model_route(&fallback_vision_model)
+                        {
+                            let vault = crate::storage::Vault::new(db.clone());
+                            let vault_keys = vault.get_all_keys().unwrap_or_default();
+                            match ModelRouter::select_api_key_for_route(&route, &vault_keys) {
+                                Ok(k) => Some((k, route.base_url)),
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let (vis_api_key, vis_base_url) = vis_api_key
+                            .map(|(k, b)| (k, Some(b)))
+                            .unwrap_or((String::new(), base_url.map(|s| s.to_string())));
                         let analyzer = crate::agent::vision::VisualAnalyzer::new(
                             Arc::new(self.router.clone()),
-                            api_key.to_string(),
-                            base_url.map(|s| s.to_string()),
+                            vis_api_key,
+                            vis_base_url,
                         );
                         let vis_ctx = crate::agent::vision::VisualAnalysisContext {
                             route: "".to_string(),
@@ -1251,6 +1274,17 @@ The program is started as an explicit executable plus argument vector; free-form
             task_grant: persisted_task_grant,
         };
 
+        // Bug 9: every authorization branch must see one validated grant.
+        // Resolve the active grant through the single resolver (run binding,
+        // expiry, terminal-state revocation) immediately before any tool
+        // analysis or authorization, and evaluate with exactly that grant.
+        let active_grant =
+            crate::governance::AuthorizationEngine::resolve_active_task_grant(db, &ctx);
+        let ctx = ExecutionContext {
+            task_grant: active_grant.clone(),
+            ..ctx
+        };
+
         // The shell analysis is computed once, before authorisation, so that the
         // exact argument vector that was inspected is also the argument vector
         // that is executed.  Authorisation and execution can therefore never
@@ -1328,6 +1362,9 @@ The program is started as an explicit executable plus argument vector; free-form
                     profile,
                     base_url,
                     reasoning_sink.clone(),
+                    Some(crate::governance::TaskAuthorizationGrant::execution_roots(
+                        &ctx,
+                    )),
                 )
                 .await
             }
@@ -1427,6 +1464,11 @@ The program is started as an explicit executable plus argument vector; free-form
                                     profile,
                                     base_url,
                                     reasoning_sink.clone(),
+                                    Some(
+                                        crate::governance::TaskAuthorizationGrant::execution_roots(
+                                            &ctx,
+                                        ),
+                                    ),
                                 )
                                 .await;
                         } else if status.status == "denied" {
@@ -1473,6 +1515,9 @@ The program is started as an explicit executable plus argument vector; free-form
                     profile,
                     base_url,
                     reasoning_sink.clone(),
+                    Some(crate::governance::TaskAuthorizationGrant::execution_roots(
+                        &ctx,
+                    )),
                 )
                 .await
             }
@@ -1492,6 +1537,9 @@ The program is started as an explicit executable plus argument vector; free-form
                     profile,
                     base_url,
                     reasoning_sink.clone(),
+                    Some(crate::governance::TaskAuthorizationGrant::execution_roots(
+                        &ctx,
+                    )),
                 )
                 .await
             }
@@ -1516,7 +1564,14 @@ The program is started as an explicit executable plus argument vector; free-form
         profile: &ProfileSnapshot,
         base_url: Option<&str>,
         reasoning_sink: Option<ReasoningSink>,
+        authorized_roots: Option<Vec<std::path::PathBuf>>,
     ) -> (String, bool, Option<String>) {
+        // Filesystem execution uses exactly the canonical roots that
+        // authorization validated (Bug 14); with none available the
+        // operation fails closed through the empty-roots validator.
+        let file_operation_roots: Vec<PathBuf> = authorized_roots
+            .or_else(|| workspace_root.map(|ws| vec![ws.to_path_buf()]))
+            .unwrap_or_default();
         match tc.name.as_str() {
             "execute_shell" => {
                 let cmd = tc.arguments["command"].as_str().unwrap_or_default();
@@ -1525,7 +1580,7 @@ The program is started as an explicit executable plus argument vector; free-form
 
                 if use_sandbox {
                     let image = sandbox_image.unwrap_or_else(|| "alpine:3.20".to_string());
-                    match DockerSandbox::run_in_sandbox(&image, cmd) {
+                    match DockerSandbox::run_in_sandbox_in_dir(&image, cmd, workspace_root) {
                         Ok(res) => (
                             format!(
                                 "Sandbox ({}) exit code {}:\nSTDOUT:\n{}\nSTDERR:\n{}",
@@ -1644,7 +1699,11 @@ The program is started as an explicit executable plus argument vector; free-form
             }
             "read_file" => {
                 let path = tc.arguments["path"].as_str().unwrap_or_default();
-                match AuthorizationEngine::secure_read_contained(workspace_root, path) {
+                // The same canonical roots that authorization validated are
+                // what execution confines to (Bug 14): workspace root plus
+                // the grant's authorized folders.
+                match AuthorizationEngine::secure_read_contained_roots(&file_operation_roots, path)
+                {
                     Ok(content) => (content, false, None),
                     Err(e) => (format!("Filesystem access denied: {}", e), true, None),
                 }
@@ -1652,8 +1711,8 @@ The program is started as an explicit executable plus argument vector; free-form
             "write_file" => {
                 let path = tc.arguments["path"].as_str().unwrap_or_default();
                 let content = tc.arguments["content"].as_str().unwrap_or_default();
-                let safe_path = match AuthorizationEngine::secure_write_contained(
-                    workspace_root,
+                let safe_path = match AuthorizationEngine::secure_write_contained_roots(
+                    &file_operation_roots,
                     path,
                     content.as_bytes(),
                 ) {
@@ -1848,6 +1907,27 @@ The program is started as an explicit executable plus argument vector; free-form
             "click_mark" => {
                 let mark_id = tc.arguments["mark_id"].as_u64().unwrap_or(0) as usize;
                 if let Some((x, y)) = SetOfMarksEngine::resolve_mark(mark_id) {
+                    // Execution-boundary recheck (Bug 10): authorization and
+                    // dispatch use the same trusted label. A mark whose label
+                    // is missing, empty, or consequential at click time is
+                    // refused here — coordinates are never clicked without a
+                    // classifiable semantic target.
+                    let label_ok = match SetOfMarksEngine::resolve_mark_semantics(mark_id) {
+                        Some(sem) if !sem.label.is_empty() => {
+                            !crate::governance::is_consequential_control_text(&sem.combined)
+                        }
+                        _ => false,
+                    };
+                    if !label_ok {
+                        return (
+                            format!(
+                                "Mark #{} cannot be clicked: its trusted semantic label is missing or consequential in the current grounded session.",
+                                mark_id
+                            ),
+                            true,
+                            None,
+                        );
+                    }
                     let before_shot = capture_screen(0).ok();
                     let before_png = before_shot
                         .as_ref()

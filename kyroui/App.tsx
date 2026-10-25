@@ -11,10 +11,17 @@ import {
   ApprovalRequest,
   GroundedScreenResult,
 } from "./types/agent";
-import { ToolCallCard } from "./components/ToolCallCard";
-import { evaluateVerificationOutcome } from "./components/TaskProgress";
-import { ThinkingIndicator } from "./components/ThinkingIndicator";
+import {
+  TaskProgress,
+  evaluateVerificationOutcome,
+  isInspectionToolName,
+  isVerificationToolName,
+  TaskPlan,
+  TaskStep,
+} from "./components/TaskProgress";
 import { TerminalView } from "./components/TerminalView";
+import { TaskComposer } from "./components/TaskComposer";
+import { AgentActivityFeed } from "./components/AgentActivityFeed";
 import { SettingsModal } from "./components/SettingsModal";
 import { TeachTaskModal } from "./components/TeachTaskModal";
 import { TeammateRosterModal } from "./components/TeammateRosterModal";
@@ -32,12 +39,15 @@ import { MyRoutinesView } from "./components/MyRoutinesView";
 import { OnboardingModal } from "./components/OnboardingModal";
 import { CommandPalette } from "./components/CommandPalette";
 import { InlineNotice } from "./components/InlineNotice";
-import { MarkdownRenderer } from "./components/MarkdownRenderer";
+import { classifyTaskIntent, suggestedResourcesForIntent } from "./lib/taskIntent";
+import {
+  classifyAttachment,
+  ACCEPTED_ATTACHMENT_TYPES,
+} from "./lib/attachments";
 import { KyroLogo } from "./components/Logo";
 import { AgentAvatar } from "./components/AgentAvatar";
 import { NvidiaIcon } from "./components/BrandIcons";
 import {
-  Send,
   Plus,
   Settings,
   Terminal,
@@ -45,7 +55,6 @@ import {
   Eye,
   Camera,
   Crop,
-  StopCircle,
   ChevronRight,
   ExternalLink,
   Users,
@@ -61,16 +70,8 @@ import {
   XCircle,
   Layers,
   Command,
-  Mic,
-  MicOff,
-  Volume2,
-  VolumeX,
-  Paperclip,
-  FileCode,
   X,
   Plug,
-  Copy,
-  Check,
   Trash2,
   FolderTree,
   FileText,
@@ -82,9 +83,6 @@ import {
   Wrench,
   Clock,
   HelpCircle,
-  CheckCircle2,
-  ListOrdered,
-  RefreshCw,
   Cpu,
 } from "lucide-react";
 
@@ -129,20 +127,14 @@ export const App: React.FC = () => {
   const [routinesInitialTab, setRoutinesInitialTab] = useState<"routines" | "history">("routines");
   const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
 
-  // Structured Task Plan before consequential operations
-  const [activePlan, setActivePlan] = useState<{
-    id: string;
-    runId: string;
-    conversationId?: string;
-    isBackendPlan?: boolean;
-    goal: string;
-    understanding: string;
-    resources: string[];
-    steps: { id: string; text: string; done?: boolean; status: "pending" | "running" | "completed" | "failed" | "unverified"; evidence?: string }[];
-    status: "planning" | "approved" | "executing" | "completed" | "failed" | "cancelled" | "unverified";
-    accomplished: string[];
-    remaining: string[];
-  } | null>(null);
+  // Structured Task Plan before consequential operations.
+  // Single source of truth: the shape lives in TaskProgress.tsx and the same
+  // component renders it (Bug 18). A plan without a backend origin is a
+  // *suggested workflow*, never an authoritative execution plan (Bug 5).
+  const [activePlan, setActivePlan] = useState<TaskPlan | null>(null);
+  /** Synchronously readable mirror of activePlan for outcome wording. */
+  const activePlanRef = useRef<TaskPlan | null>(null);
+  activePlanRef.current = activePlan;
 
   const handleSelectModel = async (model: string) => {
     setSelectedModel(model);
@@ -194,6 +186,30 @@ export const App: React.FC = () => {
     activeRunIdRef.current = activeRunId;
   }, [activeRunId]);
 
+  /**
+   * The runs this window submitted and have not yet resolved, keyed by run id
+   * (value: owning conversation). Background runs stay alive here when the
+   * user switches conversation, so they keep their identity and remain
+   * stoppable explicitly (Bug 1/2).
+   */
+  const inFlightRunsRef = useRef<Map<string, string>>(new Map());
+  /** Per-conversation synchronous submission lock (Bug 4). */
+  const submitLocksRef = useRef<Map<string, string>>(new Map());
+  /** Mirror of the newest unresolved run per conversation + current busy/selection. */
+  const syncAgentBusy = () => {
+    const currentConv = activeConvIdRef.current;
+    let newestRunForConv: string | null = null;
+    let anyForConv = false;
+    for (const [runId, convId] of inFlightRunsRef.current.entries()) {
+      if (convId === currentConv) {
+        anyForConv = true;
+        newestRunForConv = runId; // entries() iterates insertion order; last wins
+      }
+    }
+    setActiveRunId(newestRunForConv);
+    setIsAgentRunning(anyForConv);
+  };
+
   const [activeReasoning, setActiveReasoning] = useState<{
     runId: string;
     conversationId?: string | null;
@@ -234,7 +250,6 @@ export const App: React.FC = () => {
     base64?: string;
     mimeType?: string;
   } | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Multi-Bot & Governance. The active teammate is an agent profile resolved
   // by the registry — client-supplied prompts are never trusted.
@@ -353,71 +368,155 @@ export const App: React.FC = () => {
         };
       });
 
-      // Update active plan evidence based on verifiable tool outcomes
+      // Update active plan evidence based on verifiable tool outcomes.
+      // The plan of one run can never be mutated by the events of another
+      // (run-scoped ownership), a recorded failure is never overwritten by a
+      // later success, and verification is evaluated through the truthful
+      // helper with the actual shell command the run executed (Bug 6).
       setActivePlan((prev) => {
         if (!prev || prev.runId !== payload.run_id) return prev;
+        const calls = payload.tool_calls || [];
+        const findCallCommand = (res: { tool_call_id: string; name: string }) => {
+          const call =
+            calls.find((tc: any) => tc.id === res.tool_call_id) ||
+            calls.find((tc: any) => tc.name === res.name);
+          const command = call?.arguments?.command;
+          return typeof command === "string" ? command : undefined;
+        };
+
         const newAccomplished = [...prev.accomplished];
         const newRemaining = [...prev.remaining];
-        let hasToolError = false;
-        let hasVerification = false;
-        let actionCompleted = false;
+        let inspectionRan = false;
+        let inspectionFailed = false;
+        let actionRan = false;
+        let actionFailed = false;
+        let verificationPassed = false;
+        let verificationFailed = false;
+        let verificationEvidence: string | null = null;
+
+        // Decisive failure markers in an action's stdout/stderr; coarse words
+        // alone are not evidence, but a process exit code of 1 is.
+        const ACTION_FAILURE_PATTERN =
+          /exit code: 1|exit status: 1|compilation error|build failed|tests? failed|assertion error|error\[/i;
 
         for (const res of payload.tool_results || []) {
-          const outcome = evaluateVerificationOutcome(res);
-          if (res.is_error) {
-            hasToolError = true;
-            const errSummary = `Error in ${res.name}: ${res.output.slice(0, 80)}`;
-            if (!newRemaining.includes(errSummary)) {
-              newRemaining.push(errSummary);
-            }
-          } else if (outcome.failed) {
-            hasToolError = true;
-            const errSummary = outcome.reason || `Error in ${res.name}: ${res.output.slice(0, 80)}`;
-            if (!newRemaining.includes(errSummary)) {
-              newRemaining.push(errSummary);
-            }
-          } else {
+          const commandArg = findCallCommand(res);
+          const isVerification = isVerificationToolName(res.name, commandArg);
+          const isInspection = !isVerification && isInspectionToolName(res.name);
+
+          if (isVerification) {
+            // Executing a verification tool IS an accomplished, factual
+            // action — recorded even when the verification itself fails
+            // (the failure lands in the step/remaining evidence).
             const accSummary = `Executed ${res.name}`;
             if (!newAccomplished.includes(accSummary)) {
               newAccomplished.push(accSummary);
             }
-            if (outcome.verified) {
-              hasVerification = true;
-            } else {
-              actionCompleted = true;
+            const outcome = evaluateVerificationOutcome(res, commandArg);
+            if (res.is_error || outcome.failed) {
+              verificationFailed = true;
+              verificationEvidence = outcome.reason;
+            } else if (outcome.verified) {
+              verificationPassed = true;
+              verificationEvidence = outcome.reason;
             }
+            continue;
+          }
+
+          if (isInspection) {
+            if (res.is_error) {
+              inspectionFailed = true;
+            } else {
+              inspectionRan = true;
+            }
+            continue;
+          }
+
+          if (res.is_error || ACTION_FAILURE_PATTERN.test(res.output || "")) {
+            actionFailed = true;
+            const errSummary = res.is_error
+              ? `Error in ${res.name}: ${res.output.slice(0, 80)}`
+              : `${res.name} reported failure: ${res.output.slice(0, 80)}`;
+            if (!newRemaining.includes(errSummary)) {
+              newRemaining.push(errSummary);
+            }
+            continue;
+          }
+
+          actionRan = true;
+          const accSummary = `Executed ${res.name}`;
+          if (!newAccomplished.includes(accSummary)) {
+            newAccomplished.push(accSummary);
           }
         }
 
-        const updatedSteps = prev.steps.map((st) => {
-          if (st.id === "step_inspect") {
-            return {
-              ...st,
-              status: (hasToolError ? "failed" : "completed") as any,
-              done: !hasToolError,
-              evidence: payload.thought ? "Analyzed request context" : undefined,
-            };
-          }
-          if (st.id === "step_execute") {
-            if (hasToolError) {
-              return { ...st, status: "failed" as any, done: false, evidence: "Execution error occurred" };
+        // Immutable evidence policy: a step that already reached completed or
+        // failed stays there; only evidence advances it otherwise.
+        const updatedSteps = prev.steps.map(
+          (st: TaskStep): TaskStep => {
+            if (st.id === "step_inspect") {
+              if (st.status === "completed" || st.status === "failed") return st;
+              if (inspectionFailed) {
+                return {
+                  ...st,
+                  status: "failed" as const,
+                  done: false,
+                  evidence: "Inspection tool reported an error",
+                };
+              }
+              if (inspectionRan) {
+                return {
+                  ...st,
+                  status: "completed" as const,
+                  done: true,
+                  evidence: "Inspection tool ran successfully",
+                };
+              }
+              return st;
             }
-            if (actionCompleted) {
-              return { ...st, status: "completed" as any, done: true, evidence: "Actions executed" };
+            if (st.id === "step_execute") {
+              if (st.status === "failed" || st.status === "completed") return st;
+              if (actionFailed) {
+                return {
+                  ...st,
+                  status: "failed" as const,
+                  done: false,
+                  evidence: "Execution failure observed",
+                };
+              }
+              if (actionRan) {
+                return {
+                  ...st,
+                  status: "completed" as const,
+                  done: true,
+                  evidence: "Actions executed",
+                };
+              }
+              return st;
             }
-            return { ...st, status: "running" as any };
-          }
-          if (st.id === "step_verify") {
-            if (hasToolError) {
-              return { ...st, status: "failed" as any, done: false, evidence: "Pre-empted by execution failure" };
-            }
-            if (hasVerification) {
-              return { ...st, status: "completed" as any, done: true, evidence: "Verification check passed" };
+            if (st.id === "step_verify") {
+              if (st.status === "completed" || st.status === "failed") return st;
+              if (verificationPassed) {
+                return {
+                  ...st,
+                  status: "completed" as const,
+                  done: true,
+                  evidence: verificationEvidence || "Verification check passed",
+                };
+              }
+              if (verificationFailed) {
+                return {
+                  ...st,
+                  status: "failed" as const,
+                  done: false,
+                  evidence: verificationEvidence || "Verification did not pass",
+                };
+              }
+              return st;
             }
             return st;
           }
-          return st;
-        });
+        );
 
         return {
           ...prev,
@@ -429,12 +528,23 @@ export const App: React.FC = () => {
 
       const currentConversation = activeConvIdRef.current;
       const belongsToActiveConversation =
-        !payload.conversation_id || !currentConversation
-          ? false
-          : payload.conversation_id === currentConversation;
+        !!payload.conversation_id && !!currentConversation &&
+        payload.conversation_id === currentConversation;
 
       if (belongsToActiveConversation) {
-        setActiveRunId(payload.run_id);
+        // Step events may heal the visible run selection for runs this window
+        // did not start (e.g. after a reload). A newer engine-driven timeline
+        // replaces an older engine-driven one (same conversation), but a
+        // submission-owned in-flight run is never stolen from (Bug 2).
+        const currentActive = activeRunIdRef.current;
+        const currentIsInFlight =
+          !!currentActive && inFlightRunsRef.current.has(currentActive);
+        if (
+          !currentIsInFlight &&
+          !inFlightRunsRef.current.has(payload.run_id)
+        ) {
+          setActiveRunId(payload.run_id);
+        }
       }
       // Clear transient reasoning when step executes tools or completes
       if ((payload.tool_calls && payload.tool_calls.length > 0) || payload.is_finished) {
@@ -516,11 +626,11 @@ export const App: React.FC = () => {
     } else {
       setMessages([]);
     }
-    // The live steps of the previous conversation are kept in the per-run
-    // store, so switching back to it restores its timeline.  Only the
-    // selection of the "current" run is reset here.
-    setActiveRunId(null);
+    // Background runs of OTHER conversations are still in flight and keep
+    // their run identity (Bug 1). This conversation displays its newest
+    // unresolved run, or nothing when it has none.
     setActiveReasoning(null);
+    syncAgentBusy();
     setActivePlan((prev) => (prev && prev.conversationId === activeConvId ? prev : null));
   }, [activeConvId]);
 
@@ -594,6 +704,39 @@ export const App: React.FC = () => {
       }
     }
   };
+
+  /**
+   * Truthful notifications (Bug 6): each plan announces a terminal outcome
+   * exactly once, derived from the committed plan state.
+   */
+  const notifiedPlanIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const plan = activePlan;
+    if (!plan || notifiedPlanIdsRef.current.has(plan.id)) return;
+    switch (plan.status) {
+      case "completed":
+        notifiedPlanIdsRef.current.add(plan.id);
+        sendNotification("Kyro Task Completed", plan.goal.slice(0, 80));
+        break;
+      case "failed":
+        notifiedPlanIdsRef.current.add(plan.id);
+        sendNotification("Kyro Task Failed", "The run reported execution failures.");
+        break;
+      case "unverified":
+        notifiedPlanIdsRef.current.add(plan.id);
+        sendNotification(
+          "Kyro Task Finished (unverified)",
+          "The run ended without a successful verification check."
+        );
+        break;
+      case "cancelled":
+        notifiedPlanIdsRef.current.add(plan.id);
+        sendNotification("Kyro Task Stopped", "The run was cancelled per your request.");
+        break;
+      default:
+        break;
+    }
+  }, [activePlan?.id, activePlan?.status]);
 
   const loadDefaultBot = async () => {
     try {
@@ -824,257 +967,460 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  /**
+   * Attachment policy gate (Bug 19): explicit allowlist and size caps drive
+   * what may be attached at all. Images travel on the binary/base64 path;
+   * searchable PDFs are decoded through the backend's real document parser
+   * (`extract_attachment_text`); supported text/code files are decoded as
+   * UTF-8 only after a binary-content check. Everything else — including
+   * mismatched MIME/extension pairs and empty files — is rejected with a
+   * clear error before submission.
+   */
+  const handleFileSelect = async (file: File) => {
     if (!file) return;
 
-    if (file.type.startsWith("image/")) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const base64 = (reader.result as string).split(",")[1];
+    const classification = classifyAttachment(file);
+    if (classification.error || !classification.kind) {
+      setNotice({ tone: "error", message: classification.error || "Unsupported attachment." });
+      return;
+    }
+
+    const readAsDataURL = () =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error || new Error("File read failed"));
+        reader.readAsDataURL(file);
+      });
+    const readAsText = () =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error || new Error("File read failed"));
+        reader.readAsText(file);
+      });
+
+    try {
+      if (classification.kind === "image") {
+        const dataUrl = await readAsDataURL();
         setAttachedFile({
           name: file.name,
           content: `[Attached image file: ${file.name}]`,
-          base64,
+          base64: dataUrl.split(",")[1],
           mimeType: file.type || "image/png",
         });
-      };
-      reader.readAsDataURL(file);
-    } else {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const text = reader.result as string;
+        return;
+      }
+
+      if (classification.kind === "pdf") {
+        const dataUrl = await readAsDataURL();
+        const base64 = dataUrl.split(",")[1];
+        // Route through the production document parser — the raw PDF is
+        // never decoded as text on the client.
+        const extracted = await invoke<{
+          text: string;
+          format: string;
+          page_count: number | null;
+          file_name: string;
+          word_count: number;
+          character_count: number;
+          truncated: boolean;
+        }>("extract_attachment_text", { fileName: file.name, base64Bytes: base64 });
+        const pageNote = extracted.page_count ? ` (extracted from ${extracted.page_count} PDF pages)` : "";
         setAttachedFile({
           name: file.name,
-          content: text,
+          content: `[Attached PDF document: ${file.name}${pageNote}]\n${extracted.text}`,
+          mimeType: "application/pdf",
         });
-      };
-      reader.readAsText(file);
+        return;
+      }
+
+      // Text/code: read as text, then verify it is actually text before it
+      // can enter the prompt.
+      const text = await readAsText();
+      if (text.includes("\0")) {
+        setNotice({
+          tone: "error",
+          message: `"${file.name}" contains binary data and cannot be attached as text.`,
+        });
+        return;
+      }
+      setAttachedFile({
+        name: file.name,
+        content: text,
+        mimeType: file.type || "text/plain",
+      });
+    } catch (err: any) {
+      const message = typeof err === "string" ? err : (err?.message ?? "Attachment could not be processed");
+      setNotice({ tone: "error", message: `Attachment rejected: ${message}` });
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if ((!prompt.trim() && !attachedFile) || isAgentRunning) return;
+  /**
+   * Runs a turn through the backend.
+   *
+   * Concurrency truthfulness (Bugs 2 & 4):
+   *  - a per-conversation synchronous lock is acquired BEFORE the first
+   *    await, so a second submission for the same conversation can never be
+   *    in flight; different conversations may still run concurrently;
+   *  - state updates are functional and every response/error path verifies
+   *    that the conversation it captured still owns the visible state;
+   *  - only the submission that owns the lock releases it.
+   */
+  const handleSubmit = async (formEvent?: React.FormEvent) => {
+    formEvent?.preventDefault?.();
 
+    if (!prompt.trim() && !attachedFile) return;
+    const lockKey = activeConvId ?? "_new_conversation";
+    // Synchronous acquisition: ref mutation happens before any await.
+    if (submitLocksRef.current.has(lockKey)) return;
+    const submitId = "submit_" + crypto.randomUUID();
+    submitLocksRef.current.set(lockKey, submitId);
+    // The run this submission registers, so `finally` can always clean up
+    // exactly what this submission created (and nothing else).
+    let myRunId: string | null = null;
+    let registeredConvId: string | null = null;
+
+    const typedAsk = prompt;
     let convId = activeConvId;
-    if (!convId) {
-      convId = "conv_" + crypto.randomUUID();
-      const newConv = await invoke<Conversation>("create_conversation", {
-        id: convId,
-        title: prompt.slice(0, 30) || attachedFile?.name || "New Task",
-        model: selectedModel,
-      });
-      setConversations([newConv, ...conversations]);
-      setActiveConvId(convId);
-    }
-
-    let fullPromptText = prompt;
-    let imageAttachment: { base64: string; mimeType: string; name: string } | null = null;
-    if (attachedFile) {
-      if (attachedFile.base64) {
-        imageAttachment = {
-          base64: attachedFile.base64,
-          mimeType: attachedFile.mimeType || "image/png",
-          name: attachedFile.name,
-        };
-        fullPromptText = `[Attachment: ${attachedFile.name}]\n${prompt}`;
-      } else {
-        fullPromptText = `[Attachment: ${attachedFile.name}]\n\`\`\`\n${attachedFile.content}\n\`\`\`\n\n${prompt}`;
-      }
-      setAttachedFile(null);
-    }
-
-    const userMsg: Message = {
-      id: "msg_" + crypto.randomUUID(),
-      conversation_id: convId,
-      role: "user",
-      content: fullPromptText,
-      created_at: Date.now(),
-    };
-
-    setMessages((prev) => [...prev, userMsg]);
-    await invoke("add_message", { msg: userMsg }).catch(console.error);
-
-    setPrompt("");
-    const runId = "run_" + crypto.randomUUID();
-    setActiveRunId(runId);
-    setActiveReasoning(null);
-    setIsAgentRunning(true);
-    clearRunSteps(runId);
-
-    const isConsequential = /(organize|move|clean|delete|email|draft|send|routine|schedule|compare|build|test|deploy|install)/i.test(fullPromptText);
-    if (isConsequential) {
-      const activeResources = [
-        activeBot.name ? `@${activeBot.name} Workspace` : "Apex Orchestrator",
-        "SQLite Audit Ledger",
-      ];
-      if (/email|draft|send/i.test(fullPromptText)) {
-        activeResources.push("Configured Email Connector");
-      }
-      if (/file|folder|clean|organize|move/i.test(fullPromptText)) {
-        activeResources.push("Authorized Local Directories");
-      }
-
-      setActivePlan({
-        id: "plan_" + Date.now(),
-        runId,
-        conversationId: convId,
-        goal: fullPromptText,
-        understanding: `Kyro received request: "${fullPromptText.trim()}". Proposed execution plan:`,
-        resources: activeResources,
-        steps: [
-          { id: "step_inspect", text: "Inspect and analyze relevant resources and parameters", status: "running", done: false },
-          { id: "step_execute", text: "Execute requested workflow safely with rollback records", status: "pending", done: false },
-          { id: "step_verify", text: "Verify execution results and validate state integrity", status: "pending", done: false },
-        ],
-        status: "executing",
-        accomplished: [],
-        remaining: [
-          "Inspect and analyze relevant resources and parameters",
-          "Execute requested workflow safely with rollback records",
-          "Verify execution results and validate state integrity",
-        ],
-      });
-    }
-
-    const priorHistory = messages.map((m) => ({
-      role: m.role,
-      content: m.content,
-      tool_calls: m.tool_calls_json ? JSON.parse(m.tool_calls_json) : null,
-      tool_call_id: null,
-    }));
-
-    const lastMessageContent = imageAttachment
-      ? [
-          {
-            type: "text",
-            text: fullPromptText.trim() ? fullPromptText : `Image attached: ${imageAttachment.name}`,
-          },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:${imageAttachment.mimeType};base64,${imageAttachment.base64}`,
-            },
-          },
-        ]
-      : fullPromptText;
-
-    const history = priorHistory.concat([
-      {
-        role: userMsg.role,
-        content: lastMessageContent as any,
-        tool_calls: null,
-        tool_call_id: null,
-      },
-    ]);
-
     try {
-      // The profile prompt is resolved engine-side (Stage C); the client can
-      // only choose an agent id, never supply instructions.
-      const finalReply = await invoke<string>("run_agent_turn", {
-        runId,
-        conversationId: convId,
-        model: selectedModel,
-        botId: activeBot.id,
-        history,
-        systemPrompt: null,
-      });
+      if (!convId) {
+        convId = "conv_" + crypto.randomUUID();
+        const newConv = await invoke<Conversation>("create_conversation", {
+          id: convId,
+          title: typedAsk.slice(0, 30) || attachedFile?.name || "New Task",
+          model: selectedModel,
+        });
+        // Atomically (synchronously) move the submission lock to the real
+        // conversation id before any other work.
+        submitLocksRef.current.delete(lockKey);
+        submitLocksRef.current.set(convId, submitId);
+        setConversations((prev) => [newConv, ...prev.filter((c) => c.id !== convId)]);
+        setActiveConvId(convId);
+      }
 
-      const assistantMsg: Message = {
-        id: "msg_" + crypto.randomUUID(),
-        conversation_id: convId,
-        role: "assistant",
-        content: finalReply || "Task completed.",
-        created_at: Date.now(),
-      };
-
-      setMessages((prev) => [...prev, assistantMsg]);
-      await invoke("add_message", { msg: assistantMsg }).catch(console.error);
-      sendNotification("Kyro Task Completed", finalReply.slice(0, 80));
-      setActivePlan((prev) => {
-        if (!prev) return null;
-        const verificationStep = prev.steps.find((s) => s.id === "step_verify");
-        const isVerified = verificationStep?.status === "completed";
-        const hasFailedStep = prev.steps.some((s) => s.status === "failed");
-
-        const finalStatus = hasFailedStep
-          ? "failed"
-          : isVerified
-          ? "completed"
-          : prev.accomplished.length > 0
-          ? "unverified"
-          : "unverified";
-
-        const remainingNotes = [...prev.remaining];
-        if (!isVerified && !hasFailedStep && !remainingNotes.some((n) => n.toLowerCase().includes("verification"))) {
-          remainingNotes.push("Explicit verification check not executed");
+      let fullPromptText = typedAsk;
+      let imageAttachment: { base64: string; mimeType: string; name: string } | null = null;
+      if (attachedFile) {
+        if (attachedFile.base64) {
+          imageAttachment = {
+            base64: attachedFile.base64,
+            mimeType: attachedFile.mimeType || "image/png",
+            name: attachedFile.name,
+          };
+          fullPromptText = `[Attachment: ${attachedFile.name}]\n${typedAsk}`;
+        } else {
+          fullPromptText = `[Attachment: ${attachedFile.name}]\n\`\`\`\n${attachedFile.content}\n\`\`\`\n\n${typedAsk}`;
         }
+        setAttachedFile(null);
+      }
 
-        return {
-          ...prev,
-          status: finalStatus,
-          steps: prev.steps.map((s) => {
-            if (s.id === "step_verify" && s.status !== "completed" && !hasFailedStep) {
-              return { ...s, status: "unverified" as any, done: false, evidence: "Unverified" };
-            }
-            if (s.status === "running") {
-              return { ...s, status: (hasFailedStep ? "failed" : "completed") as any, done: !hasFailedStep };
-            }
-            return s;
-          }),
-          remaining: remainingNotes,
-        };
-      });
-    } catch (err: any) {
-      const errorMsg: Message = {
+      const userMsg: Message = {
         id: "msg_" + crypto.randomUUID(),
         conversation_id: convId,
-        role: "assistant",
-        content: "Error running turn: " + err,
+        role: "user",
+        content: fullPromptText,
         created_at: Date.now(),
       };
-      setMessages((prev) => [...prev, errorMsg]);
-      sendNotification("Kyro Task Failed", String(err));
-      setActivePlan((prev) =>
-        prev
-          ? {
-              ...prev,
-              status: "failed",
-              steps: prev.steps.map((s) =>
-                s.status === "running" ? { ...s, status: "failed" as any, done: false } : s
-              ),
-              remaining: [`Encountered execution failure: ${err}`],
-            }
-          : null
-      );
+
+      setMessages((prev) => [...prev, userMsg]);
+      await invoke("add_message", { msg: userMsg }).catch(console.error);
+
+      setPrompt("");
+      const runId = "run_" + crypto.randomUUID();
+      const conversationId = convId!;
+      // This run is durably registered before the engine call so UI state,
+      // events and cancellation all agree about who owns what (Bug 1/2).
+      inFlightRunsRef.current.set(runId, conversationId);
+      submitLocksRef.current.set(conversationId, submitId);
+      myRunId = runId;
+      registeredConvId = conversationId;
+      clearRunSteps(runId);
+      setActiveReasoning(null);
+      syncAgentBusy();
+
+      // Stale plans never survive a new task: cleared for prompts that do
+      // not qualify as well (Bug 5).
+      setActivePlan(null);
+      const intent = classifyTaskIntent(typedAsk);
+      if (intent.isConsequential) {
+        const plan: TaskPlan = {
+          id: "plan_" + Date.now(),
+          runId,
+          conversationId,
+          // Client-side template: labeled a SUGGESTED workflow, never a
+          // backend-execution plan (Bug 5).
+          isBackendPlan: false,
+          goal: typedAsk,
+          understanding: `Suggested workflow for: "${typedAsk.trim()}". Kyro's engine plans, executes and verifies the task itself; this checkpoint preview is client-side guidance, not an engine plan.`,
+          resources: suggestedResourcesForIntent(intent, activeBot?.name),
+          steps: [
+            { id: "step_inspect", text: "Inspect and analyze relevant resources and parameters", status: "running", done: false },
+            { id: "step_execute", text: "Execute requested workflow safely with rollback records", status: "pending", done: false },
+            { id: "step_verify", text: "Verify execution results and validate state integrity", status: "pending", done: false },
+          ],
+          status: "executing",
+          accomplished: [],
+          remaining: [
+            "Inspect and analyze relevant resources and parameters",
+            "Execute requested workflow safely with rollback records",
+            "Verify execution results and validate state integrity",
+          ],
+        };
+        activePlanRef.current = plan;
+        setActivePlan(plan);
+      }
+
+      // The history snapshot is taken synchronously from the conversation the
+      // run belongs to, so a later conversation switch cannot poison it.
+      const historySnapshot = [...messages, userMsg].map((m) => ({
+        role: m.role,
+        content: m.content,
+        tool_calls: m.tool_calls_json ? JSON.parse(m.tool_calls_json) : null,
+        tool_call_id: null,
+      }));
+
+      const lastMessageContent = imageAttachment
+        ? [
+            {
+              type: "text",
+              text: fullPromptText.trim() ? fullPromptText : `Image attached: ${imageAttachment.name}`,
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:${imageAttachment.mimeType};base64,${imageAttachment.base64}`,
+              },
+            },
+          ]
+        : fullPromptText;
+
+      const history = historySnapshot.slice(0, -1).concat([
+        {
+          role: userMsg.role,
+          content: lastMessageContent as any,
+          tool_calls: null,
+          tool_call_id: null,
+        },
+      ]);
+
+      let runErrored = false;
+      let runCancelled = false;
+      let finalReply = "";
+      try {
+        // The profile prompt is resolved engine-side (Stage C); the client can
+        // only choose an agent id, never supply instructions.
+        finalReply = (await invoke<string>("run_agent_turn", {
+          runId,
+          conversationId,
+          model: selectedModel,
+          botId: activeBot.id,
+          history,
+          systemPrompt: null,
+        })) as string;
+      } catch (err: any) {
+        runErrored = true;
+        const message = typeof err === "string" ? err : err?.message || String(err);
+        runCancelled = /cancel/i.test(message);
+        const assistantMsg: Message = {
+          id: "msg_" + crypto.randomUUID(),
+          conversation_id: conversationId,
+          role: "assistant",
+          content: runCancelled
+            ? "Run cancelled by user request."
+            : "Error running turn: " + message,
+          created_at: Date.now(),
+        };
+        // Late results route to their owning conversation only: appended to
+        // the visible list only when that conversation is still displayed
+        // (Bug 2); persistence happens for the owning conversation regardless.
+        if (activeConvIdRef.current === conversationId) {
+          setMessages((prev) => [...prev, assistantMsg]);
+        }
+        await invoke("add_message", { msg: assistantMsg }).catch(console.error);
+        if (runCancelled) {
+          sendNotification("Kyro Task Stopped", "The run was cancelled per your request.");
+        } else {
+          sendNotification("Kyro Task Failed", message.slice(0, 120));
+        }
+        setActivePlan((prev) => {
+          if (!prev || prev.runId !== runId) return prev;
+          const next = runCancelled
+            ? {
+                ...prev,
+                status: "cancelled" as const,
+                steps: prev.steps.map((s) =>
+                  s.status === "running" ? { ...s, status: "failed" as const, done: false, evidence: "Cancelled" } : s
+                ),
+                remaining: ["Execution cancelled by user request"],
+              }
+            : {
+                ...prev,
+                status: "failed" as const,
+                steps: prev.steps.map((s) =>
+                  s.status === "running" ? { ...s, status: "failed" as const, done: false } : s
+                ),
+                remaining: [`Encountered execution failure: ${message}`],
+              };
+          activePlanRef.current = next;
+          return next;
+        });
+      }
+
+      if (!runErrored) {
+        const assistantMsg: Message = {
+          id: "msg_" + crypto.randomUUID(),
+          conversation_id: conversationId,
+          role: "assistant",
+          content: finalReply || "Task completed.",
+          created_at: Date.now(),
+        };
+        if (activeConvIdRef.current === conversationId) {
+          setMessages((prev) => [...prev, assistantMsg]);
+        }
+        await invoke("add_message", { msg: assistantMsg }).catch(console.error);
+
+        // Final plan updates only from the run that owns the plan (Bug 6).
+        // Functional so the freshest step-event evidence wins even when the
+        // turn promise and queued step updates resolve in the same tick.
+        setActivePlan((prev) => {
+          if (!prev || prev.runId !== runId) return prev;
+          const isVerified =
+            prev.steps.find((s) => s.id === "step_verify")?.status === "completed";
+          const hasFailedStep = prev.steps.some((s) => s.status === "failed");
+          const finalStatus: TaskPlan["status"] = hasFailedStep
+            ? "failed"
+            : isVerified
+            ? "completed"
+            : "unverified";
+
+          const remainingNotes = [...prev.remaining];
+          if (!isVerified && !hasFailedStep && !remainingNotes.some((n) => n.toLowerCase().includes("verification"))) {
+            remainingNotes.push("Explicit verification check not executed");
+          }
+
+          const next: TaskPlan = {
+            ...prev,
+            status: finalStatus,
+            steps: prev.steps.map((s) => {
+              if (s.id === "step_verify" && s.status !== "completed" && s.status !== "failed") {
+                if (hasFailedStep) return s;
+                return { ...s, status: "unverified" as const, done: false, evidence: "Unverified" };
+              }
+              if (s.status === "running") {
+                return {
+                  ...s,
+                  status: (hasFailedStep ? "failed" : "completed") as TaskStep["status"],
+                  done: !hasFailedStep,
+                };
+              }
+              return s;
+            }),
+            remaining: remainingNotes,
+          };
+          activePlanRef.current = next;
+          return next;
+        });
+
+        // Ordinary questions produce no plan; truthfully report the reply.
+        if (!intent.isConsequential) {
+          sendNotification("Kyro Reply Ready", finalReply.slice(0, 80));
+        }
+        // Planned runs report (Bug 6) once the plan reaches a terminal status —
+        // handled by the notification effect below.
+      }
+    } catch (err: any) {
+      // Submission-level failure (conversation creation, messaging, etc.).
+      const message = typeof err === "string" ? err : err?.message || String(err);
+      setNotice({ tone: "error", message: `Task submission failed: ${message}` });
     } finally {
-      setIsAgentRunning(false);
-      setActiveRunId(null);
+      // Release ONLY the lock owned by this submission (Bug 2), and drop the
+      // run from the in-flight registry whatever the outcome was.
+      if (registeredConvId && submitLocksRef.current.get(registeredConvId) === submitId) {
+        submitLocksRef.current.delete(registeredConvId);
+      } else if (!registeredConvId && submitLocksRef.current.get(lockKey) === submitId) {
+        submitLocksRef.current.delete(lockKey);
+      }
+      if (myRunId) {
+        inFlightRunsRef.current.delete(myRunId);
+      }
+      syncAgentBusy();
       setActiveReasoning(null);
     }
   };
 
+  /**
+   * Stops the displayed run (Bug 1).
+   *
+   * Cancellation is only claimed when the backend confirms the transition:
+   *  - `true`  → confirmed cancelled; UI may mark the plan cancelled;
+   *  - `false` → the run was already terminal; state is reconciled instead
+   *              of pretending that a cancellation happened;
+   *  - `Err`   → either the run is still inside its setup window (the
+   *              cancellation was registered and WILL abort its first
+   *              execution step) or cancelling failed. The UI reports the
+   *              truth and does not fake a cancelled state.
+   */
   const handleAbort = async () => {
-    if (activeRunId) {
-      await invoke("cancel_agent_run", { runId: activeRunId }).catch(console.error);
+    const runId = activeRunIdRef.current ?? activeRunId;
+    if (!runId) {
+      await invoke("abort_computer_use").catch(console.error);
+      setNotice({ tone: "info", message: "There is no running task to stop in this conversation." });
+      return;
     }
+
+    let confirmResult: boolean | null = null;
+    let failureMessage = "";
+    try {
+      confirmResult = await invoke<boolean>("cancel_agent_run", { runId });
+    } catch (err: any) {
+      failureMessage = typeof err === "string" ? err : err?.message || String(err);
+    }
+
+    // Any ghost/overlay capture is aborted regardless of the run outcome.
     await invoke("abort_computer_use").catch(console.error);
-    setActivePlan((prev) =>
-      prev
-        ? {
-            ...prev,
-            status: "cancelled",
-            steps: prev.steps.map((s) =>
-              s.status === "running" ? { ...s, status: "failed" as any, done: false, evidence: "Cancelled" } : s
-            ),
-            remaining: ["Execution cancelled by user request"],
-          }
-        : null
-    );
-    setIsAgentRunning(false);
-    setActiveRunId(null);
-    setActiveReasoning(null);
+
+    if (confirmResult === true) {
+      // Backend CONFIRMED the transition — only now is "cancelled" truthful.
+      setActivePlan((prev) =>
+        prev && prev.runId === runId
+          ? {
+              ...prev,
+              status: "cancelled" as const,
+              steps: prev.steps.map((s) =>
+                s.status === "running" ? { ...s, status: "failed" as const, done: false, evidence: "Cancelled" } : s
+              ),
+              remaining: ["Execution cancelled by user request"],
+            }
+          : prev
+      );
+      inFlightRunsRef.current.delete(runId);
+      syncAgentBusy();
+      setActiveReasoning(null);
+      setNotice({ tone: "info", message: "Task stopped." });
+      return;
+    }
+
+    if (confirmResult === false) {
+      // Already terminal (succeeded/failed/cancelled): reconcile the busy
+      // state instead of claiming a fresh cancellation.
+      inFlightRunsRef.current.delete(runId);
+      syncAgentBusy();
+      setActiveReasoning(null);
+      setNotice({ tone: "info", message: "The task had already finished; nothing was cancelled." });
+      return;
+    }
+
+    if (failureMessage.includes("still being created")) {
+      // The cancellation is registered against the run id and will abort the
+      // run's first execution step: requested-but-not-yet-confirmed is
+      // truthful here. The submitting handler stays in flight and will
+      // resolve with the cancelled outcome.
+      setNotice({ tone: "info", message: `Stopping: ${failureMessage}` });
+      return;
+    }
+
+    setNotice({ tone: "error", message: `Could not stop the task: ${failureMessage}` });
   };
 
   const handleCaptureScreen = async () => {
@@ -1779,118 +2125,16 @@ export const App: React.FC = () => {
           </div>
         ) : (
           <div className="flex-1 overflow-y-auto p-6 space-y-6">
-            {/* Structured Task Plan Card */}
+            {/* Structured Task Plan Card — single source of truth: the
+                 TaskProgress component renders the same plan state the
+                 submission/step logic maintains (Bug 18). A client-side plan
+                 is labeled a Suggested Workflow, never an engine plan. */}
             {activePlan && (
-              <div className="max-w-2xl mx-auto my-2 p-4 rounded-xl bg-[#141414] border border-neutral-800 space-y-3 shadow-lg">
-                <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
-                  <div className="flex items-center gap-2">
-                    <ListOrdered className="w-4 h-4 text-neutral-300" />
-                    <span className="text-xs font-semibold text-neutral-200">Execution Plan</span>
-                    <span className="text-[10px] font-mono text-neutral-400">({activePlan.status})</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`text-[10px] px-2 py-0.5 rounded-full font-mono uppercase font-bold ${
-                        activePlan.status === "completed"
-                          ? "bg-green-950/60 text-green-300 border border-green-800/60"
-                          : activePlan.status === "failed"
-                          ? "bg-red-950/60 text-red-300 border border-red-800/60"
-                          : activePlan.status === "unverified"
-                          ? "bg-yellow-950/60 text-yellow-300 border border-yellow-800/60"
-                          : activePlan.status === "executing"
-                          ? "bg-purple-950/60 text-purple-300 border border-purple-800/60 animate-pulse"
-                          : "bg-neutral-800 text-neutral-300 border border-neutral-700"
-                      }`}
-                    >
-                      {activePlan.status}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setActivePlan(null)}
-                      className="text-neutral-500 hover:text-neutral-300 text-xs p-1"
-                      title="Dismiss plan"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="text-xs space-y-2">
-                  <div>
-                    <span className="text-neutral-400">Understanding: </span>
-                    <span className="text-neutral-200 font-medium">{activePlan.understanding}</span>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                    <span className="text-neutral-400 text-[11px]">Resources: </span>
-                    {activePlan.resources.map((res, i) => (
-                      <span
-                        key={i}
-                        className="px-2 py-0.5 bg-[#000000] border border-neutral-800 text-[10px] text-neutral-300 rounded font-mono"
-                      >
-                        {res}
-                      </span>
-                    ))}
-                  </div>
-
-                  <div className="space-y-1.5 pt-1">
-                    <span className="text-neutral-400 block font-medium text-[11px]">Planned Steps:</span>
-                    {activePlan.steps.map((st, i) => {
-                      const isComplete = st.status === "completed" || (!st.status && st.done);
-                      const isFailed = st.status === "failed";
-                      const isRunning = st.status === "running";
-                      const isUnverified = st.status === "unverified";
-                      return (
-                        <div key={i} className="flex items-center gap-2 text-neutral-300">
-                          {isComplete ? (
-                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
-                          ) : isFailed ? (
-                            <X className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                          ) : isRunning ? (
-                            <RefreshCw className="w-3.5 h-3.5 text-purple-400 animate-spin shrink-0" />
-                          ) : isUnverified ? (
-                            <AlertTriangle className="w-3.5 h-3.5 text-yellow-400 shrink-0" />
-                          ) : (
-                            <span className="w-3.5 h-3.5 rounded-full border border-neutral-600 flex items-center justify-center text-[9px] font-mono text-neutral-400 shrink-0">
-                              {i + 1}
-                            </span>
-                          )}
-                          <span className={isComplete ? "line-through text-neutral-500" : ""}>{st.text}</span>
-                          {st.evidence && (
-                            <span className="text-[10px] text-neutral-500 font-mono">({st.evidence})</span>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {activePlan.accomplished.length > 0 && (
-                    <div className="pt-2 border-t border-neutral-800/80">
-                      <span className="text-[11px] font-semibold text-neutral-300 block mb-1">
-                        Accomplished:
-                      </span>
-                      <ul className="list-disc list-inside text-[11px] text-neutral-400 space-y-0.5">
-                        {activePlan.accomplished.map((item, i) => (
-                          <li key={i}>{item}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {activePlan.remaining.length > 0 && (
-                    <div className="pt-1">
-                      <span className="text-[11px] font-semibold text-neutral-400 block mb-1">
-                        Remaining / Unfinished:
-                      </span>
-                      <ul className="list-disc list-inside text-[11px] text-neutral-500 space-y-0.5">
-                        {activePlan.remaining.map((item, i) => (
-                          <li key={i}>{item}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                </div>
-              </div>
+              <TaskProgress
+                plan={activePlan}
+                activeConversationId={activeConvId}
+                onDismiss={() => setActivePlan(null)}
+              />
             )}
 
             {(!messages || messages.length === 0) && (!liveSteps || liveSteps.length === 0) ? (
@@ -2123,152 +2367,24 @@ export const App: React.FC = () => {
               )}
             </div>
           ) : (
-            <>
-              {(messages || []).map((m) => (
-                <div
-                  key={m.id}
-                  className={`flex flex-col ${
-                    m.role === "user" ? "items-end" : "items-start"
-                  }`}
-                >
-                  <div
-                    className={`max-w-2xl px-4 py-3 rounded-2xl text-sm leading-relaxed ${
-                      m.role === "user"
-                        ? "bg-[#1f1f1f] text-[#ededed] border border-[#2e2e2e] rounded-br-none shadow-sm"
-                        : "bg-[#121212] text-[#ededed] border border-[#262626] rounded-bl-none shadow-sm"
-                    }`}
-                  >
-                    {m.role === "assistant" ? (
-                      <MarkdownRenderer content={m.content} />
-                    ) : (
-                      <div className="whitespace-pre-wrap">{m.content}</div>
-                    )}
-
-                    {/* Timeline tool calls for assistant messages */}
-                    {(() => {
-                      if (m.role !== "assistant" || !m.tool_calls_json) return null;
-                      try {
-                        const tcs = JSON.parse(m.tool_calls_json);
-                        if (!Array.isArray(tcs) || tcs.length === 0) return null;
-                        let obs: any[] = [];
-                        if (m.observations_json) {
-                          try {
-                            obs = JSON.parse(m.observations_json);
-                          } catch {}
-                        }
-                        return (
-                          <div className="space-y-2 mt-3 pt-2 border-t border-[#1f1f1f] w-full">
-                            {tcs.map((tc: any, idx: number) => {
-                              const res = Array.isArray(obs)
-                                ? obs.find((r: any) => r.tool_call_id === tc.id)
-                                : undefined;
-                              return (
-                                <ToolCallCard
-                                  key={`msg-tc-${tc.id || idx}`}
-                                  toolCall={tc}
-                                  result={res}
-                                  defaultExpanded={false}
-                                />
-                              );
-                            })}
-                          </div>
-                        );
-                      } catch {
-                        return null;
-                      }
-                    })()}
-
-                    {/* Actions for assistant messages */}
-                    {m.role === "assistant" && (
-                      <div className="flex items-center justify-between pt-2 mt-2 border-t border-neutral-800 text-xs">
-                        <span className="text-[10px] text-neutral-400 font-mono">
-                          {new Date(m.created_at).toLocaleTimeString()}
-                        </span>
-                        <div className="flex items-center gap-3">
-                          <button
-                            onClick={() => handleCopyMessage(m.id, m.content)}
-                            className="text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
-                            title="Copy response"
-                          >
-                            {copiedMessageId === m.id ? (
-                              <>
-                                <Check className="w-3.5 h-3.5 text-neutral-200" />
-                                <span className="text-[10px]">Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                <span className="text-[10px]">Copy</span>
-                              </>
-                            )}
-                          </button>
-                          <button
-                            onClick={() => handleSpeak(m.id, m.content)}
-                            className="text-neutral-400 hover:text-neutral-200 flex items-center gap-1 transition"
-                            title="Read message aloud (Local TTS)"
-                          >
-                            {speakingMessageId === m.id ? (
-                              <>
-                                <VolumeX className="w-3.5 h-3.5 text-amber-400" />
-                                <span className="text-[10px]">Stop</span>
-                              </>
-                            ) : (
-                              <>
-                                <Volume2 className="w-3.5 h-3.5" />
-                                <span className="text-[10px]">Speak</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              {/* Real-time Tool Action Cards & Thoughts */}
-              {liveSteps.map((step) => (
-                <React.Fragment key={`${step.run_id}-${step.step}`}>
-                  {step.thought && (
-                    <div className="flex flex-col items-start my-2 max-w-2xl">
-                      <div className="px-4 py-3 rounded-2xl rounded-bl-none bg-[#121212] text-[#ededed] border border-[#262626] shadow-sm text-sm">
-                        {step.is_child_run && (
-                          <div className="mb-1.5 text-[10px] uppercase tracking-wide text-neutral-500 font-mono">
-                            Delegated agent
-                            {step.agent_id ? ` · ${step.agent_id}` : ""}
-                          </div>
-                        )}
-                        <MarkdownRenderer content={step.thought} />
-                      </div>
-                    </div>
-                  )}
-                  {(step.tool_calls || []).map((tc, idx) => {
-                    const res = (step.tool_results || []).find((r) => r.tool_call_id === tc.id);
-                    return (
-                      <ToolCallCard
-                        key={`${step.step}-${tc.id || idx}`}
-                        toolCall={tc}
-                        result={res}
-                        defaultExpanded={!res}
-                      />
-                    );
-                  })}
-                </React.Fragment>
-              ))}
-
-              {isAgentRunning && (
-                <div className="py-1">
-                  <ThinkingIndicator
-                    agentName={resolveAgentDisplayName()}
-                    reasoningText={activeReasoning?.text}
-                    isStreaming={activeReasoning?.isStreaming ?? true}
-                    statusText="Waiting for model response…"
-                  />
-                </div>
-              )}
-
-              <div ref={messagesEndRef} />
-            </>
+            <AgentActivityFeed
+              messages={messages || []}
+              steps={liveSteps}
+              isAgentRunning={isAgentRunning}
+              agentName={resolveAgentDisplayName()}
+              activeReasoning={
+                activeReasoning
+                  ? { text: activeReasoning.text, isStreaming: activeReasoning.isStreaming }
+                  : null
+              }
+              pendingApprovalsCount={pendingApprovals.length}
+              messagesEndRef={messagesEndRef}
+              onCopyMessage={handleCopyMessage}
+              onSpeakMessage={handleSpeak}
+              copiedMessageId={copiedMessageId}
+              speakingMessageId={speakingMessageId}
+              className="max-w-3xl mx-auto"
+            />
           )}
         </div>
       )}
@@ -2290,22 +2406,6 @@ export const App: React.FC = () => {
             <div className="flex-1 p-2 overflow-hidden">
               <TerminalView />
             </div>
-          </div>
-        )}
-
-        {/* Attached File Preview Chip */}
-        {attachedFile && (
-          <div className="px-4 py-1.5 bg-[#141414] border-t border-neutral-800 flex items-center justify-between text-xs text-neutral-200">
-            <div className="flex items-center gap-2">
-              <FileCode className="w-4 h-4 text-neutral-400" />
-              <span>Attached: <strong>{attachedFile.name}</strong></span>
-            </div>
-            <button
-              onClick={() => setAttachedFile(null)}
-              className="text-neutral-400 hover:text-white transition-colors"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
           </div>
         )}
 
@@ -2337,78 +2437,30 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* Input Form with Voice Dictation & Attachments */}
+        {/* Production composer: shared component for prompt input, attachment
+            policy gate (Bug 19) and truthful stop affordance (Bug 1). */}
         <div className="p-4 border-t border-[#1f1f1f] bg-[#0a0a0a]">
-          <form onSubmit={handleSubmit} className="flex items-end gap-2">
-            {/* Hidden File Picker */}
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleFileSelect}
-              className="hidden"
-            />
-
-            {/* Attachment Button */}
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="p-3 rounded-xl bg-[#000000] hover:bg-neutral-900 border border-[#242424] text-neutral-400 hover:text-neutral-200 transition shrink-0"
-              title="Attach a local text or image file"
-            >
-              <Paperclip className="w-4 h-4" />
-            </button>
-
-            {/* Voice Dictation Button */}
-            <button
-              type="button"
-              onClick={toggleVoiceDictation}
-              className={`p-3 rounded-xl border transition shrink-0 ${
-                isListening
-                  ? "bg-red-950/40 text-red-400 border-red-700/60 animate-pulse"
-                  : "bg-[#000000] hover:bg-neutral-900 border-[#242424] text-neutral-400 hover:text-neutral-200"
-              }`}
-              title={isListening ? "Listening... click to stop" : "Voice Dictation (Speech to Text)"}
-            >
-              {isListening ? <Mic className="w-4 h-4 text-red-400 animate-bounce" /> : <MicOff className="w-4 h-4" />}
-            </button>
-
-            <textarea
-              rows={2}
-              placeholder={
-                isListening
-                  ? "Listening to your voice..."
-                  : `Ask @${activeBot.name} to automate a desktop task, run terminal commands, or teach a skill...`
-              }
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSubmit(e as any);
-                }
-              }}
-              disabled={isAgentRunning}
-              className="flex-1 px-4 py-2.5 bg-[#000000] border border-[#242424] rounded-xl text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-500 resize-none transition"
-            />
-
-            {isAgentRunning ? (
-              <button
-                type="button"
-                onClick={handleAbort}
-                className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-semibold uppercase tracking-wider flex items-center gap-2 shadow-sm transition shrink-0"
-              >
-                <StopCircle className="w-4 h-4 fill-current" /> Stop
-              </button>
-            ) : (
-              <button
-                type="submit"
-                disabled={!prompt.trim() && !attachedFile}
-                className="px-5 py-3 rounded-xl bg-neutral-100 hover:bg-white disabled:opacity-40 text-neutral-950 text-xs font-semibold flex items-center gap-2 shadow-sm transition shrink-0"
-              >
-                <Send className="w-4 h-4" /> Send
-              </button>
-            )}
-          </form>
+          <TaskComposer
+            prompt={prompt}
+            onPromptChange={setPrompt}
+            onSubmit={() => handleSubmit()}
+            onAbort={handleAbort}
+            isAgentRunning={isAgentRunning}
+            activeBotName={activeBot.name}
+            attachedFile={attachedFile ? { name: attachedFile.name, base64: attachedFile.base64, mimeType: attachedFile.mimeType } : null}
+            onSelectFile={handleFileSelect}
+            onRemoveFile={() => setAttachedFile(null)}
+            isListening={isListening}
+            onToggleVoice={toggleVoiceDictation}
+            placeholder={
+              isListening
+                ? "Listening to your voice..."
+                : `Ask @${activeBot.name} to automate a desktop task, run terminal commands, or teach a skill...`
+            }
+            attachButtonTitle="Attach a local text or image file"
+            voiceButtonTitle="Voice Dictation (Speech to Text)"
+            acceptAttribute={ACCEPTED_ATTACHMENT_TYPES}
+          />
         </div>
       </div>
 

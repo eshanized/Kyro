@@ -940,14 +940,16 @@ describe("Phase C Frontend Coverage to >= 95%", () => {
       fireEvent.click(sendBtn);
 
       await waitFor(() => {
-        expect(screen.getByText("Execution Plan")).toBeInTheDocument();
-        expect(screen.getByText(/Kyro received request: "Please organize my downloaded files/i)).toBeInTheDocument();
+        // Bug 5 contract: the client template renders as a Suggested
+        // Workflow, never an authoritative "Execution Plan".
+        expect(screen.getByText("Suggested Workflow")).toBeInTheDocument();
+        expect(screen.getByText(/Suggested workflow for: "Please organize my downloaded files/i)).toBeInTheDocument();
       });
 
       // Dismiss execution plan
       const dismissPlanBtn = screen.getByTitle("Dismiss plan");
       fireEvent.click(dismissPlanBtn);
-      expect(screen.queryByText("Execution Plan")).not.toBeInTheDocument();
+      expect(screen.queryByText("Suggested Workflow")).not.toBeInTheDocument();
 
       // Everyday destination tabs navigation
       fireEvent.click(screen.getByText("Today", { selector: "span" }).closest("button")!);

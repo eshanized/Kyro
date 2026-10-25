@@ -3528,7 +3528,11 @@ async fn test_dynamic_mcp_tool_classification_and_schema_fingerprint_invalidatio
         "External tools must not auto-approve based on naming heuristics alone"
     );
 
-    // E. External tool with explicit read-only declaration -> Safe, can_auto_approve: true
+    // E. External tool with explicit read-only declaration: the annotation is
+    // untrusted metadata supplied by the external provider (Issue finding 11).
+    // It must NOT self-authorize auto-approval; only a local trusted policy
+    // decision can ever grant that. The annotation still records the
+    // read-only hint alongside the trusted name heuristic.
     let explicit_ro_schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -3543,7 +3547,26 @@ async fn test_dynamic_mcp_tool_classification_and_schema_fingerprint_invalidatio
     );
     assert_eq!(risk_safe, RiskLevel::Safe);
     assert!(is_ro_safe);
-    assert!(can_auto_safe);
+    assert!(
+        !can_auto_safe,
+        "Externally supplied read-only annotations must not auto-approve a tool"
+    );
+
+    // E2. Annotation-only tool (no read-only naming heuristic) claims
+    // read-only: stays behind approval and never becomes auto-approvable.
+    let annotation_only = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "annotations": { "readOnlyHint": true, "title": "read stuff" },
+        "x-read-only": true
+    });
+    let (risk_ann, is_ro_ann, can_auto_ann) =
+        classify_external_tool("sync_workspace", "Keeps systems aligned", &annotation_only);
+    assert_eq!(risk_ann, RiskLevel::Moderate);
+    assert!(is_ro_ann, "annotation is recorded as a metadata hint only");
+    assert!(!can_auto_ann);
 
     // F. Benign name with explicit read-only declaration BUT side-effecting property -> Moderate, cannot auto-approve
     let deceptive_schema = serde_json::json!({
@@ -4666,4 +4689,263 @@ fn test_conversation_deletion_concurrency_and_lifecycle_consistency() {
     }
 
     std::fs::remove_dir_all(temp_dir).ok();
+}
+
+// -------------------------------------------------------------------------
+// Bug 15: the model router binds every model identifier to the provider that
+// actually serves it — endpoint AND credential — instead of silently sending
+// third-party-hosted identifiers to the NVIDIA gateway.
+// -------------------------------------------------------------------------
+
+/// Snapshot of every `KYRO_*_BASE_URL` / `KYRO_*_API_KEY` variable, removing
+/// them for the duration of the test so the default route table is exercised
+/// deterministically, and restoring them afterwards.
+struct RouterEnvGuard {
+    saved: Vec<(String, std::ffi::OsString)>,
+}
+
+impl RouterEnvGuard {
+    fn clear_router_vars() -> Self {
+        let mut saved = Vec::new();
+        for (k, v) in std::env::vars_os() {
+            let key = k.to_string_lossy().to_string();
+            if key.starts_with("KYRO_") && (key.ends_with("_BASE_URL") || key.ends_with("_API_KEY"))
+            {
+                saved.push((key.clone(), v));
+                std::env::remove_var(&key);
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for RouterEnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..) {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
+#[test]
+fn model_router_binds_models_to_their_true_providers() {
+    use kyro_lib::agent::router::{ModelRouter, NVIDIA_BASE_URL};
+
+    let _guard = RouterEnvGuard::clear_router_vars();
+
+    // --- Default route table (no env overrides) ---
+    let cases: &[(&str, &str, &str, Option<&str>)] = &[
+        // (model, expected provider, expected base, credential key var)
+        (
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+        ("", "nvidia", NVIDIA_BASE_URL, Some("KYRO_NVIDIA_API_KEY")),
+        (
+            "meta/llama-3.2-11b-vision-instruct",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+        (
+            "llama3.1-8b-instruct",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+        (
+            "qwen/qwen2.5-7b-instruct",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+        // Regression: NIM-hosted HuggingFace namespaces must NOT go to the
+        // first-party APIs that do not serve these identifiers.
+        (
+            "mistralai/mistral-small-3.1-24b-instruct",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+        (
+            "deepseek-ai/deepseek-r1-0528",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+        // First-party providers keep their own endpoints and credentials.
+        (
+            "openai/gpt-4o",
+            "openai",
+            "https://api.openai.com/v1",
+            Some("KYRO_OPENAI_API_KEY"),
+        ),
+        (
+            "gpt-4o-mini",
+            "openai",
+            "https://api.openai.com/v1",
+            Some("KYRO_OPENAI_API_KEY"),
+        ),
+        (
+            "claude-3-5-sonnet",
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            Some("KYRO_ANTHROPIC_API_KEY"),
+        ),
+        (
+            "anthropic/claude-3-5-haiku",
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            Some("KYRO_ANTHROPIC_API_KEY"),
+        ),
+        (
+            "gemini-2.0-flash",
+            "google",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            Some("KYRO_GOOGLE_API_KEY"),
+        ),
+        (
+            "google/gemini-1.5-pro",
+            "google",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            Some("KYRO_GOOGLE_API_KEY"),
+        ),
+        (
+            "groq/llama-3.3-70b-versatile",
+            "groq",
+            "https://api.groq.com/openai/v1",
+            Some("KYRO_GROQ_API_KEY"),
+        ),
+        (
+            "mistral-small-latest",
+            "mistral",
+            "https://api.mistral.ai/v1",
+            Some("KYRO_MISTRAL_API_KEY"),
+        ),
+        (
+            "deepseek-chat",
+            "deepseek",
+            "https://api.deepseek.com/v1",
+            Some("KYRO_DEEPSEEK_API_KEY"),
+        ),
+        (
+            "openrouter/z-ai/glm-4.5",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            Some("KYRO_OPENROUTER_API_KEY"),
+        ),
+        (
+            "together/meta-llama/Llama-3-70b",
+            "together",
+            "https://api.together.xyz/v1",
+            Some("KYRO_TOGETHER_API_KEY"),
+        ),
+        (
+            "mistral-7b-ollama",
+            "ollama",
+            "http://127.0.0.1:11434/v1",
+            None,
+        ),
+        // Unknown families stay on the historical NVIDIA-compatible gateway.
+        (
+            "some-unknown-family-v9",
+            "nvidia",
+            NVIDIA_BASE_URL,
+            Some("KYRO_NVIDIA_API_KEY"),
+        ),
+    ];
+
+    for (model, provider, base, credential) in cases {
+        let route = ModelRouter::resolve_model_route(model).expect("resolution must succeed");
+        assert_eq!(
+            route.provider, *provider,
+            "model '{}' must resolve to provider '{}'",
+            model, provider
+        );
+        assert_eq!(
+            route.base_url, *base,
+            "model '{}' must resolve to base URL '{}'",
+            model, base
+        );
+        assert_eq!(
+            route.credential_key.as_deref(),
+            *credential,
+            "model '{}' must carry the right credential reference",
+            model
+        );
+    }
+
+    // --- Environment override: self-hosted proxy endpoints ---
+    std::env::set_var("KYRO_OPENAI_BASE_URL", "https://proxy.example.internal/v1");
+    let proxied = ModelRouter::resolve_model_route("gpt-4o").unwrap();
+    assert_eq!(proxied.base_url, "https://proxy.example.internal/v1");
+    assert_eq!(proxied.provider, "openai");
+    std::env::remove_var("KYRO_OPENAI_BASE_URL");
+
+    // An empty override is ignored, not adopted.
+    std::env::set_var("KYRO_DEEPSEEK_BASE_URL", "   ");
+    let blank = ModelRouter::resolve_model_route("deepseek-chat").unwrap();
+    assert_eq!(blank.base_url, "https://api.deepseek.com/v1");
+    std::env::remove_var("KYRO_DEEPSEEK_BASE_URL");
+
+    // --- Credential selection refuses to substitute another provider's key ---
+
+    // 1. NVIDIA: the vault service key is used directly.
+    let nvidia_route =
+        ModelRouter::resolve_model_route(kyro_lib::agent::router::DEFAULT_NEMOTRON_MODEL).unwrap();
+    let keys = kyro_lib::storage::ApiKeys {
+        nvidia: Some("nvault-key".to_string()),
+        telegram_bot_token: None,
+        telegram_chat_id: None,
+    };
+    let key = ModelRouter::select_api_key_for_route(&nvidia_route, &keys)
+        .expect("vault nvidia key is selected");
+    assert_eq!(key, "nvault-key");
+
+    // 2. NVIDIA without a usable vault key: hard error, never a substitute.
+    let empty_keys = kyro_lib::storage::ApiKeys::default();
+    let err = ModelRouter::select_api_key_for_route(&nvidia_route, &empty_keys)
+        .expect_err("missing nvidia key must fail the request before any HTTP call");
+    assert!(err.contains("will not route it to a different provider"));
+    assert!(
+        err.contains("KYRO_NVIDIA_API_KEY"),
+        "the error names the exact remedy: {}",
+        err
+    );
+
+    // 3. First-party provider with an env key.
+    let openai_route = ModelRouter::resolve_model_route("gpt-4o").unwrap();
+    std::env::set_var("KYRO_OPENAI_API_KEY", "sk-env-openai");
+    let env_key = ModelRouter::select_api_key_for_route(&openai_route, &empty_keys)
+        .expect("env key satisfies the openai route");
+    assert_eq!(env_key, "sk-env-openai");
+    std::env::remove_var("KYRO_OPENAI_API_KEY");
+
+    // 4. First-party provider without any key: descriptive failure.
+    let err = ModelRouter::select_api_key_for_route(&openai_route, &empty_keys)
+        .expect_err("an openai route without a key must fail");
+    assert!(
+        err.contains("No API key configured for provider 'openai'"),
+        "{}",
+        err
+    );
+
+    // 5. Ollama needs no credential at all.
+    let ollama_route = ModelRouter::resolve_model_route("mistral-7b-ollama").unwrap();
+    assert!(ModelRouter::select_api_key_for_route(&ollama_route, &empty_keys).is_ok());
+}
+
+#[test]
+fn agent_loop_router_fallback_uses_the_resolved_route_for_the_vision_model() {
+    // Sanity at the boundary used by loop_engine's vision fallback: a
+    // NIM-hosted vision model resolves to NVIDIA with the NVIDIA credential
+    // reference, never to some first-party endpoint without one.
+    use kyro_lib::agent::router::{ModelRouter, NVIDIA_BASE_URL};
+    let route =
+        ModelRouter::resolve_model_route(kyro_lib::agent::router::DEFAULT_VISION_MODEL).unwrap();
+    assert_eq!(route.provider, "nvidia");
+    assert_eq!(route.base_url, NVIDIA_BASE_URL);
+    assert_eq!(route.credential_key.as_deref(), Some("KYRO_NVIDIA_API_KEY"));
 }

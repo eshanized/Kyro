@@ -1003,32 +1003,86 @@ pub async fn cancel_agent_run(state: State<'_, AppState>, run_id: String) -> Res
         return Err("Run ID cannot be empty".to_string());
     }
 
-    let run = state
-        .db
-        .get_run(trimmed)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Run '{}' does not exist", trimmed))?;
+    let run_lookup = state.db.get_run(trimmed);
+
+    // Mark the run cancelled in the engine *before* consulting the durable
+    // record. This ordering closes the setup window: when a cancellation
+    // arrives after the frontend announced a run but before
+    // `run_agent_turn` has inserted the row (or registered the token), the
+    // retention of the cancellation in the engine's `cancelled_runs` set
+    // makes the eventual token pre-cancelled by `register_run`, and the
+    // post-registration abort check in `run_agent_turn` turns it into a
+    // truthful `cancelled` outcome instead of a silently executed run.
+    let engine_cancelled = state.engine.cancel_run(trimmed).await;
+
+    let run = match run_lookup {
+        Ok(Some(run)) => run,
+        // A run record that does not exist is not necessarily a bogus ID: it
+        // may still be inside the pre-persistence setup phase of
+        // `run_agent_turn`. The engine mark above already guarantees the
+        // cancellation is retained; report the unknown-record case honestly.
+        Ok(None) => {
+            if engine_cancelled {
+                // `engine.cancel_run` returns true both for a live token and
+                // for an unknown run; distinguish genuinely live
+                // cancellations from meaningless ones so callers can rely on
+                // the verdict.
+                if state.engine.is_run_cancelled(trimmed).await {
+                    return Err(format!(
+                        "Run '{}' is still being created; cancellation was registered and will abort its first execution step",
+                        trimmed
+                    ));
+                }
+            }
+            return Err(format!("Run '{}' does not exist", trimmed));
+        }
+        Err(e) => {
+            // A policy/state database failure must not be reported as a
+            // successful cancellation: the caller cannot know whether the run
+            // was stopped. Fail closed with the concrete error.
+            return Err(format!(
+                "Cancellation failed: run state could not be read: {}",
+                e
+            ));
+        }
+    };
 
     // If run has already reached terminal state, do not overwrite or falsely report cancelling active run
     if matches!(
         run.status.as_str(),
-        "succeeded" | "failed" | "cancelled" | "completed"
+        "succeeded" | "failed" | "cancelled" | "completed" | "interrupted"
     ) {
         return Ok(false);
     }
 
-    // Always mark run cancelled in the engine so even if engine.run_step hasn't started yet,
-    // or is between registration steps, it will abort immediately.
-    let _ = state.engine.cancel_run(trimmed).await;
+    // Atomic, race-safe cancellation: the repository transition only applies
+    // while the run is still active, so it can never overwrite a completion
+    // that lands concurrently, and no later stale completion can overwrite
+    // this terminal state (both directions are guarded by the CAS transition
+    // table in `Database::update_run_status`).
+    let cancelled_in_db = state
+        .db
+        .cancel_run_if_active(trimmed, "Cancelled by user request")
+        .map_err(|e| {
+            format!(
+                "Cancellation failed: run status could not be persisted: {}",
+                e
+            )
+        })?;
 
-    let now = chrono::Utc::now().timestamp_millis();
-    let _ = state.db.update_run_status(
-        trimmed,
-        "cancelled",
-        None,
-        Some(now),
-        Some("Cancelled by user request"),
-    );
+    if !cancelled_in_db {
+        // The run reached a terminal state between the read above and the CAS
+        // write. Re-read the authoritative status and report the truth.
+        let final_status = state
+            .db
+            .get_run(trimmed)
+            .ok()
+            .flatten()
+            .map(|r| r.status)
+            .unwrap_or_default();
+        return Ok(matches!(final_status.as_str(), "cancelled"));
+    }
+
     Ok(true)
 }
 
@@ -1047,12 +1101,21 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
     _auto_approve: Option<bool>, // Deprecated convenience flag, governance policy is authoritative
 ) -> Result<String, String> {
     let keys = state.vault.get_all_keys()?;
-    let api_key = keys.nvidia.ok_or_else(|| {
-        "NVIDIA API Key not configured. Please add your key in Kyro Settings.".to_string()
-    })?;
 
     let effective_run_id = run_id.unwrap_or_else(|| format!("run_{}", uuid::Uuid::new_v4()));
     let selected_model = model.unwrap_or_else(|| DEFAULT_NEMOTRON_MODEL.to_string());
+
+    // Authoritative provider resolution: bind the selected model to its
+    // provider, endpoint and credential BEFORE any network work. An absent
+    // credential for the resolved provider fails here instead of silently
+    // routing the request through another provider's endpoint/key.
+    let model_route = crate::agent::router::ModelRouter::resolve_model_route(&selected_model)?;
+    let api_key = crate::agent::router::ModelRouter::select_api_key_for_route(&model_route, &keys)?;
+    // The whole lifecycle of this run uses the resolved route family; the
+    // concrete endpoint is handed to the engine through registered context so
+    // that every completion call agrees about where to send the request.
+    let resolved_base_url = model_route.base_url.clone();
+
     // Deprecated client-supplied prompt: the engine composes the authoritative
     // system prompt from the agent profile (Stage C). The argument is kept for
     // wire compatibility with older frontends.
@@ -1103,12 +1166,20 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .map(std::path::PathBuf::from)
         .and_then(|p| p.canonicalize().ok());
 
-    let task_grant = Some(crate::governance::TaskAuthorizationGrant::new(
+    // Bounded, task-scoped autonomy: the grant only carries the operation
+    // classes that the trusted backend task classification justifies. A
+    // read-only question therefore cannot autonomously write, organize files
+    // or execute verification commands merely because those capabilities are
+    // "commonly useful". Scope expansion happens exclusively inside this
+    // trusted backend code — model-generated arguments can never alter it.
+    let mut task_grant = crate::governance::TaskAuthorizationGrant::new(
         effective_run_id.clone(),
         ws_root,
         auth_folders,
         autonomy_mode,
-    ));
+    );
+    task_grant.scope_operations_to_task(&task_prompt);
+    let task_grant = Some(task_grant);
 
     let run_snapshot = RunConfigSnapshot {
         profile: resolved_profile.clone(),
@@ -1161,6 +1232,22 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         config_json: Some(cfg_value.to_string()),
         parent_run_id: None,
     };
+
+    // Claim the cancellation channel BEFORE the durable record is created.
+    //
+    // The engine keeps a per-run `cancelled_runs` mark; registering first means
+    // a cancellation requested during lengthy setup (vault, registry routing,
+    // profile resolution) is retained and applied the moment the token is
+    // bound — `register_run` pre-cancels tokens for runs that were marked
+    // cancelled while they were not yet registered. Without this ordering an
+    // early cancellation could be silently lost and the run would race on
+    // un-cancellable.
+    let run_cancel_token = crate::agent::cancellation::CancellationToken::new();
+    state
+        .engine
+        .register_run_token(&effective_run_id, run_cancel_token)
+        .await;
+
     state
         .db
         .create_run(&run_record)
@@ -1188,7 +1275,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
             &effective_run_id,
             &selected_model,
             &api_key,
-            None,
+            Some(resolved_base_url.as_str()),
             &sys,
             history,
             state.db.clone(),
@@ -1228,28 +1315,74 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
     }
     match result {
         Ok(ref reply) => {
-            let _ = state.db.update_run_status(
+            // Compare-and-set finalization: a stale completion can never
+            // overwrite a terminal state that a racing cancellation already
+            // confirmed. If the CAS is refused, the run's actual repository
+            // state wins and the caller must see the truthful outcome.
+            if let Err(e) = state.db.update_run_status(
                 &effective_run_id,
                 "succeeded",
                 None,
                 Some(completed_time),
                 None,
-            );
+            ) {
+                let db_status = state
+                    .db
+                    .get_run(&effective_run_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.status)
+                    .unwrap_or_default();
+                if matches!(db_status.as_str(), "cancelled" | "interrupted")
+                    || state.engine.is_run_cancelled(&effective_run_id).await
+                {
+                    return Err("Run was cancelled by user request".to_string());
+                }
+                // A failed persistence operation must never be reported as
+                // successful completion.
+                return Err(format!(
+                    "Run finished but its final status could not be persisted: {}",
+                    e
+                ));
+            }
             Ok(reply.clone())
         }
         Err(ref err) => {
+            // Cancellation errors observed through the engine keep the
+            // authoritative `cancelled` outcome instead of mislabeling them
+            // as a generic failure.
             let status = if err.contains("cancelled") {
                 "cancelled"
             } else {
                 "failed"
             };
-            let _ = state.db.update_run_status(
+            if let Err(e) = state.db.update_run_status(
                 &effective_run_id,
                 status,
                 None,
                 Some(completed_time),
                 Some(err),
-            );
+            ) {
+                let db_status = state
+                    .db
+                    .get_run(&effective_run_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.status)
+                    .unwrap_or_default();
+                if matches!(
+                    db_status.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "completed" | "interrupted"
+                ) {
+                    // The run already reached a confirmed terminal state; that
+                    // state stays authoritative.
+                } else {
+                    return Err(format!(
+                        "Run failed ({}) and its final status could not be persisted: {}",
+                        err, e
+                    ));
+                }
+            }
             Err(err.clone())
         }
     }
@@ -2131,6 +2264,110 @@ pub async fn compare_documents(
     Ok(res)
 }
 
+/// A text extraction performed on an *uploaded* attachment through Kyro's
+/// production document parser (`DocumentAssistant`), so binary content is
+/// never silently coerced to UTF-8 by the client (Bug 19).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedAttachmentText {
+    pub text: String,
+    pub format: String,
+    pub page_count: Option<usize>,
+    pub file_name: String,
+    pub word_count: usize,
+    pub character_count: usize,
+    /// `true` when the extracted text was cut short by a safety cap.
+    pub truncated: bool,
+}
+
+/// Backed by the same parser the Document Assistant uses for local files:
+/// searchable PDFs are parsed by the real PDF text extractor; every other
+/// supported format must decode as valid UTF-8 without binary markers.
+#[tauri::command]
+pub async fn extract_attachment_text(
+    file_name: String,
+    base64_bytes: String,
+) -> Result<ExtractedAttachmentText, String> {
+    use base64::Engine;
+
+    /// Hard cap on accepted attachment payloads (20 MiB).
+    const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+    /// Cap on returned text so one huge document cannot wedge the UI.
+    const MAX_EXTRACTED_CHARS: usize = 1_000_000;
+
+    let trimmed_name = file_name.trim();
+    if trimmed_name.is_empty()
+        || trimmed_name.contains("..")
+        || trimmed_name.contains('/')
+        || trimmed_name.contains('\\')
+    {
+        return Err("Invalid attachment file name".to_string());
+    }
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_bytes.trim())
+        .map_err(|e| format!("Attachment payload could not be decoded: {}", e))?;
+    if bytes.is_empty() {
+        return Err("Attachment is empty; there is nothing to extract".to_string());
+    }
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Attachment exceeds the maximum supported size of {} MiB",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let format = DocumentAssistant::detect_format(Path::new(trimmed_name));
+    if format == "unsupported" {
+        return Err(format!(
+            "Unsupported attachment format '{}'. Kyro accepts images, text and code files, and searchable PDFs.",
+            trimmed_name.rsplit('.').next().unwrap_or(trimmed_name)
+        ));
+    }
+
+    let (raw_text, page_count) = if format == "pdf" {
+        // The real PDF parser also validates the %PDF- header, so a PDF
+        // extension with non-PDF content fails here instead of being pasted.
+        DocumentAssistant::extract_pdf_text(&bytes)?
+    } else {
+        let decoded = String::from_utf8(bytes).map_err(|_| {
+            "Attachment is not valid UTF-8 text; binary content cannot be attached as text"
+        })?;
+        if decoded.contains('\0') {
+            return Err(
+                "Attachment contains binary data and cannot be inserted as text".to_string(),
+            );
+        }
+        (decoded, None)
+    };
+
+    if raw_text.trim().is_empty() {
+        return Err("Attachment contains no extractable text".to_string());
+    }
+
+    let (text, truncated) = if raw_text.chars().count() > MAX_EXTRACTED_CHARS {
+        let cut: String = raw_text.chars().take(MAX_EXTRACTED_CHARS).collect();
+        (
+            format!(
+                "{}\n\n[… extracted text truncated at {} characters]",
+                cut, MAX_EXTRACTED_CHARS
+            ),
+            true,
+        )
+    } else {
+        (raw_text, false)
+    };
+
+    Ok(ExtractedAttachmentText {
+        word_count: text.split_whitespace().count(),
+        character_count: text.chars().count(),
+        text,
+        format: format.to_string(),
+        page_count,
+        file_name: trimmed_name.to_string(),
+        truncated,
+    })
+}
+
 #[tauri::command]
 pub async fn explain_screen_capture(
     base64_png: String,
@@ -2139,9 +2376,30 @@ pub async fn explain_screen_capture(
     state: tauri::State<'_, AppState>,
 ) -> Result<VisualAnalysisResult, String> {
     let keys = state.vault.get_all_keys().unwrap_or_default();
-    let api_key = keys.nvidia.unwrap_or_default();
     let router = Arc::new(ModelRouter::new());
-    let analyzer = VisualAnalyzer::new(router, api_key, None);
+    // Bind the analyzer's endpoint and credential to the vision model that
+    // will actually run, instead of assuming the NVIDIA route regardless of
+    // which model was configured (Bug 15). An unavailable credential yields
+    // the analyzer's honest "not analyzed" result instead of a misrouted
+    // request.
+    let vision_model = VisualAnalyzer::new(router.clone(), String::new(), None)
+        .resolve_vision_model(model.as_deref().unwrap_or(""));
+    let (api_key, base_url) = match vision_model
+        .and_then(|m| ModelRouter::resolve_model_route(&m).ok().map(|r| (m, r)))
+    {
+        Some((_, route)) => match ModelRouter::select_api_key_for_route(&route, &keys) {
+            Ok(k) => (k, Some(route.base_url)),
+            Err(reason) => {
+                log::warn!(
+                    "[explain_screen_capture] vision model credentials unavailable: {}",
+                    reason
+                );
+                (String::new(), Some(route.base_url))
+            }
+        },
+        None => (String::new(), None),
+    };
+    let analyzer = VisualAnalyzer::new(router, api_key, base_url);
     let ctx = VisualAnalysisContext {
         route: "desktop_screen".to_string(),
         preview_url: "screen://current".to_string(),

@@ -75,6 +75,22 @@ impl DockerSandbox {
     }
 
     pub fn run_in_sandbox(image: &str, command: &str) -> Result<ContainerExecResult, String> {
+        Self::run_in_sandbox_in_dir(image, command, None)
+    }
+
+    /// Same as [`Self::run_in_sandbox`] with an optional bind-mounted working
+    /// directory.
+    ///
+    /// The directory is bind-mounted into the container as its working
+    /// directory so repository-controlled verification (builds, test suites,
+    /// package scripts) can run inside the network-isolated, capability-dropped
+    /// container while staying confined to the same filesystem scope the task
+    /// grant authorizes.
+    pub fn run_in_sandbox_in_dir(
+        image: &str,
+        command: &str,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<ContainerExecResult, String> {
         let probe = Self::probe();
         if !probe.available {
             return Err("Container sandbox engine is not available on this system. Execution failed closed.".to_string());
@@ -89,23 +105,34 @@ impl DockerSandbox {
         }
 
         let binary = &probe.engine;
-        let output = Command::new(binary)
-            .args([
-                "run",
-                "--rm",
-                "--network=none", // Isolated network by default for security
-                "--memory=512m",
-                "--cpus=1.0",
-                "--pids-limit=100",
-                "--security-opt=no-new-privileges",
-                "--cap-drop=ALL",
-                "--read-only",
-                "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
-                normalized_image,
-                "sh",
-                "-c",
-                command,
-            ])
+        let mut docker = Command::new(binary);
+        docker.args([
+            "run",
+            "--rm",
+            "--network=none", // Isolated network by default for security
+            "--memory=512m",
+            "--cpus=1.0",
+            "--pids-limit=100",
+            "--security-opt=no-new-privileges",
+            "--cap-drop=ALL",
+            "--read-only",
+            "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
+        ]);
+        if let Some(workspace) = workspace {
+            if !workspace.is_absolute() || !workspace.is_dir() {
+                return Err(format!(
+                    "Sandbox workspace '{}' is not an absolute directory path",
+                    workspace.display()
+                ));
+            }
+            docker.arg("--volume");
+            docker.arg(format!("{}:/workspace", workspace.display()));
+            docker.arg("-w");
+            docker.arg("/workspace");
+        }
+        docker.arg(normalized_image).args(["sh", "-c", command]);
+
+        let output = docker
             .output()
             .map_err(|e| format!("Failed to execute in {}: {}", binary, e))?;
 

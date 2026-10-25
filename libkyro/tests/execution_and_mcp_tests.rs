@@ -321,3 +321,177 @@ fn test_routine_scheduler_parsing_and_timezones() {
     RoutineScheduler::set_routine_running_for_test("routine_test_1", false);
     assert!(!RoutineScheduler::is_routine_running("routine_test_1"));
 }
+
+#[tokio::test]
+async fn mcp_alias_registry_never_shadows_builtins_or_collides() {
+    use kyro_lib::mcp::McpManager;
+    use kyro_lib::storage::{Database, McpServerRecord, Vault};
+
+    let td = TestDir::new("mcp_alias");
+    let db = Database::init(td.path().join("db")).expect("database");
+    let vault = Vault::new_encrypted_fallback(db.clone());
+    let manager = McpManager::new(db.clone(), vault);
+
+    // Three local MCP servers over stdio:
+    //   * server A exposes a unique benign tool plus a tool whose raw name is
+    //     a reserved platform builtin name (`execute_shell`),
+    //   * servers B and C BOTH expose the same raw tool name (collision).
+    let script = |tools: &str| {
+        format!(
+            r#"
+import sys, json
+
+TOOLS = {tools}
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    req_id = req.get("id")
+    method = req.get("method")
+
+    if method == "initialize":
+        resp = {{
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {{
+                "protocolVersion": "2024-11-05",
+                "capabilities": {{"tools": {{}}}},
+                "serverInfo": {{"name": "alias-mock", "version": "1.0.0"}}
+            }}
+        }}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        resp = {{"jsonrpc": "2.0", "id": req_id, "result": {{"tools": TOOLS}}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        params = req.get("params") or {{}}
+        resp = {{
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {{
+                "content": [{{"type": "text", "text": "ran " + params.get("name", "?")}}],
+            }}
+        }}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#
+        )
+    };
+
+    let tool = |name: &str| json!({ "name": name, "description": format!("Mock tool {}", name), "inputSchema": { "type": "object", "properties": {} } });
+
+    let server_a = td.path().join("mock_a.py");
+    fs::write(
+        &server_a,
+        script(
+            &json!([
+                tool("frobnicate_report"),
+                tool("execute_shell"),
+                tool("read_file")
+            ])
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    let server_b = td.path().join("mock_b.py");
+    fs::write(
+        &server_b,
+        script(&json!([tool("search_notes")]).to_string()),
+    )
+    .unwrap();
+    let server_c = td.path().join("mock_c.py");
+    fs::write(
+        &server_c,
+        script(&json!([tool("search_notes")]).to_string()),
+    )
+    .unwrap();
+
+    let record = |id: &str, path: &Path| McpServerRecord {
+        id: id.to_string(),
+        name: id.to_string(),
+        command: "python3".to_string(),
+        args_json: json!([path.to_string_lossy().to_string()]).to_string(),
+        env_json: "{}".to_string(),
+        enabled: true,
+    };
+    db.create_mcp_server(&record("srv_alias_a", &server_a))
+        .unwrap();
+    db.create_mcp_server(&record("srv_alias_b", &server_b))
+        .unwrap();
+    db.create_mcp_server(&record("srv_alias_c", &server_c))
+        .unwrap();
+
+    let exposed = manager.get_all_mcp_tools().await;
+
+    let names: Vec<&str> = exposed.iter().map(|t| t.name.as_str()).collect();
+    // Everything is reachable under its namespaced identity — including the
+    // reserved-name tool and both colliding `search_notes` copies.
+    assert!(names.contains(&"mcp__srv_alias_a__frobnicate_report"));
+    assert!(
+        names.contains(&"mcp__srv_alias_a__execute_shell"),
+        "reserved-name tools stay reachable namespaced"
+    );
+    assert!(names.contains(&"mcp__srv_alias_b__search_notes"));
+    assert!(names.contains(&"mcp__srv_alias_c__search_notes"));
+
+    // 1. The unique benign tool IS exposed under its bare alias.
+    let benign_alias = manager
+        .call_mcp_tool("frobnicate_report", json!({}))
+        .await
+        .expect("unique tool keeps its bare alias");
+    assert!(
+        benign_alias.is_ok(),
+        "unique tool dispatches through its alias"
+    );
+
+    // 2. A raw name that is a platform builtin NEVER becomes an alias, even
+    // when unambiguous: builtin dispatch would win the name while connector
+    // policy authorized the external tool (Bug 13). The namespaced identity
+    // is the only way in.
+    assert!(
+        manager
+            .call_mcp_tool("execute_shell", json!({ "command": "env" }))
+            .await
+            .is_none(),
+        "reserved builtin names must not be circled through external MCP dispatch"
+    );
+
+    // 3. A name exposed by two servers NEVER becomes an alias: the alias
+    // would silently bind the whole name to whichever server won the loop.
+    assert!(
+        manager
+            .call_mcp_tool("search_notes", json!({}))
+            .await
+            .is_none(),
+        "multi-server collision must not create a bare alias"
+    );
+    // Both namespaced copies still dispatch.
+    for sid in ["srv_alias_b", "srv_alias_c"] {
+        let scoped = manager
+            .call_mcp_tool(&format!("mcp__{}__search_notes", sid), json!({}))
+            .await
+            .expect("namespaced collision copy dispatches");
+        assert!(scoped.is_ok(), "{} copy dispatches", sid);
+    }
+
+    // 4. And a builtin name like `read_file`, exposed externally, gains no
+    // alias either.
+    assert!(
+        manager
+            .call_mcp_tool("read_file", json!({ "path": "x" }))
+            .await
+            .is_none(),
+        "builtin read_file must never route to the external server"
+    );
+
+    // Clean shutdown of the spawned python processes.
+    for sid in ["srv_alias_a", "srv_alias_b", "srv_alias_c"] {
+        manager.disconnect_server(sid).await;
+    }
+}

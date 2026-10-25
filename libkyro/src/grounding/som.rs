@@ -53,6 +53,18 @@ pub enum MarkTarget {
     },
 }
 
+/// The trusted, self-produced semantics of a grounded mark, used for risk
+/// classification of mark-targeted clicks (Bug 10).
+///
+/// * `label` — the semantic name the grounding pass or accessibility tree
+///   attached to the element; empty means the mark is a nameless shape.
+/// * `combined` — `role` and `label` joined, the widest trusted descriptor.
+#[derive(Debug, Clone)]
+pub struct MarkSemantics {
+    pub label: String,
+    pub combined: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarkMeasurements {
     /// Fraction of the bounding box actually covered by the detected region.
@@ -357,6 +369,28 @@ Call capture_grounded_screen again before clicking.",
         }
 
         Ok((mark, session.clone()))
+    }
+
+    /// Resolves the trusted semantic label for a mark ID from the active
+    /// grounding session.
+    ///
+    /// Risk classification for `click_mark` consumes this label instead of
+    /// trusting model-supplied descriptions: the label was produced by Kyro's
+    /// own grounding pass (or the browser accessibility tree), so it is the
+    /// only authority on what the mark actually points at.
+    /// Returns `None` when no grounded session is active or the mark does not
+    /// exist, which callers must treat as "cannot enact anything".
+    pub fn resolve_mark_semantics(id: usize) -> Option<MarkSemantics> {
+        let guard = GROUNDING.lock().unwrap();
+        guard.as_ref().and_then(|session| {
+            session.marks.iter().find(|m| m.id == id).map(|m| {
+                let combined = format!("{} {}", m.role, m.label);
+                MarkSemantics {
+                    label: m.label.trim().to_string(),
+                    combined: combined.trim().to_string(),
+                }
+            })
+        })
     }
 
     /// Compares a stored snapshot against the current screen and returns the

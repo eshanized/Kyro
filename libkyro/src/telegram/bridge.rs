@@ -1,5 +1,5 @@
 use crate::agent::loop_engine::AgentLoopEngine;
-use crate::agent::router::{ChatMessage, MessageContent, DEFAULT_NEMOTRON_MODEL};
+use crate::agent::router::{ChatMessage, MessageContent, ModelRouter, DEFAULT_NEMOTRON_MODEL};
 use crate::computer_use::{capture_screen, InputController};
 use crate::governance::TakeoverController;
 use crate::mcp::McpManager;
@@ -319,12 +319,18 @@ impl TelegramBridge {
                     tool_call_id: None,
                 }];
                 let sys = "You are Kyro, executing an authorized mobile task received via Telegram. Execute the objective step by step safely.";
+                // Bind the endpoint explicitly via the authoritative route
+                // resolver instead of relying on the implicit NVIDIA fallback
+                // inside the router (Bug 15).
+                let telegram_route = ModelRouter::resolve_model_route(DEFAULT_NEMOTRON_MODEL)
+                    .map(|r| r.base_url)
+                    .unwrap_or_else(|_| crate::agent::router::NVIDIA_BASE_URL.to_string());
                 let result = engine_cloned
                     .run_step(
                         &run_id_cloned,
                         DEFAULT_NEMOTRON_MODEL,
                         &api_key,
-                        None,
+                        Some(&telegram_route),
                         sys,
                         history,
                         db_cloned.clone(),

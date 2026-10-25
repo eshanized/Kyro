@@ -128,6 +128,63 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?:
   };
 }
 
+/**
+ * Name/command-based detection of test-or-verification tools. Mirrors the
+ * tool namespace rules of `evaluateVerificationOutcome` so the plan reducer
+ * can classify results BEFORE asking the evaluator for truthful evidence
+ * (Bug 6). `execute_shell` counts only when its command actually runs tests.
+ */
+export function isVerificationToolName(name: string, commandArg?: string): boolean {
+  const toolName = (name || "").toLowerCase();
+  return (
+    toolName === "run_tests" ||
+    toolName === "run_test" ||
+    toolName === "test" ||
+    toolName === "execute_tests" ||
+    toolName === "verify_checkpoint" ||
+    toolName === "check_verification" ||
+    toolName.startsWith("verify_") ||
+    toolName.startsWith("validate_") ||
+    (toolName === "execute_shell" &&
+      Boolean(
+        commandArg &&
+          /\b(test|pytest|npm\s+test|cargo\s+test|vitest|jest|make\s+test|make\s+verify)\b/i.test(
+            commandArg
+          )
+      ))
+  );
+}
+
+/**
+ * Inspection/tools that only gather context — their success can complete the
+ * inspection step but never the execution step (Bug 6).
+ */
+export function isInspectionToolName(name: string): boolean {
+  const n = (name || "").toLowerCase();
+  if (!n || isVerificationToolName(n)) return false;
+  const actionMarkers = [
+    "execute_", "start_", "stop_", "close_", "delete_", "send_", "write_",
+    "create_", "cancel_", "rollback", "organize_files_execute", "launch_",
+    "install_", "approve_", "toggle_", "restore_", "reset_", "update_", "set_",
+  ];
+  if (actionMarkers.some((p) => n.startsWith(p) || n.includes(p))) return false;
+  return (
+    n === "inspect_project" ||
+    n.startsWith("inspect_") ||
+    n.startsWith("read_") ||
+    n.startsWith("list_") ||
+    n.startsWith("capture_") ||
+    n.startsWith("search_") ||
+    n.startsWith("find_") ||
+    n.startsWith("get_") ||
+    n.startsWith("timeline_") ||
+    n.startsWith("explain_") ||
+    n === "browser_open" ||
+    n.endsWith("_preview") ||
+    n.endsWith("_plan")
+  );
+}
+
 export interface TaskProgressProps {
   plan: TaskPlan;
   activeConversationId?: string | null;

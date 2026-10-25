@@ -82,6 +82,142 @@ impl TaskAuthorizationGrant {
             && risk <= self.max_risk
     }
 
+    /// Restricts the operation classes of this grant to what the task prompt
+    /// actually justifies.
+    ///
+    /// This is trusted backend classification (never model-controlled): it is
+    /// called exclusively by `run_agent_turn` before the grant is persisted.
+    /// Bounded autonomy contract:
+    /// - every task keeps `FileRead` + `SafeCommand` (inspection and safe,
+    ///   policy-allowlisted read-only commands),
+    /// - file *writes* require write/modify/Edit verbs,
+    /// - file organization additionally requires organization verbs,
+    /// - local verification (build/test execution) requires dev-workflow verbs.
+    ///
+    /// A capability class that was not granted makes the corresponding tool
+    /// follow the regular targeted approval flow instead of running
+    /// autonomously — the approval path, not a blanket lockout.
+    pub fn scope_operations_to_task(&mut self, task_prompt: &str) {
+        const VERIFICATION_TERMS: &[&str] = &[
+            "run",
+            "test",
+            "tests",
+            "build",
+            "compile",
+            "lint",
+            "verify",
+            "execute",
+            "cargo",
+            "npm",
+            "pnpm",
+            "yarn",
+            "pip",
+            "pytest",
+            "make",
+            "gradle",
+            "maven",
+            "benchmark",
+        ];
+        const WRITE_TERMS: &[&str] = &[
+            "write",
+            "edit",
+            "update",
+            "modify",
+            "fix",
+            "create",
+            "delete",
+            "remove",
+            "refactor",
+            "implement",
+            "rename",
+            "save",
+            "append",
+            "insert",
+            "replace",
+            "generate",
+            "add",
+            "apply",
+            "patch",
+            "commit",
+            "make",
+        ];
+        const ORGANIZE_TERMS: &[&str] = &[
+            "organize",
+            "organise",
+            "reorganize",
+            "reorganise",
+            "tidy",
+            "declutter",
+            "sort",
+            "clean",
+            "archive",
+            "deduplicate",
+            "dedupe",
+            "move",
+        ];
+
+        let lower = task_prompt.to_lowercase();
+        let mut ops = vec![RoutineOpClass::FileRead, RoutineOpClass::SafeCommand];
+        if contains_standalone_word(&lower, VERIFICATION_TERMS) {
+            ops.push(RoutineOpClass::LocalVerification);
+        }
+        if contains_standalone_word(&lower, WRITE_TERMS)
+            || contains_standalone_word(&lower, ORGANIZE_TERMS)
+        {
+            ops.push(RoutineOpClass::FileWrite);
+        }
+        if contains_standalone_word(&lower, ORGANIZE_TERMS) {
+            ops.push(RoutineOpClass::FileOrganize);
+        }
+        self.allowed_operations = ops;
+    }
+
+    /// Checks whether `path` is within the grant's authorized folders only.
+    ///
+    /// This is the scope decision used by file-organization gating: it must
+    /// agree exactly with what the organizer can actually execute
+    /// (`check_path_authorized_in_folders`), so a workspace root that was not
+    /// explicitly authorized as a folder cannot be reported as verified-then-
+    /// rejected at execution time.
+    pub fn folders_in_scope(&self, path: &Path) -> bool {
+        let resolved = if path.is_relative() {
+            if let Some(ref ws) = self.workspace_root {
+                ws.join(path)
+            } else {
+                path.to_path_buf()
+            }
+        } else {
+            path.to_path_buf()
+        };
+        let candidate = resolved.canonicalize().unwrap_or(resolved);
+
+        self.authorized_folders.iter().any(|folder| {
+            candidate.starts_with(folder.canonicalize().unwrap_or_else(|_| folder.clone()))
+        })
+    }
+
+    /// Every canonical root this context may touch: the run's effective
+    /// workspace (first resolution root for relative paths) plus the
+    /// explicitly authorized folders.
+    ///
+    /// Authorization and execution both source their scope from this single
+    /// function so the two can never disagree about what an approved path is
+    /// (Bug 14 invariant).
+    pub fn execution_roots(ctx: &ExecutionContext) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(ref ws) = ctx.workspace_root {
+            roots.push(ws.clone());
+        }
+        if let Some(ref grant) = ctx.task_grant {
+            for f in &grant.authorized_folders {
+                if !roots.contains(f) {
+                    roots.push(f.clone());
+                }
+            }
+        }
+        roots
+    }
+
     pub fn path_in_scope(&self, path: &Path) -> bool {
         let resolved = if path.is_relative() {
             if let Some(ref ws) = self.workspace_root {
@@ -149,6 +285,151 @@ impl ExecutionContext {
         self.task_grant = Some(grant);
         self
     }
+}
+
+/// Consequential-control vocabulary for browser/desktop activation checks.
+///
+/// Used with [`contains_standalone_word`]: a hyphenated or punctuation-
+/// delimited occurrence counts (`.delete-btn`, `data-testid=submit-button`),
+/// a coincidental substring inside a longer word does not (`latest`, `website`).
+const CONSEQUENTIAL_CONTROL_TERMS: &[&str] = &[
+    "delete",
+    "remove",
+    "purchase",
+    "buy",
+    "pay",
+    "checkout",
+    "send",
+    "publish",
+    "deploy",
+    "confirm",
+    "submit",
+    "transfer",
+    "upgrade",
+    "subscribe",
+    "invite",
+    "sign out",
+    "log out",
+    "logout",
+];
+
+/// `true` when `text` contains a consequential control term as a standalone
+/// word. Public so the execution boundary (loop engine dispatch) shares the
+/// exact same classification as the authorization engine.
+pub fn is_consequential_control_text(text: &str) -> bool {
+    contains_standalone_word(&text.to_lowercase(), CONSEQUENTIAL_CONTROL_TERMS)
+}
+
+/// Word-boundary aware keyword check.
+///
+/// Matches `term` only when it appears as a standalone word: neither neighbour
+/// may be alphanumeric or `_` (so `latest` never matches `test`, `mailbox`
+/// never matches `move`, `remove` never matches `move`), while hyphenated
+/// forms (e.g. `re-test`) do count as separate words.
+fn contains_standalone_word(haystack_lower: &str, terms: &[&str]) -> bool {
+    for term in terms {
+        let mut from = 0usize;
+        while let Some(idx) = haystack_lower[from..].find(term) {
+            let abs = from + idx;
+            let end = abs + term.len();
+
+            let before_ok = haystack_lower[..abs]
+                .chars()
+                .next_back()
+                .map(|ch| !ch.is_alphanumeric() && ch != '_')
+                .unwrap_or(true);
+            let after_ok = haystack_lower[end..]
+                .chars()
+                .next()
+                .map(|ch| !ch.is_alphanumeric() && ch != '_')
+                .unwrap_or(true);
+
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
+/// Credential-bearing field vocabulary for browser fill checkpoints (Bug 10):
+/// a target resolved to a credential field is a human takeover checkpoint no
+/// matter what value the model claims it is typing.
+const CREDENTIAL_FIELD_TERMS: &[&str] = &[
+    "password",
+    "passwd",
+    "passwort",
+    "otp",
+    "one-time code",
+    "passcode",
+    "credit card",
+    "card number",
+    "cvv",
+    "cvc",
+    "security code",
+    "ssn",
+    "social security",
+    "api key",
+    "api-key",
+    "apikey",
+    "access token",
+    "secret",
+];
+
+/// Renders every locator the browser target argument shape can carry into a
+/// single classification surface.
+///
+/// The previous implementation only studied `name` and `text`, so a click or
+/// fill could be steered to a consequential control through `ref`, `css`,
+/// `test_id`, `nth` or coordinates without any risk analysis at all (Bug 10).
+/// Risk decisions now consider exactly the fields the production target
+/// resolver (`target_from_args` / `ElementTarget`) understands.
+fn browser_target_descriptor(args: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for field in [
+        "ref",
+        "element_ref",
+        "role",
+        "name",
+        "text",
+        "tag",
+        "test_id",
+        "testId",
+        "css",
+        "nth",
+    ] {
+        let item = &args[field];
+        if item.is_null() {
+            continue;
+        }
+        if let Some(s) = item.as_str() {
+            let s = s.trim();
+            if !s.is_empty() {
+                parts.push(format!("{}={}", field, s));
+            }
+        } else if let Some(n) = item.as_i64() {
+            parts.push(format!("{}={}", field, n));
+        } else if let Some(f) = item.as_f64() {
+            parts.push(format!("{}={}", field, f));
+        }
+    }
+    parts.join(" ")
+}
+
+/// `true` when at least one human-readable locator (role, accessible name,
+/// visible text, tag, test id or CSS selector) is present.
+fn has_resolvable_semantics(args: &serde_json::Value) -> bool {
+    ["role", "name", "text", "tag", "test_id", "testId", "css"]
+        .iter()
+        .any(|f| {
+            !args
+                .get(*f)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,23 +529,60 @@ impl AuthorizationEngine {
         "/etc/sudoers",
     ];
 
+    /// Resolves the canonical set of allowed roots. A root that cannot be
+    /// canonicalized is a configured-policy error and is propagated, never
+    /// silently ignored (fail-closed root resolution).
+    fn canonicalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+        roots
+            .iter()
+            .map(|r| {
+                r.canonicalize().map_err(|e| {
+                    format!(
+                        "Configured path root '{}' is invalid or inaccessible: {}",
+                        r.display(),
+                        e
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Root containment check against every allowed root.
+    fn path_within_roots(candidate: &Path, canonical_roots: &[PathBuf]) -> bool {
+        canonical_roots
+            .iter()
+            .any(|root| candidate.starts_with(root))
+    }
+
     /// Enforces rigorous filesystem boundary confinement for operations:
-    /// 1. Requires explicit workspace root policy.
-    /// 2. Canonicalizes paths and follows symlinks to ensure they reside strictly within workspace root.
+    /// 1. Requires explicitly approved roots (an empty root list denies).
+    /// 2. Canonicalizes paths and follows symlinks to ensure they reside strictly within an approved root.
     /// 3. Prevents parent directory traversal ('..') and unauthorized absolute paths.
     /// 4. Validates real destination for new files via deepest existing ancestor directory.
     /// 5. Strictly rejects access to prohibited system locations.
-    pub fn validate_path_confinement(
-        workspace_root: Option<&Path>,
+    ///
+    /// This is the single authoritative canonicalization used by BOTH the
+    /// authorization engine (to decide whether a path is in scope) and the
+    /// actual filesystem execution (to perform it), so an approved path can
+    /// never be rejected at execution time, and an unapproved path can never
+    /// reach the filesystem merely because a different subsystem used a
+    /// different definition of "allowed root".
+    pub fn validate_path_confinement_roots(
+        roots: &[PathBuf],
         raw_path: &str,
         op: FileOp,
     ) -> Result<PathBuf, String> {
-        let root = match workspace_root {
-            Some(r) => r,
-            None => {
-                return Err("Filesystem access denied: No workspace root configured for this execution context".to_string());
-            }
-        };
+        if roots.is_empty() {
+            return Err(
+                "Filesystem access denied: No workspace root configured for this execution context"
+                    .to_string(),
+            );
+        }
+        let canonical_roots = Self::canonicalize_roots(roots)?;
+
+        // Relative paths always resolve against the first root (the run's
+        // effective workspace) — the same resolution both sides use.
+        let primary_root = canonical_roots[0].clone();
 
         let trimmed = raw_path.trim();
         if trimmed.is_empty() {
@@ -274,14 +592,6 @@ impl AuthorizationEngine {
         if trimmed.contains('\0') {
             return Err("Filesystem path contains prohibited null byte".to_string());
         }
-
-        let canonical_root = root.canonicalize().map_err(|e| {
-            format!(
-                "Configured workspace root '{}' is invalid or inaccessible: {}",
-                root.display(),
-                e
-            )
-        })?;
 
         // 1. Prohibited sensitive paths check
         let lower = trimmed.to_lowercase();
@@ -300,7 +610,7 @@ impl AuthorizationEngine {
         let target = if input_path.is_absolute() {
             input_path.to_path_buf()
         } else {
-            canonical_root.join(input_path)
+            primary_root.join(input_path)
         };
 
         // 2. Traversal verification: resolve relative parent segments
@@ -317,8 +627,8 @@ impl AuthorizationEngine {
                     std::path::Component::ParentDir => {
                         if !resolved.pop() {
                             return Err(format!(
-                                "Directory traversal ('..') escapes workspace root '{}'",
-                                canonical_root.display()
+                                "Directory traversal ('..') escapes the approved roots '{}'",
+                                canonical_roots[0].display()
                             ));
                         }
                     }
@@ -326,10 +636,10 @@ impl AuthorizationEngine {
                 }
             }
 
-            if !resolved.starts_with(&canonical_root) {
+            if !Self::path_within_roots(&resolved, &canonical_roots) {
                 return Err(format!(
-                    "Directory traversal ('..') escapes workspace root '{}'",
-                    canonical_root.display()
+                    "Directory traversal ('..') escapes the approved roots '{}'",
+                    canonical_roots[0].display()
                 ));
             }
         }
@@ -344,11 +654,11 @@ impl AuthorizationEngine {
                 )
             })?;
 
-            if !canonical_target.starts_with(&canonical_root) {
+            if !Self::path_within_roots(&canonical_target, &canonical_roots) {
                 return Err(format!(
-                    "Security denial: path '{}' resolves outside approved workspace root '{}'",
+                    "Security denial: path '{}' resolves outside approved roots '{}'",
                     trimmed,
-                    canonical_root.display()
+                    canonical_roots[0].display()
                 ));
             }
 
@@ -389,11 +699,11 @@ impl AuthorizationEngine {
                 )
             })?;
 
-            if !canonical_ancestor.starts_with(&canonical_root) {
+            if !Self::path_within_roots(&canonical_ancestor, &canonical_roots) {
                 return Err(format!(
-                    "Security denial: destination '{}' resides outside approved workspace root '{}'",
+                    "Security denial: destination '{}' resides outside approved roots '{}'",
                     trimmed,
-                    canonical_root.display()
+                    canonical_roots[0].display()
                 ));
             }
 
@@ -414,6 +724,23 @@ impl AuthorizationEngine {
         }
     }
 
+    /// Enforces rigorous filesystem boundary confinement for operations:
+    /// 1. Requires explicit workspace root policy.
+    /// 2. Canonicalizes paths and follows symlinks to ensure they reside strictly within workspace root.
+    /// 3. Prevents parent directory traversal ('..') and unauthorized absolute paths.
+    /// 4. Validates real destination for new files via deepest existing ancestor directory.
+    /// 5. Strictly rejects access to prohibited system locations.
+    pub fn validate_path_confinement(
+        workspace_root: Option<&Path>,
+        raw_path: &str,
+        op: FileOp,
+    ) -> Result<PathBuf, String> {
+        let roots: Vec<PathBuf> = workspace_root
+            .map(|r| vec![r.to_path_buf()])
+            .unwrap_or_default();
+        Self::validate_path_confinement_roots(&roots, raw_path, op)
+    }
+
     /// Securely writes a file within an approved workspace root, hardening against
     /// symlink replacement, directory substitution, and race conditions between validation and write.
     pub fn secure_write_contained(
@@ -421,17 +748,22 @@ impl AuthorizationEngine {
         path_str: &str,
         content: &[u8],
     ) -> Result<PathBuf, String> {
-        let safe_path = Self::validate_path_confinement(workspace_root, path_str, FileOp::Write)?;
+        let roots: Vec<PathBuf> = workspace_root
+            .map(|r| vec![r.to_path_buf()])
+            .unwrap_or_default();
+        Self::secure_write_contained_roots(&roots, path_str, content)
+    }
 
-        let root = workspace_root
-            .ok_or_else(|| "Workspace root is required for contained file write".to_string())?;
-        let canonical_root = root.canonicalize().map_err(|e| {
-            format!(
-                "Failed to canonicalize workspace root '{}': {}",
-                root.display(),
-                e
-            )
-        })?;
+    /// Multi-root variant of [`Self::secure_write_contained`] used by the
+    /// production tool dispatcher: the exact same root set that produced the
+    /// authorization decision.
+    pub fn secure_write_contained_roots(
+        roots: &[PathBuf],
+        path_str: &str,
+        content: &[u8],
+    ) -> Result<PathBuf, String> {
+        let safe_path = Self::validate_path_confinement_roots(roots, path_str, FileOp::Write)?;
+        let canonical_roots = Self::canonicalize_roots(roots)?;
 
         // 1. Explicitly create parent directories and propagate any errors
         if let Some(parent) = safe_path.parent() {
@@ -454,11 +786,11 @@ impl AuthorizationEngine {
                 )
             })?;
 
-            if !canonical_parent.starts_with(&canonical_root) {
+            if !Self::path_within_roots(&canonical_parent, &canonical_roots) {
                 return Err(format!(
-                    "Security denial: parent directory '{}' escapes workspace root '{}' via symlink or substitution",
+                    "Security denial: parent directory '{}' escapes the approved roots '{}' via symlink or substitution",
                     canonical_parent.display(),
-                    canonical_root.display()
+                    canonical_roots[0].display()
                 ));
             }
 
@@ -476,7 +808,7 @@ impl AuthorizationEngine {
         // 3. Inspect existing destination to prevent symlink hijack attacks
         if let Ok(meta) = std::fs::symlink_metadata(&safe_path) {
             if meta.file_type().is_symlink() {
-                // If the target is a symlink, verify its target canonicalizes strictly inside canonical_root
+                // If the target is a symlink, verify its target canonicalizes strictly inside a root
                 let canonical_target = safe_path.canonicalize().map_err(|e| {
                     format!(
                         "Security denial: destination symlink '{}' cannot be resolved: {}",
@@ -484,11 +816,11 @@ impl AuthorizationEngine {
                         e
                     )
                 })?;
-                if !canonical_target.starts_with(&canonical_root) {
+                if !Self::path_within_roots(&canonical_target, &canonical_roots) {
                     return Err(format!(
-                        "Security denial: destination symlink '{}' points outside approved workspace root '{}'",
+                        "Security denial: destination symlink '{}' points outside the approved roots '{}'",
                         safe_path.display(),
-                        canonical_root.display()
+                        canonical_roots[0].display()
                     ));
                 }
             }
@@ -498,7 +830,7 @@ impl AuthorizationEngine {
         std::fs::write(&safe_path, content)
             .map_err(|e| format!("Failed to write file '{}': {}", safe_path.display(), e))?;
 
-        // 5. Post-write verification: ensure the written file is genuinely within canonical root
+        // 5. Post-write verification: ensure the written file is genuinely within an approved root
         let written_canon = safe_path.canonicalize().map_err(|e| {
             format!(
                 "Failed to verify written file '{}': {}",
@@ -506,12 +838,12 @@ impl AuthorizationEngine {
                 e
             )
         })?;
-        if !written_canon.starts_with(&canonical_root) {
+        if !Self::path_within_roots(&written_canon, &canonical_roots) {
             // Rollback the escaped file immediately
             let _ = std::fs::remove_file(&written_canon);
             return Err(format!(
-                "Security violation: written file escaped approved workspace root '{}'",
-                canonical_root.display()
+                "Security violation: written file escaped the approved roots '{}'",
+                canonical_roots[0].display()
             ));
         }
 
@@ -524,16 +856,20 @@ impl AuthorizationEngine {
         workspace_root: Option<&Path>,
         path_str: &str,
     ) -> Result<String, String> {
-        let safe_path = Self::validate_path_confinement(workspace_root, path_str, FileOp::Read)?;
-        let root = workspace_root
-            .ok_or_else(|| "Workspace root is required for contained file read".to_string())?;
-        let canonical_root = root.canonicalize().map_err(|e| {
-            format!(
-                "Failed to canonicalize workspace root '{}': {}",
-                root.display(),
-                e
-            )
-        })?;
+        let roots: Vec<PathBuf> = workspace_root
+            .map(|r| vec![r.to_path_buf()])
+            .unwrap_or_default();
+        Self::secure_read_contained_roots(&roots, path_str)
+    }
+
+    /// Multi-root variant of [`Self::secure_read_contained`] used by the
+    /// production tool dispatcher.
+    pub fn secure_read_contained_roots(
+        roots: &[PathBuf],
+        path_str: &str,
+    ) -> Result<String, String> {
+        let safe_path = Self::validate_path_confinement_roots(roots, path_str, FileOp::Read)?;
+        let canonical_roots = Self::canonicalize_roots(roots)?;
 
         // Revalidate canonicalization at the read boundary
         let canon = safe_path.canonicalize().map_err(|e| {
@@ -543,11 +879,11 @@ impl AuthorizationEngine {
                 e
             )
         })?;
-        if !canon.starts_with(&canonical_root) {
+        if !Self::path_within_roots(&canon, &canonical_roots) {
             return Err(format!(
-                "Security denial: path '{}' resolves outside approved workspace root '{}'",
+                "Security denial: path '{}' resolves outside the approved roots '{}'",
                 path_str,
-                canonical_root.display()
+                canonical_roots[0].display()
             ));
         }
 
@@ -620,7 +956,7 @@ impl AuthorizationEngine {
         if let Ok(Some(r)) = db.get_run(&ctx.run_id) {
             if matches!(
                 r.status.as_str(),
-                "completed" | "succeeded" | "failed" | "cancelled"
+                "completed" | "succeeded" | "failed" | "cancelled" | "interrupted"
             ) {
                 log::warn!(
                     "[Security] Task grant for run '{}' is revoked because run is in terminal status '{}'",
@@ -708,7 +1044,11 @@ impl AuthorizationEngine {
             };
         }
 
-        // Check active bounded authorization grant
+        // Check active bounded authorization grant. Organizer autonomy uses
+        // the folders-only scope so it agrees exactly with what the organizer
+        // can later execute (`check_path_authorized_in_folders`); a workspace
+        // root that is not itself an authorized folder still gets a targeted
+        // approval instead of an authorization that execution would reject.
         if let Some(grant) = active_grant {
             if grant.mode == TaskAutonomyMode::Autonomous
                 && grant
@@ -716,10 +1056,10 @@ impl AuthorizationEngine {
                     .contains(&RoutineOpClass::FileOrganize)
                 && RiskLevel::Moderate <= grant.max_risk
             {
-                let target_in_scope = grant.path_in_scope(&plan.target_directory);
+                let target_in_scope = grant.folders_in_scope(&plan.target_directory);
                 let ops_in_scope = plan.operations.iter().all(|op| {
-                    grant.path_in_scope(&op.source_path)
-                        && grant.path_in_scope(&op.destination_path)
+                    grant.folders_in_scope(&op.source_path)
+                        && grant.folders_in_scope(&op.destination_path)
                 });
 
                 if target_in_scope && ops_in_scope {
@@ -764,7 +1104,7 @@ impl AuthorizationEngine {
                         .allowed_operations
                         .contains(&RoutineOpClass::FileOrganize)
                     && RiskLevel::Moderate <= grant.max_risk
-                    && grant.path_in_scope(target_path)
+                    && grant.folders_in_scope(target_path)
                 {
                     return AuthDecision::Allow;
                 }
@@ -808,8 +1148,20 @@ impl AuthorizationEngine {
             "execute_shell" | "bash" | "terminal" => {
                 Self::evaluate_shell_in_context(policy, ctx, args)
             }
-            "read_file" => Self::evaluate_file_read(ctx, args),
-            "write_file" => Self::evaluate_file_write(ctx, args),
+            "read_file" => {
+                let active = ctx
+                    .task_grant
+                    .as_ref()
+                    .filter(|g| g.is_active(&ctx.run_id, chrono::Utc::now().timestamp_millis()));
+                Self::evaluate_file_read(ctx, args, active)
+            }
+            "write_file" => {
+                let active = ctx
+                    .task_grant
+                    .as_ref()
+                    .filter(|g| g.is_active(&ctx.run_id, chrono::Utc::now().timestamp_millis()));
+                Self::evaluate_file_write(ctx, args, active)
+            }
             "create_artifact" => Self::evaluate_create_artifact(ctx, args),
             "computer_action" => Self::evaluate_computer_action(policy, args),
             "click_mark" => Self::evaluate_click_mark(policy, args),
@@ -841,7 +1193,9 @@ impl AuthorizationEngine {
                         && RiskLevel::Moderate <= grant.max_risk
                     {
                         if let Some(target_dir) = args["plan"]["target_directory"].as_str() {
-                            if grant.path_in_scope(Path::new(target_dir)) {
+                            // Folders-only scope: agrees with the organizer's
+                            // own execution gate (`check_path_authorized_in_folders`).
+                            if grant.folders_in_scope(Path::new(target_dir)) {
                                 return AuthDecision::Allow;
                             }
                         }
@@ -863,7 +1217,18 @@ impl AuthorizationEngine {
                             .contains(&RoutineOpClass::FileOrganize)
                         && RiskLevel::Moderate <= grant.max_risk
                     {
-                        return AuthDecision::Allow;
+                        // Without the database the undo's real target directory
+                        // cannot be resolved server-side, so scope can only be
+                        // established when the caller carries it in the tool
+                        // arguments. Otherwise fail closed to approval.
+                        let target = args["transaction"]["target_directory"]
+                            .as_str()
+                            .map(Path::new);
+                        if let Some(target) = target {
+                            if grant.folders_in_scope(target) {
+                                return AuthDecision::Allow;
+                            }
+                        }
                     }
                 }
                 AuthDecision::RequireApproval {
@@ -913,54 +1278,8 @@ impl AuthorizationEngine {
                 }
                 AuthDecision::Allow
             }
-            "browser_click" => {
-                const CONSEQUENTIAL: &[&str] = &[
-                    "delete",
-                    "remove",
-                    "purchase",
-                    "buy",
-                    "pay",
-                    "checkout",
-                    "send",
-                    "publish",
-                    "deploy",
-                    "confirm",
-                    "submit",
-                    "transfer",
-                    "upgrade",
-                    "subscribe",
-                    "invite",
-                    "sign out",
-                    "log out",
-                    "logout",
-                ];
-                let label = format!(
-                    "{} {}",
-                    args["name"].as_str().unwrap_or(""),
-                    args["text"].as_str().unwrap_or("")
-                )
-                .to_lowercase();
-                if CONSEQUENTIAL.iter().any(|c| label.contains(c)) {
-                    AuthDecision::RequireApproval {
-                        reason: format!(
-                            "Activating the control '{}' may perform a consequential action",
-                            label.trim()
-                        ),
-                        risk: RiskLevel::Moderate,
-                        summary: format!("Activate the control: {}", label.trim()),
-                    }
-                } else {
-                    AuthDecision::Allow
-                }
-            }
-            "browser_fill" => {
-                let value = args["value"].as_str().unwrap_or("");
-                if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(value) {
-                    AuthDecision::RequireTakeover { reason }
-                } else {
-                    AuthDecision::Allow
-                }
-            }
+            "browser_click" => Self::evaluate_browser_click(args),
+            "browser_fill" => Self::evaluate_browser_fill(args),
             "browser_open" | "stop_dev_server" | "browser_close" => AuthDecision::Allow,
             _ => AuthDecision::RequireApproval {
                 reason: format!("Tool '{}' requires explicit authorization", tool_name),
@@ -999,12 +1318,28 @@ impl AuthorizationEngine {
             }
         }
 
-        // 3. Enforce explicit tool denial policies
+        // 3. Enforce explicit tool denial policies. When the policy row cannot
+        // be read, enforcement state is unknown — proceed as if no explicit
+        // denial existed would make the explicit-off switch bypassable
+        // (Bug 12), so fail closed to a checkpoint.
         let perm_key = format!("mcp_perm:{}", tool_name);
-        if let Ok(Some(policy_val)) = db.get_setting(&perm_key) {
-            if policy_val.trim().to_lowercase() == "deny" {
-                return AuthDecision::Deny {
-                    reason: format!("Tool '{}' is explicitly blocked by policy", tool_name),
+        match db.get_setting(&perm_key) {
+            Ok(Some(policy_val)) => {
+                if policy_val.trim().to_lowercase() == "deny" {
+                    return AuthDecision::Deny {
+                        reason: format!("Tool '{}' is explicitly blocked by policy", tool_name),
+                    };
+                }
+            }
+            Ok(None) => {}
+            Err(db_err) => {
+                return AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Tool policy for '{}' could not be verified from the governance store ({}); approval is required",
+                        tool_name, db_err
+                    ),
+                    risk: RiskLevel::Moderate,
+                    summary: format!("Invoke tool '{}'", tool_name),
                 };
             }
         }
@@ -1014,10 +1349,17 @@ impl AuthorizationEngine {
 
         match tool_name {
             "execute_shell" | "bash" | "terminal" => {
-                Self::evaluate_shell_in_context(&policy, ctx, args)
+                // The shell analysis sees exactly the lifecycle-validated
+                // grant (Bug 9): an expired, revoked, or cross-run grant is
+                // stripped here so no shell branch can act on it.
+                let shell_ctx = ExecutionContext {
+                    task_grant: active_grant.clone(),
+                    ..ctx.clone()
+                };
+                Self::evaluate_shell_in_context(&policy, &shell_ctx, args)
             }
-            "read_file" => Self::evaluate_file_read(ctx, args),
-            "write_file" => Self::evaluate_file_write(ctx, args),
+            "read_file" => Self::evaluate_file_read(ctx, args, active_grant.as_ref()),
+            "write_file" => Self::evaluate_file_write(ctx, args, active_grant.as_ref()),
             "create_artifact" => Self::evaluate_create_artifact(ctx, args),
             "computer_action" => Self::evaluate_computer_action(&policy, args),
             "click_mark" => Self::evaluate_click_mark(&policy, args),
@@ -1027,8 +1369,8 @@ impl AuthorizationEngine {
             "run_safe_experiment" => Self::evaluate_experiment(&policy, args),
             "organize_files_preview" => {
                 let perm_key = "mcp_perm:organize_files_preview";
-                if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
-                    match policy_val.trim().to_lowercase().as_str() {
+                match db.get_setting(perm_key) {
+                    Ok(Some(policy_val)) => match policy_val.trim().to_lowercase().as_str() {
                         "deny" => {
                             return AuthDecision::Deny {
                                 reason: "File organization preview is explicitly blocked by policy"
@@ -1046,7 +1388,20 @@ impl AuthorizationEngine {
                             }
                         }
                         _ => {}
+                    },
+                    // An unreadable organizer policy is unknown enforcement
+                    // state; fail closed to a checkpoint (Bug 12).
+                    Err(db_err) => {
+                        return AuthDecision::RequireApproval {
+                            reason: format!(
+                                "File organization policy could not be verified from the governance store ({}); approval is required",
+                                db_err
+                            ),
+                            risk: RiskLevel::Safe,
+                            summary: "Preview file organization".to_string(),
+                        };
                     }
+                    Ok(None) => {}
                 }
                 if policy.task_autonomy_mode == "Supervised" {
                     AuthDecision::RequireApproval {
@@ -1064,25 +1419,54 @@ impl AuthorizationEngine {
             }
             "organize_files_execute" => {
                 let perm_key = "mcp_perm:organize_files_execute";
-                if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
-                    if policy_val.trim().to_lowercase() == "deny" {
-                        return AuthDecision::Deny {
-                            reason: "File organization execution is explicitly blocked by policy"
-                                .to_string(),
+                match db.get_setting(perm_key) {
+                    Ok(Some(policy_val)) => {
+                        if policy_val.trim().to_lowercase() == "deny" {
+                            return AuthDecision::Deny {
+                                reason:
+                                    "File organization execution is explicitly blocked by policy"
+                                        .to_string(),
+                            };
+                        }
+                    }
+                    // Unreadable execution policy: fail closed (Bug 12).
+                    Err(db_err) => {
+                        return AuthDecision::RequireApproval {
+                            reason: format!(
+                                "File organization policy could not be verified from the governance store ({}); approval is required",
+                                db_err
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: "Execute file organization".to_string(),
                         };
                     }
+                    Ok(None) => {}
                 }
                 Self::evaluate_organize_execute(db, ctx, active_grant.as_ref(), args)
             }
             "organize_files_undo" => {
                 let perm_key = "mcp_perm:organize_files_undo";
-                if let Ok(Some(policy_val)) = db.get_setting(perm_key) {
-                    if policy_val.trim().to_lowercase() == "deny" {
-                        return AuthDecision::Deny {
-                            reason: "File organization undo is explicitly blocked by policy"
-                                .to_string(),
+                match db.get_setting(perm_key) {
+                    Ok(Some(policy_val)) => {
+                        if policy_val.trim().to_lowercase() == "deny" {
+                            return AuthDecision::Deny {
+                                reason: "File organization undo is explicitly blocked by policy"
+                                    .to_string(),
+                            };
+                        }
+                    }
+                    // Unreadable undo policy: fail closed (Bug 12).
+                    Err(db_err) => {
+                        return AuthDecision::RequireApproval {
+                            reason: format!(
+                                "File organization policy could not be verified from the governance store ({}); approval is required",
+                                db_err
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: "Undo file organization".to_string(),
                         };
                     }
+                    Ok(None) => {}
                 }
                 Self::evaluate_organize_undo(db, ctx, active_grant.as_ref(), args)
             }
@@ -1125,54 +1509,8 @@ impl AuthorizationEngine {
                 }
                 AuthDecision::Allow
             }
-            "browser_click" => {
-                const CONSEQUENTIAL: &[&str] = &[
-                    "delete",
-                    "remove",
-                    "purchase",
-                    "buy",
-                    "pay",
-                    "checkout",
-                    "send",
-                    "publish",
-                    "deploy",
-                    "confirm",
-                    "submit",
-                    "transfer",
-                    "upgrade",
-                    "subscribe",
-                    "invite",
-                    "sign out",
-                    "log out",
-                    "logout",
-                ];
-                let label = format!(
-                    "{} {}",
-                    args["name"].as_str().unwrap_or(""),
-                    args["text"].as_str().unwrap_or("")
-                )
-                .to_lowercase();
-                if CONSEQUENTIAL.iter().any(|c| label.contains(c)) {
-                    AuthDecision::RequireApproval {
-                        reason: format!(
-                            "Activating the control '{}' may perform a consequential action",
-                            label.trim()
-                        ),
-                        risk: RiskLevel::Moderate,
-                        summary: format!("Activate the control: {}", label.trim()),
-                    }
-                } else {
-                    AuthDecision::Allow
-                }
-            }
-            "browser_fill" => {
-                let value = args["value"].as_str().unwrap_or("");
-                if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(value) {
-                    AuthDecision::RequireTakeover { reason }
-                } else {
-                    AuthDecision::Allow
-                }
-            }
+            "browser_click" => Self::evaluate_browser_click(args),
+            "browser_fill" => Self::evaluate_browser_fill(args),
             "browser_open" | "stop_dev_server" | "browser_close" => AuthDecision::Allow,
             _ => {
                 // MCP or custom external tool
@@ -1334,9 +1672,15 @@ impl AuthorizationEngine {
 
         let workspace_root = ctx.and_then(|c| c.workspace_root.as_deref());
 
-        // Check if command is a routine local verification step permitted by active task grant
-        if let Some(grant) = ctx.and_then(|c| c.task_grant.as_ref()) {
+        // Check if command is a routine local verification step permitted by active task grant.
+        // The grant is lifecycle-validated here (run binding + expiry): a stale
+        // grant must never re-authorize shell execution (fail-closed to the
+        // regular allowlist/approval classification below).
+        if let Some((grant, run_id)) =
+            ctx.and_then(|c| c.task_grant.as_ref().map(|g| (g, &c.run_id)))
+        {
             if grant.mode == TaskAutonomyMode::Autonomous
+                && grant.is_active(run_id, chrono::Utc::now().timestamp_millis())
                 && grant
                     .allowed_operations
                     .contains(&RoutineOpClass::LocalVerification)
@@ -1354,8 +1698,30 @@ impl AuthorizationEngine {
                     }
                 }
                 if paths_ok {
+                    // Repository-controlled code (build hooks, package.json
+                    // scripts, test suites) executes arbitrary code on the
+                    // host.  Trusting the command *name* would let a project's
+                    // `npm test` script run anything unsandboxed, so such
+                    // verification is routed into the container sandbox by
+                    // default and fails closed to a human trust checkpoint
+                    // when no sandbox engine can be established.
+                    let sandbox_status = DockerSandbox::probe();
+                    let decision = if sandbox_status.available {
+                        AuthDecision::AllowSandboxOnly {
+                            image: Self::verification_sandbox_image(&executable),
+                        }
+                    } else {
+                        AuthDecision::RequireApproval {
+                            reason: format!(
+                                "Command '{}' executes repository-controlled code and no container sandbox is available ({}); a trust checkpoint is required",
+                                cmd, sandbox_status.message
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: format!("Run repository verification: '{}'", cmd),
+                        }
+                    };
                     return ShellAnalysis {
-                        decision: AuthDecision::Allow,
+                        decision,
                         argv: Some(words.clone()),
                         requires_shell: false,
                         lexed_words: words,
@@ -1714,8 +2080,32 @@ impl AuthorizationEngine {
         }
     }
 
+    /// Selects a toolchain image from the approved sandbox allowlist that
+    /// matches the verification command family, so sandboxed verification can
+    /// actually run instead of failing on a missing toolchain.
+    fn verification_sandbox_image(executable: &str) -> String {
+        let base = executable.rsplit('/').next().unwrap_or(executable);
+        match base {
+            "cargo" => "rust:1.80-alpine".to_string(),
+            "npm" => "node:20-alpine".to_string(),
+            "pytest" => "python:3.12-alpine".to_string(),
+            _ => "alpine:3.20".to_string(),
+        }
+    }
+
     /// Evaluates filesystem reads: canonical workspace / authorized folders confinement validation
-    pub fn evaluate_file_read(ctx: &ExecutionContext, args: &serde_json::Value) -> AuthDecision {
+    ///
+    /// `active_grant` is the grant resolved through
+    /// [`AuthorizationEngine::resolve_active_task_grant`]: run-bound, unexpired
+    /// and revoked on terminal lifecycle states. When the run *was* issued a
+    /// grant but that grant is no longer active, the decision is a targeted
+    /// approval (a stale grant must never silently re-authorize an action
+    /// under a different scope definition).
+    pub fn evaluate_file_read(
+        ctx: &ExecutionContext,
+        args: &serde_json::Value,
+        active_grant: Option<&TaskAuthorizationGrant>,
+    ) -> AuthDecision {
         let path_str = match args["path"].as_str() {
             Some(p) if !p.trim().is_empty() => p.trim(),
             _ => {
@@ -1746,16 +2136,24 @@ impl AuthorizationEngine {
         }
 
         // 3. Task grant evaluation if present
-        if let Some(ref grant) = ctx.task_grant {
-            let now = chrono::Utc::now().timestamp_millis();
-            if !grant.is_active(&ctx.run_id, now) || grant.mode == TaskAutonomyMode::Supervised {
+        if ctx.task_grant.is_some() {
+            let grant = match active_grant {
+                Some(g) => g,
+                None => {
+                    // A grant existed for this run but is no longer valid:
+                    // expired, revoked by a terminal run status, or bound to
+                    // another run. Fail to the targeted approval path.
+                    return AuthDecision::RequireApproval {
+                        reason: "Active task authorization grant has expired, been revoked, or is invalid for this run"
+                            .to_string(),
+                        risk: RiskLevel::Safe,
+                        summary: format!("Read file '{}'", path_str),
+                    };
+                }
+            };
+            if grant.mode == TaskAutonomyMode::Supervised {
                 return AuthDecision::RequireApproval {
-                    reason: if grant.mode == TaskAutonomyMode::Supervised {
-                        "Supervised mode requires approval for file reads".to_string()
-                    } else {
-                        "Active task authorization grant has expired or is invalid for this run"
-                            .to_string()
-                    },
+                    reason: "Supervised mode requires approval for file reads".to_string(),
                     risk: RiskLevel::Safe,
                     summary: format!("Read file '{}'", path_str),
                 };
@@ -1767,13 +2165,25 @@ impl AuthorizationEngine {
                     summary: format!("Read file '{}'", path_str),
                 };
             }
-            let p = Path::new(path_str);
-            if !grant.path_in_scope(p) {
-                return AuthDecision::Deny {
-                    reason: format!("Path '{}' is outside task authorized scope", path_str),
-                };
-            }
-            return AuthDecision::Allow;
+            // The SAME canonical path-scope mechanism used by the actual
+            // secure read operation (Bug 14 invariant): one list of approved
+            // roots, one resolution rule, one canonicalization.
+            let roots = TaskAuthorizationGrant::execution_roots(ctx);
+            return match Self::validate_path_confinement_roots(&roots, path_str, FileOp::Read) {
+                Ok(_) => AuthDecision::Allow,
+                Err(reason) => {
+                    if reason.starts_with("File does not exist") {
+                        AuthDecision::Deny { reason }
+                    } else {
+                        AuthDecision::Deny {
+                            reason: format!(
+                                "Path '{}' is outside task authorized scope: {}",
+                                path_str, reason
+                            ),
+                        }
+                    }
+                }
+            };
         }
 
         match Self::validate_path_confinement(ctx.workspace_root.as_deref(), path_str, FileOp::Read)
@@ -1784,7 +2194,11 @@ impl AuthorizationEngine {
     }
 
     /// Evaluates filesystem writes: prevents traversal, symlink escapes, and system modification
-    pub fn evaluate_file_write(ctx: &ExecutionContext, args: &serde_json::Value) -> AuthDecision {
+    pub fn evaluate_file_write(
+        ctx: &ExecutionContext,
+        args: &serde_json::Value,
+        active_grant: Option<&TaskAuthorizationGrant>,
+    ) -> AuthDecision {
         let path_str = match args["path"].as_str() {
             Some(p) if !p.trim().is_empty() => p.trim(),
             _ => {
@@ -1815,16 +2229,21 @@ impl AuthorizationEngine {
         }
 
         // 3. Task grant evaluation if present
-        if let Some(ref grant) = ctx.task_grant {
-            let now = chrono::Utc::now().timestamp_millis();
-            if !grant.is_active(&ctx.run_id, now) || grant.mode == TaskAutonomyMode::Supervised {
+        if ctx.task_grant.is_some() {
+            let grant = match active_grant {
+                Some(g) => g,
+                None => {
+                    return AuthDecision::RequireApproval {
+                        reason: "Active task authorization grant has expired, been revoked, or is invalid for this run"
+                            .to_string(),
+                        risk: RiskLevel::Safe,
+                        summary: format!("Write file '{}'", path_str),
+                    };
+                }
+            };
+            if grant.mode == TaskAutonomyMode::Supervised {
                 return AuthDecision::RequireApproval {
-                    reason: if grant.mode == TaskAutonomyMode::Supervised {
-                        "Supervised mode requires approval for file writes".to_string()
-                    } else {
-                        "Active task authorization grant has expired or is invalid for this run"
-                            .to_string()
-                    },
+                    reason: "Supervised mode requires approval for file writes".to_string(),
                     risk: RiskLevel::Safe,
                     summary: format!("Write file '{}'", path_str),
                 };
@@ -1839,13 +2258,16 @@ impl AuthorizationEngine {
                     summary: format!("Write file '{}'", path_str),
                 };
             }
-            let p = Path::new(path_str);
-            if !grant.path_in_scope(p) {
-                return AuthDecision::Deny {
-                    reason: format!("Path '{}' is outside task authorized scope", path_str),
-                };
-            }
-            return AuthDecision::Allow;
+            let roots = TaskAuthorizationGrant::execution_roots(ctx);
+            return match Self::validate_path_confinement_roots(&roots, path_str, FileOp::Write) {
+                Ok(_) => AuthDecision::Allow,
+                Err(reason) => AuthDecision::Deny {
+                    reason: format!(
+                        "Path '{}' is outside task authorized scope: {}",
+                        path_str, reason
+                    ),
+                },
+            };
         }
 
         match Self::validate_path_confinement(
@@ -1898,8 +2320,50 @@ impl AuthorizationEngine {
             };
         }
 
-        let action_str = args["action"].as_str().unwrap_or_default();
-        let text = args["text"].as_str().unwrap_or_default();
+        // Normalise the two argument shapes in production:
+        //  * loop-engine tool calls: {"action": "left_click", "x", "y", "text"}
+        //  * perform_computer_action enum: {"LeftClick": {"x", "y"}}
+        // (Bug 10: pointer actions must participate in the risk classification
+        // exactly like keyboard actions do.)
+        let action_str = if let Some(a) = args["action"].as_str() {
+            a.to_string()
+        } else {
+            args.as_object()
+                .and_then(|o| o.keys().next().cloned())
+                .unwrap_or_default()
+                .to_lowercase()
+        };
+
+        let (x, y, text) = if let Some(body) = args
+            .as_object()
+            .and_then(|o| o.values().next().filter(|v| v.is_object()))
+        {
+            (
+                body.get("x").and_then(|v| v.as_i64()),
+                body.get("y").and_then(|v| v.as_i64()),
+                body.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+        } else {
+            (
+                args["x"].as_i64(),
+                args["y"].as_i64(),
+                args["text"].as_str().unwrap_or(""),
+            )
+        };
+
+        let pointer_action = matches!(
+            action_str.as_str(),
+            "leftclick"
+                | "left_click"
+                | "rightclick"
+                | "right_click"
+                | "doubleclick"
+                | "double_click"
+                | "mouse_move"
+                | "mousemove"
+                | "leftclickdrag"
+                | "left_click_drag"
+        );
 
         if policy.computer_use_mode == "ConfirmDestructive" {
             let destructive_keys = ["alt+f4", "ctrl+w", "ctrl+q", "delete", "backspace"];
@@ -1916,6 +2380,81 @@ impl AuthorizationEngine {
                     summary: format!("Send keystroke: '{}'", text),
                 };
             }
+
+            // Mouse actions target raw screen coordinates; the engine cannot
+            // resolve which control sits under the pointer from the tool
+            // arguments alone, so a pointer action is a potential destructive
+            // action and requires the checkpoint (Bug 10).
+            if pointer_action {
+                if args.get("mark_id").map(|v| !v.is_null()).unwrap_or(false)
+                    || args.get("markId").map(|v| !v.is_null()).unwrap_or(false)
+                {
+                    // Grounded targets: classify with the trusted mark label.
+                    let mark_id = args
+                        .get("mark_id")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| args.get("markId").and_then(|v| v.as_u64()))
+                        .unwrap_or(0);
+                    let sem = crate::grounding::SetOfMarksEngine::resolve_mark_semantics(
+                        mark_id.try_into().unwrap_or(usize::MAX),
+                    );
+                    match sem {
+                        Some(s) if !s.label.is_empty() => {
+                            if is_consequential_control_text(&s.combined) {
+                                return AuthDecision::RequireApproval {
+                                    reason: format!(
+                                        "The marked element '{}' may perform a consequential action; a human checkpoint is required",
+                                        s.combined
+                                    ),
+                                    risk: RiskLevel::Moderate,
+                                    summary: format!("Click marked element: {}", s.combined),
+                                };
+                            }
+                            return AuthDecision::Allow;
+                        }
+                        // A mark without a readable label is unclassifiable.
+                        Some(_) => {
+                            return AuthDecision::RequireApproval {
+                                reason: format!(
+                                    "Mark #{} has no trusted semantic label in the active grounded session; the click target cannot be classified",
+                                    mark_id
+                                ),
+                                risk: RiskLevel::Moderate,
+                                summary: format!("Click unclassified Set-of-Marks tag #{}", mark_id),
+                            };
+                        }
+                        // No session / unknown mark: coordinates would be
+                        // unverifiable here, so a checkpoint is required.
+                        None => {
+                            return AuthDecision::RequireApproval {
+                                reason: format!(
+                                    "Mark #{} does not exist in the active grounded session; the click target cannot be verified",
+                                    mark_id
+                                ),
+                                risk: RiskLevel::Moderate,
+                                summary: format!("Click unclassified Set-of-Marks tag #{}", mark_id),
+                            };
+                        }
+                    }
+                }
+
+                return AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Pointer action '{}' targets screen coordinates that cannot be classified, so it may be destructive and requires confirmation",
+                        action_str
+                    ),
+                    risk: RiskLevel::Moderate,
+                    summary: format!(
+                        "Perform pointer action '{}'{}",
+                        action_str,
+                        match (x, y) {
+                            (Some(px), Some(py)) =>
+                                format!(" at ({},{})", px, py),
+                            _ => String::new(),
+                        }
+                    ),
+                };
+            }
         }
 
         // Password detection in typed text
@@ -1928,12 +2467,100 @@ impl AuthorizationEngine {
         AuthDecision::Allow
     }
 
+    /// Shared browser click classification used by both the production
+    /// authorization path and preview helpers.
+    ///
+    /// A consequential click requires approval; a click whose target cannot be
+    /// classified (coordinates only, or a bare element reference with no
+    /// semantic locator) is treated as potentially consequential, because
+    /// ambiguity must never default to benign (Bug 10).
+    pub fn evaluate_browser_click(args: &serde_json::Value) -> AuthDecision {
+        let descriptor = browser_target_descriptor(args);
+        let has_semantics = has_resolvable_semantics(args);
+        let has_coordinates = ["x", "y"]
+            .iter()
+            .any(|f| args.get(*f).map(|v| !v.is_null()).unwrap_or(false));
+
+        if !(has_semantics || has_coordinates) {
+            return AuthDecision::RequireApproval {
+                reason: "The click target carries no resolvable locator, so its effect cannot be classified; approval is required"
+                    .to_string(),
+                risk: RiskLevel::Moderate,
+                summary: "Activate an unclassified page element".to_string(),
+            };
+        }
+
+        if !has_semantics {
+            return AuthDecision::RequireApproval {
+                reason: format!(
+                    "Click target is addressed only through an ambiguous locator ({}); the engine cannot read what the click would act on, so approval is required",
+                    if descriptor.is_empty() { "coordinates" } else { descriptor.trim() }
+                ),
+                risk: RiskLevel::Moderate,
+                summary: format!(
+                    "Activate a page element without a readable locator: {}",
+                    if descriptor.is_empty() { "coordinates" } else { descriptor.trim() }
+                ),
+            };
+        }
+
+        if contains_standalone_word(&descriptor.to_lowercase(), CONSEQUENTIAL_CONTROL_TERMS) {
+            AuthDecision::RequireApproval {
+                reason: format!(
+                    "Activating the control '{}' may perform a consequential action",
+                    descriptor.trim()
+                ),
+                risk: RiskLevel::Moderate,
+                summary: format!("Activate the control: {}", descriptor.trim()),
+            }
+        } else {
+            AuthDecision::Allow
+        }
+    }
+
+    /// Shared browser fill classification used by both authorization paths.
+    ///
+    /// The typed value is checked for credentials and then the *target field
+    /// semantics* are checked: filling a resolved credential-bearing field
+    /// forces a human takeover regardless of the claimed value (Bug 10).
+    pub fn evaluate_browser_fill(args: &serde_json::Value) -> AuthDecision {
+        if let Some(reason) =
+            TakeoverController::detect_sensitive_checkpoint(args["value"].as_str().unwrap_or(""))
+        {
+            return AuthDecision::RequireTakeover { reason };
+        }
+
+        let descriptor = browser_target_descriptor(args).to_lowercase();
+        if has_resolvable_semantics(args)
+            && contains_standalone_word(&descriptor, CREDENTIAL_FIELD_TERMS)
+        {
+            return AuthDecision::RequireTakeover {
+                reason: format!(
+                    "Filling a credential-bearing field ('{}') requires the human user to enter the credentials",
+                    descriptor.trim()
+                ),
+            };
+        }
+
+        if !has_resolvable_semantics(args) || descriptor.trim().is_empty() {
+            return AuthDecision::RequireApproval {
+                reason: "The fill target carries no resolvable locator, so its field semantics cannot be verified; approval is required"
+                    .to_string(),
+                risk: RiskLevel::Moderate,
+                summary: "Fill an unclassified page field".to_string(),
+            };
+        }
+
+        AuthDecision::Allow
+    }
+
     pub fn evaluate_click_mark(
         policy: &GovernancePolicy,
         args: &serde_json::Value,
     ) -> AuthDecision {
+        let mark_id = args["mark_id"].as_u64().unwrap_or(0);
+
         if policy.computer_use_mode == "AskAlways" {
-            let mark_id = args["mark_id"].as_u64().unwrap_or(0);
             return AuthDecision::RequireApproval {
                 reason: "Policy 'AskAlways' requires confirmation before clicking UI elements"
                     .to_string(),
@@ -1941,7 +2568,45 @@ impl AuthorizationEngine {
                 summary: format!("Click Set-of-Marks tag #{}", mark_id),
             };
         }
-        AuthDecision::Allow
+
+        // Classify the click with the trusted semantic label produced by
+        // Kyro's own grounding pass, never with a model-supplied description.
+        match crate::grounding::SetOfMarksEngine::resolve_mark_semantics(
+            mark_id.try_into().unwrap_or(usize::MAX),
+        ) {
+            Some(sem) if !sem.label.is_empty() => {
+                if contains_standalone_word(&sem.combined.to_lowercase(), CONSEQUENTIAL_CONTROL_TERMS) {
+                    AuthDecision::RequireApproval {
+                        reason: format!(
+                            "The marked element '{}' may perform a consequential action; a human checkpoint is required",
+                            sem.combined
+                        ),
+                        risk: RiskLevel::Moderate,
+                        summary: format!("Click marked element: {}", sem.combined),
+                    }
+                } else {
+                    AuthDecision::Allow
+                }
+            }
+            // A mark that exists but carries no trusted semantic label is real
+            // ambiguity: it *will* be clicked at coordinates, so it fails
+            // closed to a checkpoint.
+            Some(_) => AuthDecision::RequireApproval {
+                reason: format!(
+                    "Mark #{} is active but has no trusted semantic label; the click target cannot be classified",
+                    mark_id
+                ),
+                risk: RiskLevel::Moderate,
+                summary: format!("Click unclassified Set-of-Marks tag #{}", mark_id),
+            },
+            // No mark in any active session: no execute path can resolve
+            // coordinates for it, so authorization cannot enact anything —
+            // dispatch refuses unresolvable marks with an explicit error and
+            // re-validates the trusted label at execution time. Wedging the
+            // run into a human queue for an op that deterministically cannot
+            // run would stall autonomy with no safety gain.
+            None => AuthDecision::Allow,
+        }
     }
 
     /// Evaluates an application launch inside the Ghost display.
@@ -2146,17 +2811,21 @@ Use the 'executable' and 'args' fields so the launch can be validated."
             }
         }
 
-        // Check explicit connector tool policy in database
+        // Check explicit connector tool policy in database. A read failure is
+        // unknown enforcement state — the connector policy is the only block
+        // between an "allow" classification and its execution, so it must not
+        // silently degrade to the name heuristics (Bug 12, fail closed).
         if let Some(account_id) = account_id_opt {
-            if let Ok(Some(policy_rec)) = db.get_connector_tool_policy(account_id, raw_name) {
-                match policy_rec.policy.trim().to_lowercase().as_str() {
-                    "allow" => {
-                        // Destructive operations can NEVER be auto-approved
-                        if policy_rec.risk_level.trim().to_lowercase() == "destructive"
-                            || raw_name.contains("delete")
-                            || raw_name.contains("destroy")
-                        {
-                            return AuthDecision::RequireApproval {
+            match db.get_connector_tool_policy(account_id, raw_name) {
+                Ok(Some(policy_rec)) => {
+                    match policy_rec.policy.trim().to_lowercase().as_str() {
+                        "allow" => {
+                            // Destructive operations can NEVER be auto-approved
+                            if policy_rec.risk_level.trim().to_lowercase() == "destructive"
+                                || raw_name.contains("delete")
+                                || raw_name.contains("destroy")
+                            {
+                                return AuthDecision::RequireApproval {
                                 reason: format!(
                                     "Destructive connector action '{}' cannot be auto-approved and requires explicit user authorization",
                                     raw_name
@@ -2167,36 +2836,49 @@ Use the 'executable' and 'args' fields so the launch can be validated."
                                     raw_name, args
                                 ),
                             };
+                            }
+                            return AuthDecision::Allow;
                         }
-                        return AuthDecision::Allow;
-                    }
-                    "deny" => {
-                        return AuthDecision::Deny {
+                        "deny" => {
+                            return AuthDecision::Deny {
                             reason: format!(
                                 "Connector action '{}' for account '{}' is blocked by security policy",
                                 raw_name, account_id
                             ),
                         };
+                        }
+                        "ask" => {
+                            let risk = match policy_rec.risk_level.as_str() {
+                                "destructive" => RiskLevel::Destructive,
+                                "safe" => RiskLevel::Safe,
+                                _ => RiskLevel::Moderate,
+                            };
+                            return AuthDecision::RequireApproval {
+                                reason: format!(
+                                    "Connector action '{}' requires explicit user authorization",
+                                    raw_name
+                                ),
+                                risk,
+                                summary: format!(
+                                    "Run connector tool '{}' with parameters: {}",
+                                    raw_name, args
+                                ),
+                            };
+                        }
+                        _ => {}
                     }
-                    "ask" => {
-                        let risk = match policy_rec.risk_level.as_str() {
-                            "destructive" => RiskLevel::Destructive,
-                            "safe" => RiskLevel::Safe,
-                            _ => RiskLevel::Moderate,
-                        };
-                        return AuthDecision::RequireApproval {
-                            reason: format!(
-                                "Connector action '{}' requires explicit user authorization",
-                                raw_name
-                            ),
-                            risk,
-                            summary: format!(
-                                "Run connector tool '{}' with parameters: {}",
-                                raw_name, args
-                            ),
-                        };
-                    }
-                    _ => {}
+                }
+                // Unknown allow state: refuse the heuristic fallbacks so an
+                // unreadable policy can never silently authorise a connector
+                // action (Bug 12, fail closed; secret-safe structured text).
+                Ok(None) => {}
+                Err(db_err) => {
+                    return AuthDecision::Deny {
+                        reason: format!(
+                            "Connector tool policy for '{}' (account '{}') could not be verified from the governance store ({}); execution is denied",
+                            raw_name, account_id, db_err
+                        ),
+                    };
                 }
             }
         }
@@ -2234,10 +2916,12 @@ Use the 'executable' and 'args' fields so the launch can be validated."
             };
         }
 
-        // Explicitly check persisted legacy MCP permissions
+        // Explicitly check persisted legacy MCP permissions. An unreadable
+        // permission row is unknown enforcement state, so degrade to deny
+        // instead of silently skipping the permission layer (Bug 12).
         let perm_key = format!("mcp_perm:{}", tool_name);
-        if let Ok(Some(policy_val)) = db.get_setting(&perm_key) {
-            match policy_val.trim().to_lowercase().as_str() {
+        match db.get_setting(&perm_key) {
+            Ok(Some(policy_val)) => match policy_val.trim().to_lowercase().as_str() {
                 "allow" => return AuthDecision::Allow,
                 "deny" => {
                     return AuthDecision::Deny {
@@ -2255,7 +2939,16 @@ Use the 'executable' and 'args' fields so the launch can be validated."
                     }
                 }
                 _ => {}
+            },
+            Err(db_err) => {
+                return AuthDecision::Deny {
+                    reason: format!(
+                        "MCP tool permission for '{}' could not be verified from the governance store ({}); execution is denied",
+                        tool_name, db_err
+                    ),
+                };
             }
+            Ok(None) => {}
         }
 
         // Unknown / unconfigured external tools: conservative decision requires approval

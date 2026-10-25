@@ -375,6 +375,18 @@ pub struct Database {
 }
 
 impl Database {
+    /// Runs `f` with direct access to the underlying SQLite connection.
+    ///
+    /// Minimal low-traffic escape hatch for maintenance operations and for
+    /// security tests that need to drive the shared connection into a real
+    /// error state (e.g. schema corruption) so authorization reads can be
+    /// exercised under genuine database failures instead of simulated ones.
+    /// Production paths must keep using the typed accessors above this line.
+    pub fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        let conn = self.conn.lock().unwrap();
+        f(&conn)
+    }
+
     pub fn init(app_data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&app_data_dir).ok();
         let db_path = app_data_dir.join("kyro.db");
@@ -1326,16 +1338,76 @@ impl Database {
             }
         }
 
+        // Compare-and-set guards
+        let current = Self::run_status_for_update(&conn, id)?.unwrap_or_default();
+
+        let allowed_from: &[&str] = match status {
+            // Long-running states can only be entered from active/queued states.
+            "running" => &["queued", "waiting_approval"],
+            "waiting_approval" => &["running", "queued"],
+            // Finalization is only legal from an active state; it can never
+            // overwrite another terminal outcome.
+            "succeeded" => &["queued", "running"],
+            "failed" => &["queued", "running", "waiting_approval"],
+            "cancelled" => &["queued", "running", "waiting_approval"],
+            "interrupted" => &["queued", "running", "waiting_approval"],
+            _ => &["queued", "running", ("waiting_approval")],
+        };
+        if !allowed_from.contains(&current.as_str()) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(format!(
+                    "Illegal run status transition for '{}': '{}' -> '{}' \
+                     (terminal states are never overwritten by stale callbacks)",
+                    id, current, status
+                )),
+            )));
+        }
+
         conn.execute(
             "UPDATE agent_runs
              SET status = ?1,
                  started_at = COALESCE(?2, started_at),
                  completed_at = COALESCE(?3, completed_at),
                  error = COALESCE(?4, error)
-             WHERE id = ?5",
-            params![status, started_at, completed_at, error, id],
+             WHERE id = ?5 AND status = ?6",
+            params![status, started_at, completed_at, error, id, current],
         )?;
         Ok(())
+    }
+
+    /// Reads the current status of a run, or `None` when the run does not exist.
+    fn run_status_for_update(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
+        let mut stmt = conn.prepare("SELECT status FROM agent_runs WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically cancels a run only when it is still active
+    /// (`queued`, `running`, `waiting_approval`).
+    ///
+    /// Returns `Ok(true)` when this call transitions the run to `cancelled`,
+    /// and `Ok(false)` when the run was already terminal (the cancellation
+    /// lost the race against a completion) or does not exist.  This is the
+    /// authoritative, race-safe cancellation primitive: cancellation can
+    /// never overwrite a confirmed success/failure, and a stale completion
+    /// (which is subject to the same transition table in
+    /// [`Database::update_run_status`]) can never overwrite this
+    /// cancellation.
+    pub fn cancel_run_if_active(&self, id: &str, reason: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows = conn.execute(
+            "UPDATE agent_runs
+             SET status = 'cancelled',
+                 completed_at = COALESCE(NULLIF(completed_at, 0), ?2),
+                 error = COALESCE(NULLIF(error, ''), ?3)
+             WHERE id = ?1 AND status IN ('queued', 'running', 'waiting_approval')",
+            params![id, now, reason],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn get_run(&self, id: &str) -> Result<Option<AgentRun>> {

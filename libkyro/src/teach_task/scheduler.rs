@@ -424,39 +424,17 @@ impl RoutineScheduler {
                     configured_model, err
                 ))
             } else {
-                let api_key_res: Result<String, String> = (|| {
+                // One authoritative resolver binds model → provider,
+                // endpoint and credential (Bug 15). The routine never routes
+                // through a fallback endpoint implicitly; a missing credential
+                // is a hard, descriptive configuration error.
+                let route = ModelRouter::resolve_model_route(&configured_model)
+                    .map_err(|e| format!("Model routing error: {}", e))?;
+                let api_key_res = (|| {
                     let keys = vault
                         .get_all_keys()
                         .map_err(|e| format!("Vault error reading keys: {}", e))?;
-                    let api_key = match caps.provider.as_str() {
-                        "nvidia" => keys.nvidia.clone().unwrap_or_default(),
-                        other => vault
-                            .get_secret(&format!("{}_api_key", other))
-                            .ok()
-                            .flatten()
-                            .or_else(|| vault.get_secret(other).ok().flatten())
-                            .or_else(|| {
-                                std::env::var(format!("{}_API_KEY", other.to_uppercase())).ok()
-                            })
-                            .or_else(|| {
-                                if other == "meta" || other == "mistral" || other == "qwen" {
-                                    // NIM hosted model fallback
-                                    keys.nvidia.clone()
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default(),
-                    };
-
-                    if api_key.is_empty() {
-                        Err(format!(
-                            "{} API key not configured for routine. Please add your key in Kyro Settings under Model & Credentials.",
-                            caps.provider.to_uppercase()
-                        ))
-                    } else {
-                        Ok(api_key)
-                    }
+                    ModelRouter::select_api_key_for_route(&route, &keys)
                 })();
 
                 match api_key_res {
@@ -476,7 +454,7 @@ impl RoutineScheduler {
                                 &run_id,
                                 &configured_model,
                                 &api_key,
-                                None,
+                                Some(&route.base_url),
                                 sys_prompt,
                                 history,
                                 db.clone(),

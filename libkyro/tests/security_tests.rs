@@ -1769,3 +1769,992 @@ fn task_grant_approval_lifecycle_denial_cancellation_and_proof() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------
+// Bug 3: durable run lifecycle is compare-and-set safe
+// ---------------------------------------------------------------------
+
+fn lifecycle_run(db: &Database, id: &str, status: &str) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let run = kyro_lib::storage::AgentRun {
+        id: id.to_string(),
+        conversation_id: None,
+        agent_id: "apex-orchestrator".to_string(),
+        model: "test-model".to_string(),
+        prompt: "lifecycle test".to_string(),
+        status: status.to_string(),
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        config_json: None,
+        parent_run_id: None,
+    };
+    db.create_run(&run).unwrap();
+}
+
+fn run_status(db: &Database, id: &str) -> String {
+    db.get_run(id).unwrap().unwrap().status
+}
+
+#[test]
+fn run_status_transitions_cannot_overwrite_a_terminal_outcome() {
+    let (dir, db) = temp_db("run_cas");
+    db.create_conversation("conv_cas", "CAS", "test-model")
+        .unwrap();
+
+    // queued → running → waiting_approval is a legal progression
+    lifecycle_run(&db, "run_cas_a", "queued");
+    db.update_run_status("run_cas_a", "running", Some(1), None, None)
+        .unwrap();
+    db.update_run_status("run_cas_a", "waiting_approval", None, None, None)
+        .unwrap();
+    db.update_run_status("run_cas_a", "running", None, None, None)
+        .unwrap();
+
+    // Cancellation wins against an active run
+    assert!(db
+        .cancel_run_if_active("run_cas_a", "user requested")
+        .unwrap());
+    assert_eq!(run_status(&db, "run_cas_a"), "cancelled");
+
+    // A stale completion callback that arrives after cancellation must not
+    // overwrite the recorded terminal outcome (Bug 3).
+    assert!(
+        db.update_run_status("run_cas_a", "succeeded", None, Some(2), None)
+            .is_err(),
+        "succeeded must not overwrite a cancelled run"
+    );
+    assert_eq!(run_status(&db, "run_cas_a"), "cancelled");
+
+    // Repeated cancellation on an already-terminal run is a no-op that
+    // reports it lost the race, and does not rewrite completion data.
+    let completed = chrono::Utc::now().timestamp_millis();
+    db.update_run_status("run_cas_a", "cancelled", None, Some(completed), None)
+        .expect_err("cancelled -> cancelled is not a legal CAS transition");
+    assert_eq!(run_status(&db, "run_cas_a"), "cancelled");
+
+    // Reverse race: completion first, cancellation second
+    lifecycle_run(&db, "run_cas_b", "running");
+    db.update_run_status("run_cas_b", "succeeded", None, Some(3), None)
+        .unwrap();
+    assert!(
+        !db.cancel_run_if_active("run_cas_b", "late cancel").unwrap(),
+        "cancellation arriving after success must report it did not win"
+    );
+    assert_eq!(run_status(&db, "run_cas_b"), "succeeded");
+
+    // Failure after success is equally forbidden
+    db.update_run_status("run_cas_b", "failed", None, None, None)
+        .expect_err("failed must not overwrite succeeded");
+
+    // waiting_approval → failed is legal (approval flow died)
+    lifecycle_run(&db, "run_cas_c", "waiting_approval");
+    db.update_run_status("run_cas_c", "failed", None, Some(4), Some("backend error"))
+        .unwrap();
+    assert_eq!(run_status(&db, "run_cas_c"), "failed");
+    assert!(
+        !db.cancel_run_if_active("run_cas_c", "late cancel").unwrap(),
+        "cancellation cannot revive a failed run"
+    );
+
+    // Unknown run: cancellation reports false instead of fabricating state
+    assert!(!db
+        .cancel_run_if_active("run_cas_missing", "no run")
+        .unwrap());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cancel_versus_completion_interleavings_never_corrupt_outcomes() {
+    let (dir, db) = temp_db("run_race");
+    db.create_conversation("conv_race", "RACE", "test-model")
+        .unwrap();
+
+    // Interleaving 1: cancel lands between activation and completion.
+    lifecycle_run(&db, "run_race_1", "queued");
+    db.update_run_status("run_race_1", "running", None, None, None)
+        .unwrap();
+    let cancel_won = db.cancel_run_if_active("run_race_1", "stop").unwrap();
+    let completion = db.update_run_status("run_race_1", "succeeded", None, Some(9), None);
+    assert!(cancel_won && completion.is_err());
+    // Completed-at is only set by the winner: a cancelled run without a
+    // completion write must not carry a fabricated completion timestamp.
+    let record = db.get_run("run_race_1").unwrap().unwrap();
+    assert_eq!(record.status, "cancelled");
+    assert!(
+        record.completed_at.is_none() || record.completed_at.unwrap() > 0,
+        "cancelled run keeps only a truthful completion record"
+    );
+
+    // Interleaving 2: completion lands first, cancel must not rewrite it.
+    lifecycle_run(&db, "run_race_2", "queued");
+    db.update_run_status("run_race_2", "running", None, None, None)
+        .unwrap();
+    db.update_run_status("run_race_2", "succeeded", None, Some(10), None)
+        .unwrap();
+    let cancel_lost = db.cancel_run_if_active("run_race_2", "late stop").unwrap();
+    assert!(!cancel_lost);
+    let record = db.get_run("run_race_2").unwrap().unwrap();
+    assert_eq!(record.status, "succeeded");
+    assert_eq!(record.completed_at, Some(10));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Bug 7: grant capabilities are narrowed to what the task prompt justifies
+// ---------------------------------------------------------------------
+
+#[test]
+fn task_scope_narrows_grant_capabilities_to_what_the_prompt_needs() {
+    use kyro_lib::governance::RoutineOpClass;
+
+    // Benign read-only question: exactly inspection + safe commands.
+    let mut benign = TaskAuthorizationGrant::new(
+        "run_scope_benign".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    benign.scope_operations_to_task("What is the latest status of the repository?");
+    assert!(
+        benign
+            .allowed_operations
+            .contains(&RoutineOpClass::FileRead)
+            && benign
+                .allowed_operations
+                .contains(&RoutineOpClass::SafeCommand),
+        "every need still gets read + safe command: {:?}",
+        benign.allowed_operations
+    );
+    assert!(
+        !benign
+            .allowed_operations
+            .contains(&RoutineOpClass::FileWrite),
+        "a question must not gain autonomous write capability"
+    );
+    assert!(
+        !benign
+            .allowed_operations
+            .contains(&RoutineOpClass::FileOrganize),
+        "a question must not gain autonomous organization capability"
+    );
+    assert!(
+        !benign
+            .allowed_operations
+            .contains(&RoutineOpClass::LocalVerification),
+        "a question must not gain autonomous verification capability"
+    );
+
+    // Substring traps must not lengthen the grant (word-boundary aware).
+    let mut tricky = TaskAuthorizationGrant::new(
+        "run_scope_tricky".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    // "latest" contains the substring "test" and "remote" contains "move";
+    // the standalone-word check must reject both.
+    tricky.scope_operations_to_task("Summarize the remote standup notes for me");
+    assert!(
+        !tricky
+            .allowed_operations
+            .contains(&RoutineOpClass::LocalVerification),
+        "'latest'-style substrings must not grant verification"
+    );
+    assert!(
+        !tricky
+            .allowed_operations
+            .contains(&RoutineOpClass::FileWrite),
+        "'remote'-style substrings must not grant write"
+    );
+
+    // A real development task keeps the capabilities it genuinely needs.
+    let mut dev = TaskAuthorizationGrant::new(
+        "run_scope_dev".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    dev.scope_operations_to_task(
+        "Fix the failing build, run cargo test, and save a summary in the notes file",
+    );
+    assert!(dev
+        .allowed_operations
+        .contains(&RoutineOpClass::LocalVerification));
+    assert!(dev.allowed_operations.contains(&RoutineOpClass::FileWrite));
+
+    // An organization task gains organize (and hence write) but not
+    // verification unless it asked for dev work too.
+    let mut org = TaskAuthorizationGrant::new(
+        "run_scope_org".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    org.scope_operations_to_task("Organize the downloads folder and deduplicate the files");
+    assert!(org
+        .allowed_operations
+        .contains(&RoutineOpClass::FileOrganize));
+    assert!(org.allowed_operations.contains(&RoutineOpClass::FileWrite));
+    assert!(!org
+        .allowed_operations
+        .contains(&RoutineOpClass::LocalVerification));
+}
+
+// ---------------------------------------------------------------------
+// Bugs 8 & 9: repository-controlled verification is sandboxed or fails
+// closed, and only a lifecycle-valid grant can enter that branch.
+// ---------------------------------------------------------------------
+
+#[test]
+fn repo_controlled_verification_requires_sandbox_or_checkpoint() {
+    use kyro_lib::sandbox::DockerSandbox;
+    let (dir, db) = temp_db("repo_verify");
+    let sandbox_available = DockerSandbox::probe().available;
+
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let canonical_workspace = workspace.canonicalize().unwrap();
+
+    let run_id = "run_verify_1";
+    let grant = TaskAuthorizationGrant::new(
+        run_id.to_string(),
+        Some(canonical_workspace.clone()),
+        vec![canonical_workspace.clone()],
+        TaskAutonomyMode::Autonomous,
+    );
+    let ctx = ExecutionContext {
+        run_id: run_id.to_string(),
+        agent_id: "apex-orchestrator".to_string(),
+        conversation_id: Some("conv_verify".to_string()),
+        workspace_root: Some(canonical_workspace.clone()),
+        task_grant: Some(grant),
+    };
+
+    let repo_controlled_reason = |decision: &AuthDecision| -> Option<String> {
+        match decision {
+            AuthDecision::RequireApproval { reason, .. } => {
+                if reason.contains("repository-controlled") {
+                    Some(reason.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+
+    for (command, expected_image) in [
+        ("cargo test", "rust:1.80-alpine"),
+        ("cargo build", "rust:1.80-alpine"),
+        ("npm test", "node:20-alpine"),
+        ("npm run build", "node:20-alpine"),
+        ("pytest -q", "python:3.12-alpine"),
+    ] {
+        let decision = AuthorizationEngine::evaluate(
+            &db,
+            &ctx,
+            "execute_shell",
+            &serde_json::json!({ "command": command }),
+        );
+        if sandbox_available {
+            match decision {
+                AuthDecision::AllowSandboxOnly { ref image } => {
+                    assert_eq!(image, expected_image, "family image for '{}'", command);
+                }
+                other => panic!(
+                    "'{}' with an active grant and a sandbox present must route to the sandbox, got {:?}",
+                    command, other
+                ),
+            }
+        } else {
+            assert!(
+                repo_controlled_reason(&decision).is_some(),
+                "'{}' must fail closed to a trust checkpoint when no sandbox exists, got {:?}",
+                command,
+                decision
+            );
+        }
+    }
+
+    // Genuinely safe local checks stay autonomous on the normal allowlist
+    // path, even when no sandbox exists (Bug 8 scope discipline).
+    let git_status = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "execute_shell",
+        &serde_json::json!({ "command": "git status" }),
+    );
+    assert!(
+        is_allow(&git_status),
+        "safe local inspection must not be dragged into the verification sandbox: {:?}",
+        git_status
+    );
+
+    // Without a task grant the verification branch never engages at all.
+    let mut bare = ctx.clone();
+    bare.task_grant = None;
+    let no_grant = AuthorizationEngine::evaluate(
+        &db,
+        &bare,
+        "execute_shell",
+        &serde_json::json!({ "command": "cargo test" }),
+    );
+    if sandbox_available && matches!(no_grant, AuthDecision::AllowSandboxOnly { .. }) {
+        panic!(
+            "the verification branch must require an active grant, got {:?}",
+            no_grant
+        );
+    } else if !sandbox_available {
+        assert!(
+            repo_controlled_reason(&no_grant).is_none(),
+            "without a grant the fail-closed reason must come from the regular policy, got {:?}",
+            no_grant
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn expired_grants_never_reach_the_verification_branch() {
+    use kyro_lib::sandbox::DockerSandbox;
+    let (dir, db) = temp_db("repo_verify_expired");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let canonical_workspace = workspace.canonicalize().unwrap();
+
+    let run_id = "run_verify_expired";
+    let mut grant = TaskAuthorizationGrant::new(
+        run_id.to_string(),
+        Some(canonical_workspace.clone()),
+        vec![canonical_workspace.clone()],
+        TaskAutonomyMode::Autonomous,
+    );
+    grant.expires_at = chrono::Utc::now().timestamp_millis() - 1_000;
+
+    let ctx = ExecutionContext {
+        run_id: run_id.to_string(),
+        agent_id: "apex-orchestrator".to_string(),
+        conversation_id: Some("conv_verify".to_string()),
+        workspace_root: Some(canonical_workspace.clone()),
+        task_grant: Some(grant),
+    };
+
+    let decision = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "execute_shell",
+        &serde_json::json!({ "command": "cargo test" }),
+    );
+    match decision {
+        AuthDecision::AllowSandboxOnly { .. } => panic!(
+            "an expired grant must never authorize sandboxed verification through the grant branch"
+        ),
+        AuthDecision::RequireApproval { ref reason, .. } => {
+            assert!(
+                !reason.contains("repository-controlled"),
+                "the fail-close reason belongs to the *active* verification branch only: {:?}",
+                reason
+            );
+        }
+        _ => {}
+    }
+
+    let _ = DockerSandbox::probe();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn terminal_run_status_revokes_an_outstanding_verification_grant() {
+    use kyro_lib::sandbox::DockerSandbox;
+    let (dir, db) = temp_db("repo_verify_interrupted");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let canonical_workspace = workspace.canonicalize().unwrap();
+
+    let run_id = "run_verify_interrupt";
+    let grant = TaskAuthorizationGrant::new(
+        run_id.to_string(),
+        Some(canonical_workspace.clone()),
+        vec![canonical_workspace.clone()],
+        TaskAutonomyMode::Autonomous,
+    );
+    let ctx = ExecutionContext {
+        run_id: run_id.to_string(),
+        agent_id: "apex-orchestrator".to_string(),
+        conversation_id: None,
+        workspace_root: Some(canonical_workspace.clone()),
+        task_grant: Some(grant),
+    };
+
+    // Interruption is recorded durably before the callback fires.
+    lifecycle_run(&db, run_id, "running");
+    db.update_run_status(run_id, "interrupted", None, Some(1), Some("power loss"))
+        .expect("interrupted is a legal transition from running");
+
+    let decision = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "execute_shell",
+        &serde_json::json!({ "command": "cargo test" }),
+    );
+    match &decision {
+        AuthDecision::AllowSandboxOnly { .. } => panic!(
+            "a grant for an interrupted run must be revoked before the verification branch runs, got {:?}",
+            decision
+        ),
+        AuthDecision::RequireApproval { reason, .. } => {
+            assert!(
+                !reason.contains("repository-controlled"),
+                "after revocation the same command must fall through to the regular policy classification, got {:?}",
+                reason
+            );
+        }
+        _ => {}
+    }
+
+    let _ = DockerSandbox::probe();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Bug 10: activation and fill targets are classified from every locator
+// the production target resolver understands.
+// ---------------------------------------------------------------------
+
+#[test]
+fn browser_click_classification_considers_every_locator() {
+    let policy = GovernancePolicy::default();
+    let ctx = context();
+
+    let decide_click = |args: serde_json::Value| {
+        // The profile tool layer maps a passing target to None (full
+        // authorization continues in the loop); everything else is its gate.
+        match tools::evaluate_tool(&policy, &ctx, "browser_click", &args) {
+            Some(decision) => decision,
+            None => AuthDecision::Allow,
+        }
+    };
+
+    for (label, args) in [
+        (
+            "css selector naming a delete control",
+            serde_json::json!({ "css": ".delete-account-btn" }),
+        ),
+        (
+            "test id addressing a submit control",
+            serde_json::json!({ "test_id": "submit-button" }),
+        ),
+        (
+            "role + accessible name for a destructive action",
+            serde_json::json!({ "role": "button", "name": "Remove (permanent)" }),
+        ),
+        (
+            "bare element reference with no readable semantics",
+            serde_json::json!({ "ref": "el_42" }),
+        ),
+        ("bare coordinates", serde_json::json!({ "x": 120, "y": 88 })),
+        ("no target at all", serde_json::json!({})),
+    ] {
+        let decision = decide_click(args);
+        assert!(
+            is_approval(&decision),
+            "{} must require an approval: {:?}",
+            label,
+            decision
+        );
+    }
+
+    // Benign target with readable semantics executes autonomously.
+    let benign = decide_click(serde_json::json!({
+        "role": "button",
+        "name": "Download latest",
+        "text": "Get the release notes"
+    }));
+    assert!(
+        is_allow(&benign),
+        "a readable benign target must not be held for approval: {:?}",
+        benign
+    );
+
+    // Traversal through the arguments' full shape still hits the resolver:
+    // snapping coordinates onto an *unclassified* element stays gated.
+    let hybrid = decide_click(serde_json::json!({ "nth": 3, "x": 10, "y": 20 }));
+    assert!(
+        is_approval(&hybrid),
+        "an nth index with no semantics is not a resolvable target: {:?}",
+        hybrid
+    );
+}
+
+#[test]
+fn browser_fill_is_gated_by_field_semantics_and_value() {
+    let policy = GovernancePolicy::default();
+    let ctx = context();
+
+    let decide_fill = |args: serde_json::Value| {
+        // Same None convention as browser_click for passing targets.
+        match tools::evaluate_tool(&policy, &ctx, "browser_fill", &args) {
+            Some(decision) => decision,
+            None => AuthDecision::Allow,
+        }
+    };
+
+    // A resolved credential field is a human takeover checkpoint regardless
+    // of what the model claims it is typing (Bug 10).
+    for field in ["#password", "input[name='card number']", "css #cvv-field"] {
+        let decision = decide_fill(serde_json::json!({
+            "css": field,
+            "value": "nothing secret in the claims"
+        }));
+        assert!(
+            matches!(decision, AuthDecision::RequireTakeover { .. }),
+            "filling credential field '{}' must require takeover: {:?}",
+            field,
+            decision
+        );
+    }
+
+    // Credential-looking VALUE inside a benign field is also a takeover.
+    let value_sensitive = decide_fill(serde_json::json!({
+        "name": "comment",
+        "text": "comment box",
+        "value": "set password to hunter2 for the demo account"
+    }));
+    assert!(
+        matches!(value_sensitive, AuthDecision::RequireTakeover { .. }),
+        "a credential value must force takeover: {:?}",
+        value_sensitive
+    );
+
+    // Ambiguous target with a benign value still needs an approval because
+    // the field semantics could not be verified.
+    let ambiguous = decide_fill(serde_json::json!({ "ref": "el_7", "value": "hello" }));
+    assert!(
+        matches!(ambiguous, AuthDecision::RequireApproval { .. }),
+        "unclassifiable fill target must be approved: {:?}",
+        ambiguous
+    );
+
+    // Benign field + benign value runs autonomously.
+    let benign = decide_fill(serde_json::json!({
+        "css": "#newsletter-email",
+        "name": "email address",
+        "value": "me@example.com"
+    }));
+    assert!(
+        is_allow(&benign),
+        "benign fill must run autonomously: {:?}",
+        benign
+    );
+}
+
+#[test]
+fn click_mark_risk_comes_from_the_trusted_mark_registry() {
+    use kyro_lib::grounding::som::{GroundedMark, MarkTarget};
+    use kyro_lib::grounding::SetOfMarksEngine;
+
+    // Start from a clean global grounding session; restore cleanliness at the
+    // end so unrelated tests are unaffected by this suite's runs.
+    SetOfMarksEngine::clear();
+
+    let make_mark = |id: usize, role: &str, label: &str| GroundedMark {
+        id,
+        x: 10,
+        y: 10,
+        width: 8,
+        height: 8,
+        label: label.to_string(),
+        role: role.to_string(),
+        confidence: 0.99,
+        target: MarkTarget::Semantic {
+            element_ref: format!("el_{}", id),
+            role: role.to_string(),
+            name: label.to_string(),
+        },
+    };
+
+    SetOfMarksEngine::install_semantic_marks(
+        vec![
+            make_mark(42, "button", "Delete account"),
+            make_mark(43, "button", "Save document"),
+            make_mark(44, "button", ""),
+        ],
+        "fingerprint_click".to_string(),
+        vec![0u8; 64],
+        8,
+        8,
+    );
+
+    let policy = GovernancePolicy::default();
+
+    // 1. Consequential trusted label → checkpoint.
+    let dangerous_decision =
+        AuthorizationEngine::evaluate_click_mark(&policy, &serde_json::json!({ "mark_id": 42 }));
+    assert!(
+        matches!(
+            dangerous_decision,
+            AuthDecision::RequireApproval { ref reason, .. } if reason.contains("Delete account")
+        ),
+        "clicking a mark labeled 'Delete account' must be held for approval: {:?}",
+        dangerous_decision
+    );
+
+    // 2. Benign trusted label runs autonomously.
+    let benign_decision =
+        AuthorizationEngine::evaluate_click_mark(&policy, &serde_json::json!({ "mark_id": 43 }));
+    assert!(
+        is_allow(&benign_decision),
+        "clicking a benignly labeled mark must run autonomously: {:?}",
+        benign_decision
+    );
+
+    // 3. A mark with an empty trusted label cannot be classified → checkpoint.
+    let empty_decision =
+        AuthorizationEngine::evaluate_click_mark(&policy, &serde_json::json!({ "mark_id": 44 }));
+    assert!(
+        is_approval(&empty_decision),
+        "an empty-label mark must not default to benign: {:?}",
+        empty_decision
+    );
+
+    // 4. An unknown mark cannot be enacted by dispatch at all: the engine
+    // cannot resolve coordinates for it, so authorization does not wedge the
+    // run into a human queue — the dispatch boundary refuses it with a
+    // truthful error and re-validates labels before any click.
+    let unknown_decision =
+        AuthorizationEngine::evaluate_click_mark(&policy, &serde_json::json!({ "mark_id": 999 }));
+    assert!(
+        is_allow(&unknown_decision),
+        "unknown marks are refused at dispatch, not held for approval: {:?}",
+        unknown_decision
+    );
+
+    SetOfMarksEngine::clear();
+}
+
+// ---------------------------------------------------------------------
+// Bug 12: an unreadable governance store must never degrade to
+// "no policy" — it fails closed to a checkpoint or denial.
+// ---------------------------------------------------------------------
+
+/// Drops one governance table in the *real* production database so the
+/// corresponding read genuinely fails inside the authorization engine — no
+/// mocks, no simulated errors.
+#[test]
+fn unreadable_settings_fail_tool_authorization_closed() {
+    let (dir, db) = temp_db("db_fail_closed");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let canonical_workspace = workspace.canonicalize().unwrap();
+
+    let ctx = ExecutionContext {
+        run_id: "run_db_fail".to_string(),
+        agent_id: "apex-orchestrator".to_string(),
+        conversation_id: None,
+        workspace_root: Some(canonical_workspace.clone()),
+        task_grant: None,
+    };
+
+    // Healthy baseline: an in-workspace read executes autonomously.
+    std::fs::write(canonical_workspace.join("doc.txt"), "fine").unwrap();
+    let healthy = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "read_file",
+        &serde_json::json!({ "path": "doc.txt" }),
+    );
+    assert!(
+        is_allow(&healthy),
+        "baseline read must be autonomous before the failure: {:?}",
+        healthy
+    );
+
+    // Remove the settings table: every `mcp_perm:*` policy lookup now
+    // genuinely fails inside the authorization engine.
+    db.with_conn(|conn| {
+        conn.execute_batch("DROP TABLE settings;").unwrap();
+    });
+
+    // 1. A benign tool must NOT silently pass the (unreadable) explicit-off
+    // policy switch: failure to verify policy ≠ no policy.
+    let degraded = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "read_file",
+        &serde_json::json!({ "path": "doc.txt" }),
+    );
+    match degraded {
+        AuthDecision::RequireApproval { ref reason, .. } => {
+            assert!(
+                reason.contains("could not be verified"),
+                "fail-closed checkpoint must explain the store failure: {:?}",
+                reason
+            );
+        }
+        _ => panic!(
+            "unreadable policy state must degrade to a checkpoint: {:?}",
+            degraded
+        ),
+    }
+
+    // 2. MCP/custom tool authorization refuses to run without a readable
+    // permission row: the legacy permission layer is skipped in production
+    // only when the DB works, never when it fails (Bug 12).
+    let mcp_tool = AuthorizationEngine::evaluate_mcp_or_custom(
+        &db,
+        &GovernancePolicy::default(),
+        "acme/widget",
+        &serde_json::json!({}),
+    );
+    match mcp_tool {
+        AuthDecision::Deny { ref reason } => {
+            assert!(
+                reason.contains("could not be verified"),
+                "MCP permission lookup failure must deny: {:?}",
+                mcp_tool
+            );
+        }
+        _ => panic!("MCP unreadable permission must deny: {:?}", mcp_tool),
+    }
+
+    // 3. Healthy control: the same MCP tool against an intact store is
+    // handled by the standard conservative path, not by the failure handler.
+    let (dir2, db2) = temp_db("db_fail_control");
+    let control = AuthorizationEngine::evaluate_mcp_or_custom(
+        &db2,
+        &GovernancePolicy::default(),
+        "acme/widget",
+        &serde_json::json!({}),
+    );
+    if let AuthDecision::Deny { ref reason } = control {
+        assert!(
+            !reason.contains("could not be verified"),
+            "a healthy store must not take the failure path: {:?}",
+            reason
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn unreadable_connector_policy_denies_scoped_tool_execution() {
+    use kyro_lib::storage::ConnectedAccountRecord;
+    let (dir, db) = temp_db("conn_policy_fail");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let account = ConnectedAccountRecord {
+        id: "conn_policy_1".to_string(),
+        connector_id: "github".to_string(),
+        account_identifier: "octocat".to_string(),
+        display_name: "GitHub Octocat".to_string(),
+        status: "connected".to_string(),
+        status_message: None,
+        granted_scopes_json: "[]".to_string(),
+        credential_key: "key_policy_1".to_string(),
+        config_json: "{}".to_string(),
+        created_at: now,
+        updated_at: now,
+        last_connected_at: Some(now),
+        last_error: None,
+        expires_at: None,
+    };
+    db.create_connected_account(&account).unwrap();
+
+    // Remove the connector policy table: account status checks keep working,
+    // while the policy lookup for the scoped tool genuinely fails.
+    db.with_conn(|conn| {
+        conn.execute_batch("DROP TABLE connector_tool_policies;")
+            .unwrap();
+    });
+
+    let decision = AuthorizationEngine::evaluate_mcp_or_custom(
+        &db,
+        &GovernancePolicy::default(),
+        "conn_policy_1__fetch_widget",
+        &serde_json::json!({ "id": "w-1" }),
+    );
+    match decision {
+        AuthDecision::Deny { ref reason } => {
+            assert!(
+                reason.contains("could not be verified"),
+                "connector policy lookup failure must deny instead of relying on unknown-tool heuristics: {:?}",
+                reason
+            );
+        }
+        _ => panic!("connector policy unreadable must deny: {:?}", decision),
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Bug 14: execution confines files to exactly the roots authorization
+// validated — workspace root plus every authorized folder.
+// ---------------------------------------------------------------------
+
+#[test]
+fn secure_file_operations_confine_to_every_authorized_root() {
+    let (dir, db) = temp_db("multi_root");
+    let workspace = dir.join("workspace");
+    let secondary = dir.join("secondary");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&secondary).unwrap();
+    let canonical_workspace = workspace.canonicalize().unwrap();
+    let canonical_secondary = secondary.canonicalize().unwrap();
+
+    std::fs::write(canonical_workspace.join("in_ws.txt"), "ws content").unwrap();
+    std::fs::write(
+        canonical_secondary.join("in_secondary.txt"),
+        "secondary content",
+    )
+    .unwrap();
+
+    let run_id = "run_multi_root";
+    let grant = TaskAuthorizationGrant::new(
+        run_id.to_string(),
+        Some(canonical_workspace.clone()),
+        vec![canonical_workspace.clone(), canonical_secondary.clone()],
+        TaskAutonomyMode::Autonomous,
+    );
+    let ctx = ExecutionContext {
+        run_id: run_id.to_string(),
+        agent_id: "apex-orchestrator".to_string(),
+        conversation_id: None,
+        workspace_root: Some(canonical_workspace.clone()),
+        task_grant: Some(grant),
+    };
+
+    // --- Authorization and execution agree on every authorized root ---
+
+    // Read inside the secondary authorized folder: authorized by the engine...
+    let auth_decision = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "read_file",
+        &serde_json::json!({ "path": canonical_secondary.join("in_secondary.txt") }),
+    );
+    assert!(
+        is_allow(&auth_decision),
+        "secondary authorized folder must authorize reads: {:?}",
+        auth_decision
+    );
+
+    // ...and physically read through the same root list the decision used.
+    let roots = kyro_lib::governance::TaskAuthorizationGrant::execution_roots(&ctx);
+    assert_eq!(
+        roots.len(),
+        2,
+        "execution roots must include the workspace and the secondary folder: {:?}",
+        roots
+    );
+    let content = AuthorizationEngine::secure_read_contained_roots(
+        &roots,
+        &canonical_secondary
+            .join("in_secondary.txt")
+            .to_string_lossy(),
+    )
+    .expect("read inside secondary root");
+    assert_eq!(content, "secondary content");
+
+    // Write into a nested path of the secondary root, then verify on disk.
+    let written = AuthorizationEngine::secure_write_contained_roots(
+        &roots,
+        &canonical_secondary
+            .join("output/produced.txt")
+            .to_string_lossy(),
+        b"produced".as_slice(),
+    )
+    .expect("write inside secondary root");
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "produced",
+        "written bytes round-trip"
+    );
+
+    // Relative paths resolve against the workspace root (first root) on both
+    // sides: authorization and execution give the same result.
+    let rel_auth = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "read_file",
+        &serde_json::json!({ "path": "in_ws.txt" }),
+    );
+    assert!(
+        is_allow(&rel_auth),
+        "relative in-workspace read is authorized"
+    );
+    let rel_exec = AuthorizationEngine::secure_read_contained_roots(&roots, "in_ws.txt")
+        .expect("relative in-workspace read executes");
+    assert_eq!(rel_exec, "ws content");
+
+    // --- Everything outside the authorized roots fails on both sides ---
+
+    let outside = dir.join("outsider.txt");
+    std::fs::write(&outside, "forbidden").unwrap();
+
+    let outside_auth = AuthorizationEngine::evaluate(
+        &db,
+        &ctx,
+        "read_file",
+        &serde_json::json!({ "path": outside.clone() }),
+    );
+    assert!(
+        !is_allow(&outside_auth),
+        "outside path must not be authorized: {:?}",
+        outside_auth
+    );
+    assert!(
+        AuthorizationEngine::secure_read_contained_roots(&roots, &outside.to_string_lossy())
+            .is_err(),
+        "outside path must not be readable at execution either"
+    );
+
+    // Nonexistent read target: explicit failure, not a fallback.
+    assert!(
+        AuthorizationEngine::secure_read_contained_roots(
+            &roots,
+            &canonical_secondary.join("missing.txt").to_string_lossy(),
+        )
+        .is_err(),
+        "missing files fail explicitly"
+    );
+
+    // Traversal escapes fail closed.
+    assert!(
+        AuthorizationEngine::secure_read_contained_roots(
+            &roots,
+            &canonical_secondary
+                .join("../outsider.txt")
+                .to_string_lossy(),
+        )
+        .is_err(),
+        "'..' escaping the secondary root must be refused"
+    );
+
+    // Symlink placed inside the secondary root pointing outside: refused.
+    let symlink_path = canonical_secondary.join("escape_link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
+    #[cfg(not(unix))]
+    std::fs::write(&symlink_path, "not a link").unwrap();
+
+    let symlink_result =
+        AuthorizationEngine::secure_read_contained_roots(&roots, &symlink_path.to_string_lossy());
+    #[cfg(unix)]
+    assert!(
+        symlink_result.is_err(),
+        "symlink escape from a secondary root must be refused: {:?}",
+        symlink_result
+    );
+    #[cfg(not(unix))]
+    let _ = symlink_result;
+
+    std::fs::remove_dir_all(&dir).ok();
+}

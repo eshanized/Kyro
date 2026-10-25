@@ -247,9 +247,9 @@ describe("App Ultimate Coverage & Edge Cases", () => {
 
     // Plan should be rendered
     await waitFor(() => {
-      expect(screen.getByText("Execution Plan")).toBeInTheDocument();
-      expect(screen.getByText(/Kyro received request/i)).toBeInTheDocument();
-      expect(screen.getByText("Authorized Local Directories")).toBeInTheDocument();
+      expect(screen.getByText("Suggested Workflow")).toBeInTheDocument();
+      // Resources are honest for the intent (Bug 5).
+      expect(screen.getByText(/Authorized folders \(paths outside them need your approval\)/i)).toBeInTheDocument();
       expect(screen.getAllByText("Inspect and analyze relevant resources and parameters").length).toBeGreaterThan(0);
     });
 
@@ -258,7 +258,7 @@ describe("App Ultimate Coverage & Edge Cases", () => {
     fireEvent.click(dismissBtn);
 
     await waitFor(() => {
-      expect(screen.queryByText("Execution Plan")).not.toBeInTheDocument();
+      expect(screen.queryByText("Suggested Workflow")).not.toBeInTheDocument();
     });
   });
 

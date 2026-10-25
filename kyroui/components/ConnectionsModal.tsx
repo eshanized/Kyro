@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ConnectorCatalogItem,
@@ -111,6 +111,65 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
   } | null>(null);
   const [oauthPolling, setOauthPolling] = useState(false);
 
+  // ---------------------------------------------------------------------
+  // OAuth lifecycle (bug 17)
+  //
+  // `oauthLifecycleRef` is a per-flow generation token: every async
+  // continuation carries the generation it was started under, and every
+  // continuation re-checks staleness BOTH before starting its work and
+  // after every await. `close_oauth`/cancel/unmount bumps the generation so
+  // late `start_oauth_flow` responses and late status polls are ignored
+  // instead of hijacking new flows.
+  // ---------------------------------------------------------------------
+  const oauthLifecycleRef = useRef(0);
+  const oauthSessionRef = useRef<
+    { sessionId: string; authUrl: string; redirectUri: string } | null
+  >(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** Overlap guard: prevents a new status request before the previous await resolves. */
+  const pollInFlightRef = useRef(false);
+  /** Idempotency guard: `complete_oauth_flow` is one-shot per flow. */
+  const completionStartedRef = useRef(false);
+  /** Start request currently in flight, used by cancel-during-start. */
+  const oauthStartInFlightRef = useRef<Promise<{
+    auth_url: string;
+    session_id: string;
+    redirect_uri: string;
+    expires_at: number;
+  }> | null>(null);
+
+  const clearOauthPollTimer = () => {
+    if (pollTimerRef.current !== null) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  };
+
+  /** Session state setter that keeps the synchronously readable mirror exact. */
+  const setOauthSessionBoth = (
+    value: { sessionId: string; authUrl: string; redirectUri: string } | null
+  ) => {
+    oauthSessionRef.current = value;
+    setOauthSession(value);
+  };
+
+  // Closing the modal without the dedicated cancel button still cancels a
+  // live backend session and invalidates all in-flight continuations.
+  useEffect(() => {
+    if (isOpen) return;
+    oauthLifecycleRef.current += 1;
+    clearOauthPollTimer();
+    const session = oauthSessionRef.current;
+    if (session && !completionStartedRef.current) {
+      invoke("cancel_oauth_flow", { sessionId: session.sessionId }).catch((e) =>
+        console.warn("Cancel OAuth error:", e)
+      );
+    }
+    oauthSessionRef.current = null;
+    completionStartedRef.current = false;
+    pollInFlightRef.current = false;
+  }, [isOpen]);
+
   // Manage Account / Policies dialog state
   const [managingAccount, setManagingAccount] = useState<ConnectedAccountSummary | null>(null);
   const [accountPolicies, setAccountPolicies] = useState<ConnectorToolPolicyRecord[]>([]);
@@ -162,6 +221,13 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
   };
 
   const handleOpenConnect = (item: ConnectorCatalogItem) => {
+    // Bug 16 defense in depth: connectors whose catalog strategy declares no
+    // authentication can never route to the credential forms. Local MCP
+    // configuration lives in its own interface.
+    if (item.auth_type === "none") {
+      setActiveTab("custom_mcp");
+      return;
+    }
     setConnectingItem(item);
     if (item.auth_type === "oauth_browser" || item.auth_type === "pat_or_oauth") {
       setAuthMethod("oauth");
@@ -173,130 +239,224 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
     setDisplayNameInput(`${item.name} Account`);
     setRemoteUrlInput(item.id === "remote_mcp" ? "http://127.0.0.1:8000/mcp" : "");
     setAllowPrivateNetwork(false);
-    setOauthSession(null);
+    setOauthSessionBoth(null);
     setOauthPolling(false);
     setOauthClientId("");
     setOauthClientSecret("");
+    // Opening a fresh connect dialog invalidates any continuation from a
+    // previous OAuth flow for this component lifetime.
+    oauthLifecycleRef.current += 1;
+    clearOauthPollTimer();
+    pollInFlightRef.current = false;
+    completionStartedRef.current = false;
+    oauthStartInFlightRef.current = null;
   };
 
   const handleStartOAuth = async () => {
     if (!connectingItem) return;
+    // A new attempt invalidates any continuation from a previous flow
+    // (late polling ticks, late completions).
+    const generation = ++oauthLifecycleRef.current;
+    clearOauthPollTimer();
+    pollInFlightRef.current = false;
+    completionStartedRef.current = false;
     setIsSubmittingConnect(true);
+    let init: {
+      auth_url: string;
+      session_id: string;
+      redirect_uri: string;
+      expires_at: number;
+    };
+    const startPromise = invoke<{
+      auth_url: string;
+      session_id: string;
+      redirect_uri: string;
+      expires_at: number;
+    }>("start_oauth_flow", {
+      connectorId: connectingItem.id,
+      clientId: oauthClientId.trim() || null,
+      clientSecret: oauthClientSecret.trim() || null,
+    });
+    oauthStartInFlightRef.current = startPromise;
     try {
-      const init = await invoke<{
-        auth_url: string;
-        session_id: string;
-        redirect_uri: string;
-        expires_at: number;
-      }>("start_oauth_flow", {
-        connectorId: connectingItem.id,
-        clientId: oauthClientId.trim() || null,
-        clientSecret: oauthClientSecret.trim() || null,
-      });
-
-      setOauthSession({
-        sessionId: init.session_id,
-        authUrl: init.auth_url,
-        redirectUri: init.redirect_uri,
-      });
-      setOauthPolling(true);
-
-      try {
-        const { open } = await import("@tauri-apps/plugin-shell");
-        await open(init.auth_url);
-      } catch {
-        window.open(init.auth_url, "_blank");
-      }
-
-      pollOAuthCompletion(init.session_id);
+      init = await startPromise;
     } catch (err: any) {
+      oauthStartInFlightRef.current = null;
+      if (generation !== oauthLifecycleRef.current) return; // cancelled during start
       showMessage(`Failed to initiate OAuth: ${err}`, "error");
       setIsSubmittingConnect(false);
+      return;
     }
+
+    oauthStartInFlightRef.current = null;
+    if (generation !== oauthLifecycleRef.current) {
+      // The user cancelled or closed the modal while the start request was
+      // in flight. The backend session that just materialized must NOT keep
+      // running in the background without UI ownership.
+      invoke("cancel_oauth_flow", { sessionId: init.session_id }).catch((e) =>
+        console.warn("Cancel OAuth error:", e)
+      );
+      return;
+    }
+
+    setOauthSessionBoth({
+      sessionId: init.session_id,
+      authUrl: init.auth_url,
+      redirectUri: init.redirect_uri,
+    });
+    setOauthPolling(true);
+
+    try {
+      const { open } = await import("@tauri-apps/plugin-shell");
+      await open(init.auth_url);
+    } catch {
+      window.open(init.auth_url, "_blank");
+    }
+
+    pollOAuthCompletion(init.session_id, generation);
   };
 
-  const pollOAuthCompletion = (sessionId: string) => {
+  const pollOAuthCompletion = (sessionId: string, generation: number) => {
     let attempts = 0;
     const maxAttempts = 80; // 2 minutes at 1.5s interval
-    let isExchanging = false;
 
-    const pollInterval = setInterval(async () => {
+    const tick = async () => {
+      // Stale generation: this timer belongs to a cancelled/closed flow; a
+      // generation bump always clears the timer first, so this is a
+      // last-resort guard against any event-loop stragglers.
+      if (generation !== oauthLifecycleRef.current) {
+        clearOauthPollTimer();
+        return;
+      }
+
+      // Overlap guard BEFORE awaiting: a slow status response must never let
+      // the next tick start a second concurrent status request.
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
+
+      let statusView: OAuthSessionStatusView;
+      try {
+        statusView = await invoke<OAuthSessionStatusView>("get_oauth_status", {
+          sessionId,
+        });
+      } catch (err: any) {
+        pollInFlightRef.current = false;
+        console.warn("OAuth status poll error:", err);
+        return;
+      }
+      pollInFlightRef.current = false;
+
+      // Ignore late responses that resolved after close/cancel.
+      if (generation !== oauthLifecycleRef.current) return;
+
       attempts++;
       if (attempts > maxAttempts) {
-        clearInterval(pollInterval);
+        clearOauthPollTimer();
         setOauthPolling(false);
         setIsSubmittingConnect(false);
+        const session = oauthSessionRef.current;
+        if (session) {
+          invoke("cancel_oauth_flow", { sessionId: session.sessionId }).catch(
+            (e) => console.warn("Cancel OAuth error:", e)
+          );
+        }
+        setOauthSessionBoth(null);
         showMessage("OAuth authentication timed out. Please try again.", "error");
         return;
       }
 
-      if (isExchanging) return;
-
-      try {
-        const statusView = await invoke<OAuthSessionStatusView>("get_oauth_status", {
-          sessionId,
-        });
-
-        if (statusView.status === "completed") {
-          isExchanging = true;
-          clearInterval(pollInterval);
-          try {
-            const summary = await invoke<ConnectedAccountSummary>("complete_oauth_flow", {
-              sessionId,
-              code: null,
-            });
-            setOauthPolling(false);
-            setOauthSession(null);
-            setConnectingItem(null);
-            setIsSubmittingConnect(false);
-            const identity = summary.display_name || summary.account_identifier;
-            showMessage(
-              `Successfully connected account: ${identity}!`,
-              "success"
-            );
-            await loadAllData();
-            setActiveTab("connected");
-          } catch (compErr: any) {
-            setOauthPolling(false);
-            setIsSubmittingConnect(false);
-            setOauthSession(null);
-            showMessage(`OAuth completion failed: ${compErr}`, "error");
-          }
-        } else if (
-          statusView.status === "failed" ||
-          statusView.status === "cancelled" ||
-          statusView.status === "expired"
-        ) {
-          clearInterval(pollInterval);
+      if (statusView.status === "completed") {
+        // One-shot guard: even if two polls observed completion before the
+        // exchange finished, only the first may invoke complete_oauth_flow.
+        if (completionStartedRef.current) return;
+        completionStartedRef.current = true;
+        clearOauthPollTimer();
+        try {
+          const summary = await invoke<ConnectedAccountSummary>("complete_oauth_flow", {
+            sessionId,
+            code: null,
+          });
+          // Closed/cancelled during the exchange: do not resurrect the UI
+          // with a stale success after the user dismissed the flow.
+          if (generation !== oauthLifecycleRef.current) return;
+          setOauthPolling(false);
+          setOauthSessionBoth(null);
+          setIsSubmittingConnect(false);
+          completionStartedRef.current = false;
+          const identity = summary.display_name || summary.account_identifier;
+          showMessage(`Successfully connected account: ${identity}!`, "success");
+          await loadAllData();
+          setActiveTab("connected");
+        } catch (compErr: any) {
+          if (generation !== oauthLifecycleRef.current) return;
           setOauthPolling(false);
           setIsSubmittingConnect(false);
-          setOauthSession(null);
-          const errDetail = statusView.error ? `: ${statusView.error}` : "";
-          showMessage(`OAuth authorization ${statusView.status}${errDetail}`, "error");
+          setOauthSessionBoth(null);
+          completionStartedRef.current = false;
+          showMessage(`OAuth completion failed: ${compErr}`, "error");
         }
-      } catch (err: any) {
-        console.warn("OAuth status poll error:", err);
+      } else if (
+        statusView.status === "failed" ||
+        statusView.status === "cancelled" ||
+        statusView.status === "expired"
+      ) {
+        clearOauthPollTimer();
+        setOauthPolling(false);
+        setIsSubmittingConnect(false);
+        setOauthSessionBoth(null);
+        const errDetail = statusView.error ? `: ${statusView.error}` : "";
+        showMessage(`OAuth authorization ${statusView.status}${errDetail}`, "error");
       }
-    }, 1500);
+    };
+
+    pollTimerRef.current = setInterval(tick, 1500);
   };
 
   const handleCancelOAuth = async () => {
-    if (oauthSession) {
+    // Bump the lifecycle generation FIRST: any status response or start
+    // response that was already in flight becomes inert after this point.
+    oauthLifecycleRef.current += 1;
+    clearOauthPollTimer();
+    pollInFlightRef.current = false;
+
+    const session = oauthSessionRef.current;
+    if (session) {
       try {
-        await invoke("cancel_oauth_flow", { sessionId: oauthSession.sessionId });
-        setOauthPolling(false);
+        await invoke("cancel_oauth_flow", { sessionId: session.sessionId });
+        oauthSessionRef.current = null;
         setOauthSession(null);
+        setOauthPolling(false);
         setIsSubmittingConnect(false);
         showMessage("OAuth authorization cancelled.", "error");
       } catch (e: any) {
         console.warn("Cancel OAuth error:", e);
         const errDetail = e?.message || String(e);
         showMessage(`Failed to cancel OAuth flow: ${errDetail}`, "error");
+        // Preserve in-flight state on a failed cancel: the user can retry.
       }
     } else {
+      // No backend session existed (e.g. cancel pressed while the start
+      // request is still in flight): invalidate the start continuation so it
+      // can neither poll nor complete once it eventually resolves, and
+      // cancel the session materializing on the backend.
+      setOauthSessionBoth(null);
       setOauthPolling(false);
-      setOauthSession(null);
       setIsSubmittingConnect(false);
+      const startPromise = oauthStartInFlightRef.current;
+      oauthStartInFlightRef.current = null;
+      if (startPromise) {
+        startPromise
+          .then((init) => {
+            invoke("cancel_oauth_flow", { sessionId: init.session_id }).catch(
+              (e) => console.warn("Cancel OAuth error:", e)
+            );
+          })
+          .catch(() => {
+            // The start itself rejected; nothing to cancel.
+            void 0;
+          });
+      }
+      showMessage("OAuth authorization cancelled.", "error");
     }
   };
 
@@ -712,12 +872,25 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
                           Custom OAuth app required
                         </span>
                       ) : item.is_available ? (
+                        /* Bug 16: the UI route is driven by the catalog's
+                           declared authentication strategy. auth_type "none"
+                           (Local MCP) has no credential flow at all — its
+                           setup lives in the custom local-server tab. */
+                        item.auth_type === "none" ? (
+                          <button
+                            onClick={() => setActiveTab("custom_mcp")}
+                            className="px-3 py-1.5 bg-[#ededed] hover:bg-neutral-300 text-[#0a0a0a] rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow transition"
+                          >
+                            <Plus className="w-3.5 h-3.5" /> Configure Local MCP
+                          </button>
+                        ) : (
                         <button
                           onClick={() => handleOpenConnect(item)}
                           className="px-3 py-1.5 bg-[#ededed] hover:bg-neutral-300 text-[#0a0a0a] rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow transition"
                         >
                           <Plus className="w-3.5 h-3.5" /> Connect Account
                         </button>
+                        )
                       ) : (
                         <button
                           disabled

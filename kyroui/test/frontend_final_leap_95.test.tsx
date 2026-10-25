@@ -253,9 +253,9 @@ describe("Frontend Final Leap to >= 95% Coverage", () => {
     fireEvent.change(input, { target: { value: "Please organize and clean my documents" } });
     fireEvent.submit(input.closest("form")!);
 
-    // Should render Execution Plan
+    // Should render the suggested workflow card (Bug 5 contract)
     await waitFor(() => {
-      expect(screen.getByText("Execution Plan")).toBeInTheDocument();
+      expect(screen.getByText("Suggested Workflow")).toBeInTheDocument();
       expect(screen.getByText("Organized 12 files successfully into categories.")).toBeInTheDocument();
     });
 

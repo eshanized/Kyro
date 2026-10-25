@@ -7,6 +7,164 @@ pub const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 pub const DEFAULT_NEMOTRON_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b";
 pub const DEFAULT_VISION_MODEL: &str = "meta/llama-3.2-11b-vision-instruct";
 
+/// One authoritative provider/model resolution.
+///
+/// The resolver binds a selected model identifier to
+/// 1. the provider identity that actually serves the model,
+/// 2. the endpoint/base URL to call,
+/// 3. the credential reference that must be used.
+///
+/// Every caller (interactive turn, routine scheduler, delegated child agent,
+/// vision fallback) MUST resolve the route through this function instead of
+/// hard-coding an endpoint or silently inheriting the NVIDIA default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRoute {
+    pub provider: String,
+    pub base_url: String,
+    /// Vault key name that holds the credential for this provider, or
+    /// `None` when the provider does not need a key (e.g. a local Ollama).
+    pub credential_key: Option<String>,
+}
+
+fn default_base_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "https://api.openai.com/v1",
+        "anthropic" => "https://api.anthropic.com/v1",
+        "google" => "https://generativelanguage.googleapis.com/v1beta/openai",
+        "groq" => "https://api.groq.com/openai/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "deepseek" => "https://api.deepseek.com/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "together" => "https://api.together.xyz/v1",
+        "ollama" => "http://127.0.0.1:11434/v1",
+        _ => NVIDIA_BASE_URL,
+    }
+}
+
+impl ModelRouter {
+    /// Resolves the trusted provider route for a model identifier.
+    ///
+    /// Model identifiers hosted on NVIDIA NIM (`nvidia/...`, `nvidia/`,
+    /// `meta/...`, `mistralai/...`, `qwen/...`, `deepseek-ai/...`) route to
+    /// NVIDIA.  Model identifiers belonging to a different hosted provider
+    /// (for example `openai/gpt-4o`) are NOT assumed to be reachable through
+    /// NVIDIA's OpenAI-compatible schema — the request would target the wrong
+    /// endpoint and credential.  Such models resolve to their own provider
+    /// endpoint and credentials.
+    pub fn resolve_model_route(model: &str) -> Result<ModelRoute, String> {
+        let lower = model.trim().to_lowercase();
+
+        let provider: &str =
+            if lower.is_empty() || lower.starts_with("nvidia") || lower.contains("nemotron") {
+                "nvidia"
+            } else if lower.starts_with("ollama") || lower.contains("-ollama") {
+                // Explicit local-deployment tags (`ollama*`, `*-ollama`) resolve
+                // to the local Ollama endpoint BEFORE family prefixes are
+                // considered: `mistral-7b-ollama` is an Ollama model tag that
+                // api.mistral.ai does not serve, and the local instance is the
+                // only endpoint that does.
+                "ollama"
+            } else if lower.starts_with("openai/")
+                || lower.starts_with("gpt-")
+                || lower.starts_with("o1-")
+                || lower.starts_with("o3-")
+                || lower.starts_with("o4-")
+            {
+                "openai"
+            } else if lower.starts_with("anthropic/") || lower.starts_with("claude-") {
+                "anthropic"
+            } else if lower.starts_with("google/") || lower.starts_with("gemini") {
+                "google"
+            } else if lower.starts_with("groq/") {
+                "groq"
+            } else if lower.starts_with("mistralai/") {
+                // `mistralai/...` identifiers are served verbatim on NVIDIA NIM;
+                // Mistral's own API does not serve these HF-namespace IDs, so
+                // routing them to api.mistral.ai would hit a nonexistent model.
+                "nvidia"
+            } else if lower.starts_with("mistral-") {
+                "mistral"
+            } else if lower.starts_with("deepseek-ai/") {
+                // `deepseek-ai/...` identifiers are served verbatim on NVIDIA NIM;
+                // DeepSeek's own API expects `deepseek-chat`/`deepseek-reasoner`.
+                "nvidia"
+            } else if lower.starts_with("deepseek") {
+                "deepseek"
+            } else if lower.starts_with("qwen")
+                || lower.starts_with("meta/")
+                || lower.starts_with("llama")
+                || lower.contains("llava")
+            {
+                "nvidia"
+            } else if lower.starts_with("openrouter/") {
+                "openrouter"
+            } else if lower.starts_with("together/") {
+                "together"
+            } else {
+                // Unknown model families stay on the NVIDIA-compatible gateway,
+                // which is the historical default of this platform.
+                "nvidia"
+            };
+
+        // Environment overrides allow self-hosted proxies or regional
+        // endpoints without source changes.
+        let env_base = std::env::var(format!("KYRO_{}_BASE_URL", provider.to_uppercase()))
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        let env_key_var = format!("KYRO_{}_API_KEY", provider.to_uppercase());
+
+        Ok(ModelRoute {
+            provider: provider.to_string(),
+            base_url: env_base.unwrap_or_else(|| default_base_for_provider(provider).to_string()),
+            credential_key: if provider == "ollama" {
+                None
+            } else {
+                Some(env_key_var)
+            },
+        })
+    }
+
+    /// Selects the credential for a resolved route.
+    ///
+    /// This function refuses to silently substitute another provider's key:
+    /// an absent or `Option::None` credential for the resolved provider is a
+    /// hard error before any HTTP request is sent, so the request can never
+    /// reach the wrong endpoint with the wrong authorization.
+    pub fn select_api_key_for_route(
+        route: &ModelRoute,
+        vault_keys: &crate::storage::ApiKeys,
+    ) -> Result<String, String> {
+        match route.provider.as_str() {
+            "ollama" => return Ok(String::new()),
+            "nvidia" => {
+                if let Some(k) = vault_keys.nvidia.as_ref().filter(|k| !k.trim().is_empty()) {
+                    return Ok(k.clone());
+                }
+            }
+            other => {
+                if let Some(env_key) =
+                    std::env::var(format!("KYRO_{}_API_KEY", other.to_uppercase()))
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                {
+                    return Ok(env_key);
+                }
+            }
+        }
+
+        Err(format!(
+            "No API key configured for provider '{}' (service key '{}'). \
+             The model requires this provider's endpoint and credential; \
+             Kyro will not route it to a different provider. \
+             Add the key in Settings or set the '{}' environment variable.",
+            route.provider,
+            route.credential_key.as_deref().unwrap_or("<vault>"),
+            route.credential_key.as_deref().unwrap_or("<vault>")
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
@@ -883,7 +1041,10 @@ impl ModelRouter {
                         }
                     }
                     if !done && accumulator.finish_reason.is_none() {
-                        return Err("Network stream ended prematurely before model completed response".to_string());
+                        return Err(
+                            "Network stream ended prematurely before model completed response"
+                                .to_string(),
+                        );
                     }
                     break;
                 }
@@ -1223,8 +1384,9 @@ impl SseBuffer {
                 Err(err) => {
                     let valid_len = err.valid_up_to();
                     if valid_len > 0 {
-                        let valid_str = std::str::from_utf8(&self.byte_buffer[start..start + valid_len])
-                            .expect("valid UTF-8 prefix verified by from_utf8");
+                        let valid_str =
+                            std::str::from_utf8(&self.byte_buffer[start..start + valid_len])
+                                .expect("valid UTF-8 prefix verified by from_utf8");
                         self.buffer.push_str(valid_str);
                         start += valid_len;
                     }
@@ -1523,15 +1685,23 @@ mod tests {
         assert!(buffer.next_line().is_none());
 
         buffer.push_bytes(chunk2);
-        let line = buffer.next_line().expect("full line decoded after second chunk");
-        assert_eq!(line, "data: {\"reasoning\": \"Planning: 🚀 launch €100 こんにちは\"}");
-        assert!(!line.contains('\u{FFFD}'), "Split UTF-8 sequence must never be corrupted with replacement characters");
+        let line = buffer
+            .next_line()
+            .expect("full line decoded after second chunk");
+        assert_eq!(
+            line,
+            "data: {\"reasoning\": \"Planning: 🚀 launch €100 こんにちは\"}"
+        );
+        assert!(
+            !line.contains('\u{FFFD}'),
+            "Split UTF-8 sequence must never be corrupted with replacement characters"
+        );
     }
 
     #[tokio::test]
     async fn test_complete_streamed_retry_does_not_duplicate_reasoning() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1587,30 +1757,38 @@ mod tests {
         let mut emitted_reasoning = Vec::new();
 
         let endpoint = format!("http://{}", addr);
-        let res = router.complete_streamed(
-            "test-model",
-            "test-key",
-            Some(&endpoint),
-            "sys",
-            &[],
-            &[],
-            None,
-            |delta| {
-                emitted_reasoning.push(delta.to_string());
-            },
-        ).await;
+        let res = router
+            .complete_streamed(
+                "test-model",
+                "test-key",
+                Some(&endpoint),
+                "sys",
+                &[],
+                &[],
+                None,
+                |delta| {
+                    emitted_reasoning.push(delta.to_string());
+                },
+            )
+            .await;
 
         // The stream emitted partial reasoning before failing abruptly.
         // It must NOT retry, preserving the partial stream state without duplication.
-        assert!(res.is_err(), "Stream that failed mid-stream after emission must return Err");
+        assert!(
+            res.is_err(),
+            "Stream that failed mid-stream after emission must return Err"
+        );
         assert_eq!(emitted_reasoning, vec!["Initial partial reasoning... "]);
-        assert_eq!(connection_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            connection_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
     async fn test_complete_streamed_cancellation_during_reasoning() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1647,23 +1825,29 @@ mod tests {
         let mut emitted = Vec::new();
         let endpoint = format!("http://{}", addr);
 
-        let res = router.complete_streamed(
-            "test-model",
-            "test-key",
-            Some(&endpoint),
-            "sys",
-            &[],
-            &[],
-            Some(&cancel_token),
-            |delta| {
-                emitted.push(delta.to_string());
-                cancel_clone.cancel();
-            },
-        ).await;
+        let res = router
+            .complete_streamed(
+                "test-model",
+                "test-key",
+                Some(&endpoint),
+                "sys",
+                &[],
+                &[],
+                Some(&cancel_token),
+                |delta| {
+                    emitted.push(delta.to_string());
+                    cancel_clone.cancel();
+                },
+            )
+            .await;
 
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(err.to_lowercase().contains("cancel"), "Expected cancellation error, got: {}", err);
+        assert!(
+            err.to_lowercase().contains("cancel"),
+            "Expected cancellation error, got: {}",
+            err
+        );
         assert_eq!(emitted, vec!["First delta. "]);
     }
 }

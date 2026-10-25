@@ -203,6 +203,7 @@ fn main() {
             get_file_transaction,
             analyze_document,
             compare_documents,
+            extract_attachment_text,
             explain_screen_capture,
             get_model_capabilities,
             list_available_models,

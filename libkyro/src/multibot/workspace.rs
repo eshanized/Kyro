@@ -10,6 +10,7 @@
 
 use crate::agent::cancellation::CancellationToken;
 use crate::agent::registry::AgentRegistry;
+use crate::agent::ModelRouter;
 use crate::storage::{AgentRun, Database};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -814,10 +815,10 @@ impl MultiAgentOrchestrator {
                     ws.parent_run_id
                 )
             })?;
-        let api_key = match crate::storage::Vault::new(db.clone()).get_all_keys() {
-            Ok(k) => k.nvidia.unwrap_or_default(),
-            Err(_) => String::new(),
-        };
+        let vault_keys_snapshot = crate::storage::Vault::new(db.clone())
+            .get_all_keys()
+            .unwrap_or_default();
+        let api_key = vault_keys_snapshot.nvidia.clone().unwrap_or_default();
 
         // Kick off each batch member: consume an attempt, allocate a durable
         // child run id and (when required) an isolated worktree.
@@ -945,15 +946,45 @@ impl MultiAgentOrchestrator {
             let child_run_id = job.child_run_id.clone();
             let agent_id = job.agent_id.clone();
             let api_key = api_key.clone();
+            let vault_keys = vault_keys_snapshot.clone();
             let child_db = db.clone();
             let child_token = token.child_token();
             futures.push(async move {
+                // Resolve each child's provider route and credential from the
+                // one authoritative resolver instead of silently sending
+                // every child model to the parent's endpoint with the
+                // parent's credentials (Bug 15). An explicit caller-supplied
+                // base URL (tests, self-hosted proxies) keeps its authority
+                // for both endpoint and credentials.
+                let (child_base_url, child_api_key) = match base_url {
+                    Some(explicit) => (Some(explicit.to_string()), api_key),
+                    None => match ModelRouter::resolve_model_route(&job.model) {
+                        Ok(route) => {
+                            let key = ModelRouter::select_api_key_for_route(&route, &vault_keys)
+                                .unwrap_or_default();
+                            (Some(route.base_url), key)
+                        }
+                        Err(reason) => (None, format!("__routing_error__{}", reason)),
+                    },
+                };
+                if child_api_key.is_empty() || child_api_key.starts_with("__routing_error__") {
+                    let reason = child_api_key
+                        .strip_prefix("__routing_error__")
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "No API key configured for provider of model '{}'.",
+                                job.model
+                            )
+                        });
+                    return (child_run_id, agent_id, Err(reason));
+                }
                 let outcome = engine
                     .run_step_with_connectors(
                         &child_run_id,
                         &job.model,
-                        &api_key,
-                        base_url,
+                        &child_api_key,
+                        child_base_url.as_deref(),
                         "",
                         history,
                         child_db,

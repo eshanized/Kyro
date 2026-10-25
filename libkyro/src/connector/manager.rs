@@ -161,7 +161,16 @@ pub fn classify_external_tool(
         return (RiskLevel::Moderate, false, false);
     }
 
-    // 3. Explicit read-only verification
+    // 3. Untrusted read-only annotations are metadata, not authorization
+    //
+    // The schema and its annotations are supplied by the external tool
+    // provider (Bug 11): a deceptive tool can claim `readOnly`/
+    // `x-read-only`/`readOnlyHint` while performing side effects.  Such
+    // declarations may only *lower the reported risk* when they agree with
+    // the trusted name heuristics — they can never produce an auto-approvable
+    // classification by themselves, and `can_auto_approve` is only ever
+    // granted by an explicit local policy decision (see
+    // `evaluate_tool_authorization`), never by external schema content.
     let read_only_prefixes = [
         "get_",
         "list_",
@@ -178,9 +187,7 @@ pub fn classify_external_tool(
     let is_read_only_name = read_only_prefixes
         .iter()
         .any(|&p| lower_name.starts_with(p) || lower_name == p.trim_end_matches('_'));
-
-    // Check for trusted, explicit read-only declaration in schema or annotations
-    let has_explicit_read_only = schema
+    let annotation_read_only = schema
         .get("readOnly")
         .and_then(|v| v.as_bool())
         .or_else(|| schema.get("x-read-only").and_then(|v| v.as_bool()))
@@ -195,11 +202,14 @@ pub fn classify_external_tool(
         .unwrap_or(false);
 
     if is_read_only_name {
-        // External tools cannot auto-approve based on naming heuristics alone.
-        // Auto-approval strictly requires an explicit, trusted read-only declaration.
-        (RiskLevel::Safe, true, has_explicit_read_only)
-    } else if has_explicit_read_only {
-        (RiskLevel::Safe, true, true)
+        // Trusted name heuristics say read-only: report Safe + read-only.
+        // Auto-approval remains off — a malicious schema and a malicious
+        // description travel together, so heuristics are only a hint.
+        (RiskLevel::Safe, true, false)
+    } else if annotation_read_only {
+        // Annotation without a read-only name: keep it behind approval and
+        // only record the metadata hint.
+        (RiskLevel::Moderate, true, false)
     } else {
         // Unknown/unclassified external tool: fail closed!
         (RiskLevel::Moderate, false, false)
@@ -1613,15 +1623,34 @@ impl ConnectorManager {
             });
         }
 
-        // 3. Explicit connector tool policy check
-        if let Ok(Some(policy_rec)) = self
+        // 3. Explicit connector tool policy check. A database read failure
+        // leaves the enforcement state unknown: letting the default step 4
+        // decide would silently bypass stored policy for tools that the
+        // user has NOT yet configured, so fail closed (Bug 12) with a
+        // structured, secret-free diagnostic.
+        match self
             .db
             .get_connector_tool_policy(&entry.account_id, &entry.original_tool_name)
         {
-            // Verify schema fingerprint if tool policy has one
-            if let Some(expected_fp) = &policy_rec.schema_fingerprint {
-                if expected_fp != &entry.schema_fingerprint {
-                    return Some(AuthDecision::RequireApproval {
+            Err(db_err) => {
+                log::warn!(
+                    "[connector-governance] policy lookup failed for tool '{}' (account '{}'): {}",
+                    entry.original_tool_name,
+                    entry.account_id,
+                    db_err
+                );
+                return Some(AuthDecision::Deny {
+                    reason: format!(
+                        "Tool policy for '{}' could not be verified from the governance store ({}); execution is denied until the policy is readable",
+                        entry.original_tool_name, db_err
+                    ),
+                });
+            }
+            Ok(Some(policy_rec)) => {
+                // Verify schema fingerprint if tool policy has one
+                if let Some(expected_fp) = &policy_rec.schema_fingerprint {
+                    if expected_fp != &entry.schema_fingerprint {
+                        return Some(AuthDecision::RequireApproval {
                         reason: format!(
                             "Tool definition for '{}' has changed since authorization policy was configured. Re-authorization required.",
                             entry.original_tool_name
@@ -1632,35 +1661,35 @@ impl ConnectorManager {
                             entry.connector_id, entry.original_tool_name, args
                         ),
                     });
+                    }
                 }
-            }
 
-            match policy_rec.policy.trim().to_lowercase().as_str() {
-                "deny" => {
-                    return Some(AuthDecision::Deny {
-                        reason: format!(
+                match policy_rec.policy.trim().to_lowercase().as_str() {
+                    "deny" => {
+                        return Some(AuthDecision::Deny {
+                            reason: format!(
                             "Connector action '{}' for account '{}' is blocked by security policy",
                             entry.original_tool_name, entry.account_id
                         ),
-                    });
-                }
-                "ask" => {
-                    return Some(AuthDecision::RequireApproval {
-                        reason: format!(
-                            "Connector action '{}' requires explicit user authorization",
-                            entry.original_tool_name
-                        ),
-                        risk: entry.risk_level,
-                        summary: format!(
-                            "Run [{}] action '{}' with args: {}",
-                            entry.connector_id, entry.original_tool_name, args
-                        ),
-                    });
-                }
-                "allow" => {
-                    // Cannot auto-approve if can_auto_approve is false or destructive!
-                    if !entry.can_auto_approve || entry.risk_level == RiskLevel::Destructive {
+                        });
+                    }
+                    "ask" => {
                         return Some(AuthDecision::RequireApproval {
+                            reason: format!(
+                                "Connector action '{}' requires explicit user authorization",
+                                entry.original_tool_name
+                            ),
+                            risk: entry.risk_level,
+                            summary: format!(
+                                "Run [{}] action '{}' with args: {}",
+                                entry.connector_id, entry.original_tool_name, args
+                            ),
+                        });
+                    }
+                    "allow" => {
+                        // Cannot auto-approve if can_auto_approve is false or destructive!
+                        if !entry.can_auto_approve || entry.risk_level == RiskLevel::Destructive {
+                            return Some(AuthDecision::RequireApproval {
                             reason: format!(
                                 "Action '{}' cannot be auto-approved and requires explicit user authorization",
                                 entry.original_tool_name
@@ -1671,11 +1700,15 @@ impl ConnectorManager {
                                 entry.connector_id, entry.original_tool_name, args
                             ),
                         });
+                        }
+                        return Some(AuthDecision::Allow);
                     }
-                    return Some(AuthDecision::Allow);
+                    _ => {}
                 }
-                _ => {}
             }
+            // No stored policy: fall through to the default conservative
+            // step 4 (which still refuses unsafe auto-approval).
+            Ok(None) => {}
         }
 
         // 4. Default conservative policy:

@@ -17,6 +17,11 @@ export interface TaskComposerProps {
   onSelectSuggestion?: (suggestion: string) => void;
   className?: string;
   placeholder?: string;
+  /** Adapter: keeps the production window's affordance wording stable. */
+  attachButtonTitle?: string;
+  voiceButtonTitle?: string;
+  /** `accept` attribute for the allowlisted attachment policy (Bug 19). */
+  acceptAttribute?: string;
 }
 
 export const TaskComposer: React.FC<TaskComposerProps> = ({
@@ -35,6 +40,9 @@ export const TaskComposer: React.FC<TaskComposerProps> = ({
   onSelectSuggestion,
   className = "",
   placeholder,
+  attachButtonTitle,
+  voiceButtonTitle,
+  acceptAttribute,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -144,6 +152,7 @@ export const TaskComposer: React.FC<TaskComposerProps> = ({
             onChange={handleFileChange}
             className="hidden"
             aria-hidden="true"
+            accept={acceptAttribute}
           />
 
           {/* Attachment Button */}
@@ -152,7 +161,7 @@ export const TaskComposer: React.FC<TaskComposerProps> = ({
               type="button"
               onClick={() => fileInputRef.current?.click()}
               className="p-2.5 rounded-xl text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/60 transition shrink-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
-              title="Attach local file or screenshot"
+              title={attachButtonTitle || "Attach local file or screenshot"}
               aria-label="Attach file"
             >
               <Paperclip className="w-4 h-4" />
@@ -169,7 +178,7 @@ export const TaskComposer: React.FC<TaskComposerProps> = ({
                   ? "bg-red-950/40 text-red-400 border border-red-800/60 animate-pulse"
                   : "text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/60"
               }`}
-              title={isListening ? "Listening... click to stop" : "Voice dictation"}
+              title={voiceButtonTitle || (isListening ? "Listening... click to stop" : "Voice dictation")}
               aria-label={isListening ? "Stop voice dictation" : "Start voice dictation"}
             >
               {isListening ? (

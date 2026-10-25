@@ -155,11 +155,14 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
 
       // Verify Execution Plan card appears
       await waitFor(() => {
-        expect(screen.getByText("Execution Plan")).toBeInTheDocument();
+        // Bug 5 contract: client template → "Suggested Workflow".
+        expect(screen.getByText("Suggested Workflow")).toBeInTheDocument();
       });
 
       // Accomplished MUST start empty (NO fabricated "Verified permissions" or "Task verified")
-      expect(screen.queryByText("Accomplished:")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Accomplished Actions:")
+      ).not.toBeInTheDocument();
 
       // Planned steps are rendered without premature completion
       expect(screen.getAllByText(/Inspect and analyze relevant resources and parameters/i).length).toBeGreaterThan(0);
@@ -171,7 +174,8 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
       // After turn completion without verification tool:
       await waitFor(() => {
         // Plan status is unverified (NOT blindly completed)
-        expect(screen.getByText("(unverified)")).toBeInTheDocument();
+        // Status badge text (no parentheses in the new card).
+        expect(screen.getByText("unverified")).toBeInTheDocument();
         expect(screen.getByText(/Explicit verification check not executed/i)).toBeInTheDocument();
       });
     });
@@ -215,7 +219,8 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
       fireEvent.submit(input);
 
       await waitFor(() => {
-        expect(screen.getByText("Execution Plan")).toBeInTheDocument();
+        // Bug 5 contract: client template → "Suggested Workflow".
+        expect(screen.getByText("Suggested Workflow")).toBeInTheDocument();
       });
 
       expect(capturedRunId).not.toBeNull();
@@ -253,8 +258,8 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
 
       // Because verification actually executed, status is completed
       await waitFor(() => {
-        expect(screen.getByText("(completed)")).toBeInTheDocument();
-        expect(screen.getByText("Accomplished:")).toBeInTheDocument();
+        expect(screen.getByText("completed")).toBeInTheDocument();
+        expect(screen.getByText("Accomplished Actions:")).toBeInTheDocument();
         expect(screen.getByText(/Executed verify_file_integrity/i)).toBeInTheDocument();
       });
     });
@@ -298,7 +303,8 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
       fireEvent.submit(input);
 
       await waitFor(() => {
-        expect(screen.getByText("Execution Plan")).toBeInTheDocument();
+        // Bug 5 contract: client template → "Suggested Workflow".
+        expect(screen.getByText("Suggested Workflow")).toBeInTheDocument();
       });
 
       // Deliver step event with tool failure
@@ -317,7 +323,7 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
       turnResolve!("Encountered error during deletion.");
 
       await waitFor(() => {
-        expect(screen.getByText("(failed)")).toBeInTheDocument();
+        expect(screen.getByText("failed")).toBeInTheDocument();
         expect(screen.getByText(/Error in delete_directory: Permission denied/i)).toBeInTheDocument();
       });
     });

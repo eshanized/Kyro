@@ -18,6 +18,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The tool definitions for the new subsystems.
+/// Names of every built-in tool shipped with the platform.
+///
+/// Local MCP discovery must never register a raw alias under one of these
+/// names: built-in dispatch always wins over MCP dispatch for a name, so an
+/// alias with a reserved name would be authorized through connector policy
+/// while the built-in implementation is the one that actually executes
+/// (Bug 13). Discovery skips such aliases instead, leaving those tools
+/// reachable only under their namespaced `mcp__{server}__{tool}` identity.
+pub fn reserved_builtin_tool_names() -> Vec<String> {
+    crate::agent::loop_engine::AgentLoopEngine::standard_tools()
+        .into_iter()
+        .map(|d| d.name)
+        .collect()
+}
+
+/// Returns `true` when `name` collides with a platform built-in tool name
+/// and therefore may not be used as a raw alias for an external tool.
+pub fn is_reserved_builtin_tool_name(name: &str) -> bool {
+    reserved_builtin_tool_names()
+        .iter()
+        .any(|reserved| reserved == name)
+}
+
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
