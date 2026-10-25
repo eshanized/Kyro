@@ -26,6 +26,30 @@ pub struct ModelRoute {
     pub credential_key: Option<String>,
 }
 
+/// Native API protocols supported by Kyro's model routing adapters (Bug 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderProtocol {
+    OpenAiCompatible,
+    AnthropicMessages,
+}
+
+pub fn determine_provider_protocol(endpoint: &str, model: &str) -> ProviderProtocol {
+    let lower_model = model.trim().to_lowercase();
+    let lower_ep = endpoint.trim().to_lowercase();
+
+    if lower_ep.contains("api.anthropic.com")
+        || ((lower_model.starts_with("anthropic/") || lower_model.starts_with("claude"))
+            && !lower_ep.contains("/chat/completions")
+            && !lower_ep.contains("openai")
+            && !lower_ep.contains("openrouter")
+            && !lower_ep.contains("together"))
+    {
+        ProviderProtocol::AnthropicMessages
+    } else {
+        ProviderProtocol::OpenAiCompatible
+    }
+}
+
 fn default_base_for_provider(provider: &str) -> &'static str {
     match provider {
         "openai" => "https://api.openai.com/v1",
@@ -669,19 +693,37 @@ impl ModelRouter {
                 on_reasoning_delta(delta);
             };
 
-            match self
-                .complete_streamed_openai_compatible(
-                    endpoint,
-                    api_key,
-                    model,
-                    system_prompt,
-                    messages,
-                    tools,
-                    cancel_token,
-                    &mut tracking_delta_sink,
-                )
-                .await
-            {
+            let protocol = determine_provider_protocol(endpoint, model);
+            let res = match protocol {
+                ProviderProtocol::AnthropicMessages => {
+                    self.complete_streamed_anthropic(
+                        endpoint,
+                        api_key,
+                        model,
+                        system_prompt,
+                        messages,
+                        tools,
+                        cancel_token,
+                        &mut tracking_delta_sink,
+                    )
+                    .await
+                }
+                ProviderProtocol::OpenAiCompatible => {
+                    self.complete_streamed_openai_compatible(
+                        endpoint,
+                        api_key,
+                        model,
+                        system_prompt,
+                        messages,
+                        tools,
+                        cancel_token,
+                        &mut tracking_delta_sink,
+                    )
+                    .await
+                }
+            };
+
+            match res {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     // Do not duplicate partial reasoning after a retry.
@@ -752,18 +794,35 @@ impl ModelRouter {
                 }
             }
 
-            match self
-                .complete_openai_compatible(
-                    endpoint,
-                    api_key,
-                    model,
-                    system_prompt,
-                    messages,
-                    tools,
-                    cancel_token,
-                )
-                .await
-            {
+            let protocol = determine_provider_protocol(endpoint, model);
+            let res = match protocol {
+                ProviderProtocol::AnthropicMessages => {
+                    self.complete_anthropic(
+                        endpoint,
+                        api_key,
+                        model,
+                        system_prompt,
+                        messages,
+                        tools,
+                        cancel_token,
+                    )
+                    .await
+                }
+                ProviderProtocol::OpenAiCompatible => {
+                    self.complete_openai_compatible(
+                        endpoint,
+                        api_key,
+                        model,
+                        system_prompt,
+                        messages,
+                        tools,
+                        cancel_token,
+                    )
+                    .await
+                }
+            };
+
+            match res {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     let is_retryable = e.contains("429")
@@ -1059,6 +1118,264 @@ impl ModelRouter {
 
         accumulator.finalize()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_anthropic(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<LlmResponse, String> {
+        let has_image_content = messages.iter().any(|m| match &m.content {
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+            _ => false,
+        });
+
+        if has_image_content {
+            let caps = self.capabilities_for(model).await;
+            if !caps.vision && !caps.image_input {
+                return Err(format!(
+                    "Selected model '{}' does not support multimodal/vision inputs. Please select a vision-capable model to process images.",
+                    model
+                ));
+            }
+            for m in messages {
+                if let MessageContent::Parts(parts) = &m.content {
+                    for part in parts {
+                        if let ContentPart::ImageUrl { image_url } = part {
+                            validate_image_payload(&image_url.url, &caps)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let payload = build_anthropic_payload(model, system_prompt, messages, tools, false);
+
+        let url = if endpoint.ends_with("/messages") {
+            endpoint.to_string()
+        } else {
+            format!("{}/messages", endpoint.trim_end_matches('/'))
+        };
+
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+
+        if !api_key.is_empty() {
+            req = req.header("x-api-key", api_key);
+        }
+
+        let res = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err("Model completion cancelled by user".to_string());
+                }
+                res_result = req.json(&payload).send() => {
+                    res_result.map_err(|e| format!("HTTP request error to Anthropic provider at {}: {}", url, e))?
+                }
+            }
+        } else {
+            req.json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request error to Anthropic provider at {}: {}", url, e))?
+        };
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("Anthropic provider API error ({}): {}", status, text));
+        }
+
+        let data: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Anthropic response JSON: {}", e))?;
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+
+        if let Some(blocks) = data["content"].as_array() {
+            for block in blocks {
+                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                if block_type == "text" {
+                    if let Some(txt) = block.get("text").and_then(|t| t.as_str()) {
+                        content.push_str(txt);
+                    }
+                } else if block_type == "tool_use" {
+                    let id = block.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                    let args = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    });
+                }
+            }
+        }
+
+        Ok(LlmResponse {
+            content,
+            tool_calls,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_streamed_anthropic<F>(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        model: &str,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        cancel_token: Option<&CancellationToken>,
+        on_reasoning_delta: &mut F,
+    ) -> Result<LlmResponse, String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        let has_image_content = messages.iter().any(|m| match &m.content {
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+            _ => false,
+        });
+
+        if has_image_content {
+            let caps = self.capabilities_for(model).await;
+            if !caps.vision && !caps.image_input {
+                return Err(format!(
+                    "Selected model '{}' does not support multimodal/vision inputs. Please select a vision-capable model to process images.",
+                    model
+                ));
+            }
+            for m in messages {
+                if let MessageContent::Parts(parts) = &m.content {
+                    for part in parts {
+                        if let ContentPart::ImageUrl { image_url } = part {
+                            validate_image_payload(&image_url.url, &caps)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let payload = build_anthropic_payload(model, system_prompt, messages, tools, true);
+
+        let url = if endpoint.ends_with("/messages") {
+            endpoint.to_string()
+        } else {
+            format!("{}/messages", endpoint.trim_end_matches('/'))
+        };
+
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("accept", "text/event-stream");
+
+        if !api_key.is_empty() {
+            req = req.header("x-api-key", api_key);
+        }
+
+        let res = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err("Model completion cancelled by user".to_string());
+                }
+                res_result = req.json(&payload).send() => {
+                    res_result.map_err(|e| format!("HTTP request error to Anthropic provider at {}: {}", url, e))?
+                }
+            }
+        } else {
+            req.json(&payload)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request error to Anthropic provider at {}: {}", url, e))?
+        };
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("Anthropic provider API error ({}): {}", status, text));
+        }
+
+        use futures_util::StreamExt;
+        let mut stream = res.bytes_stream();
+        let mut sse_buffer = SseBuffer::new();
+        let mut accumulator = AnthropicStreamAccumulator::default();
+
+        let mut done = false;
+        while !done {
+            let next_chunk = if let Some(token) = cancel_token {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        return Err("Model completion cancelled by user".to_string());
+                    }
+                    chunk = stream.next() => chunk
+                }
+            } else {
+                stream.next().await
+            };
+
+            match next_chunk {
+                Some(Ok(bytes)) => {
+                    sse_buffer.push_bytes(&bytes);
+                    while let Some(line) = sse_buffer.next_line() {
+                        if accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))? {
+                            done = true;
+                            break;
+                        }
+                        if let Some(token) = cancel_token {
+                            if token.is_cancelled() {
+                                return Err("Model completion cancelled by user".to_string());
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(format!(
+                        "Network error while streaming Anthropic model response: {}",
+                        e
+                    ));
+                }
+                None => {
+                    if let Some(line) = sse_buffer.flush_remaining() {
+                        if accumulator.process_sse_line(&line, |rd| on_reasoning_delta(rd))? {
+                            done = true;
+                        }
+                    }
+                    if !done && accumulator.finish_reason.is_none() {
+                        return Err(
+                            "Network stream ended prematurely before Anthropic model completed response"
+                                .to_string(),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(token) = cancel_token {
+            if token.is_cancelled() {
+                return Err("Model completion cancelled by user".to_string());
+            }
+        }
+
+        accumulator.finalize()
+    }
 }
 
 pub fn build_chat_payload(
@@ -1324,6 +1641,291 @@ impl StreamAccumulator {
                     serde_json::from_str(args_str).map_err(|e| {
                         format!(
                             "Model returned malformed tool-call JSON for '{}': {}",
+                            tc.name, e
+                        )
+                    })?;
+                final_tool_calls.push(ToolCall {
+                    id: tc.id,
+                    name: tc.name,
+                    arguments: parsed_args,
+                });
+            }
+        }
+
+        Ok(LlmResponse {
+            content: self.content,
+            tool_calls: final_tool_calls,
+        })
+    }
+}
+
+pub fn build_anthropic_payload(
+    model: &str,
+    system_prompt: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    stream: bool,
+) -> serde_json::Value {
+    let mut anthropic_messages: Vec<serde_json::Value> = Vec::new();
+
+    for m in messages {
+        match m.role.as_str() {
+            "system" => {
+                // System message prompt handled via top-level "system" parameter
+            }
+            "tool" => {
+                let tool_use_id = m.tool_call_id.clone().unwrap_or_default();
+                let tool_content = m.content.as_text_lossy();
+                let result_block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tool_content,
+                });
+
+                let mut merged = false;
+                if let Some(last) = anthropic_messages.last_mut() {
+                    if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                            arr.push(result_block.clone());
+                            merged = true;
+                        }
+                    }
+                }
+                if !merged {
+                    anthropic_messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": vec![result_block],
+                    }));
+                }
+            }
+            "assistant" => {
+                let mut blocks = Vec::new();
+                let text = m.content.as_text_lossy();
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    }));
+                }
+                if let Some(ref tcs) = m.tool_calls {
+                    for tc in tcs {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        }));
+                    }
+                }
+                anthropic_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": blocks,
+                }));
+            }
+            _ => {
+                let content_val = match &m.content {
+                    MessageContent::Text(t) => {
+                        serde_json::json!(t)
+                    }
+                    MessageContent::Parts(parts) => {
+                        let mut block_list = Vec::new();
+                        for p in parts {
+                            match p {
+                                ContentPart::Text { text } => {
+                                    block_list.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": text,
+                                    }));
+                                }
+                                ContentPart::ImageUrl { image_url } => {
+                                    let url = &image_url.url;
+                                    if let Some(idx) = url.find(";base64,") {
+                                        let media_type = if url.starts_with("data:") {
+                                            &url[5..idx]
+                                        } else {
+                                            "image/png"
+                                        };
+                                        let data = &url[idx + 8..];
+                                        block_list.push(serde_json::json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": data,
+                                            }
+                                        }));
+                                    } else {
+                                        block_list.push(serde_json::json!({
+                                            "type": "text",
+                                            "text": url,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        serde_json::json!(block_list)
+                    }
+                };
+
+                anthropic_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": content_val,
+                }));
+            }
+        }
+    }
+
+    let mut payload = serde_json::json!({
+        "model": model,
+        "messages": anthropic_messages,
+        "max_tokens": 4096,
+        "temperature": 0.5,
+    });
+
+    if !system_prompt.is_empty() {
+        payload["system"] = serde_json::json!(system_prompt);
+    }
+
+    if stream {
+        payload["stream"] = serde_json::json!(true);
+    }
+
+    if !tools.is_empty() {
+        let anthropic_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            })
+            .collect();
+        payload["tools"] = serde_json::json!(anthropic_tools);
+    }
+
+    payload
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct AnthropicStreamAccumulator {
+    pub content: String,
+    pub reasoning: String,
+    pub tool_calls: HashMap<usize, PartialStreamedToolCall>,
+    pub finish_reason: Option<String>,
+}
+
+impl AnthropicStreamAccumulator {
+    pub fn process_sse_line<F>(&mut self, line: &str, mut on_reasoning: F) -> Result<bool, String>
+    where
+        F: FnMut(&str),
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(':') || trimmed.starts_with("event:") {
+            return Ok(false);
+        }
+
+        let data = if let Some(stripped) = trimmed.strip_prefix("data:") {
+            stripped.trim()
+        } else {
+            trimmed
+        };
+
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+
+        let val: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("Non-JSON Anthropic SSE data ignored: {} ({})", data, e);
+                return Ok(false);
+            }
+        };
+
+        if let Some(err) = val.get("error") {
+            let msg = if let Some(m) = err.get("message").and_then(|m| m.as_str()) {
+                m.to_string()
+            } else {
+                err.to_string()
+            };
+            return Err(format!("Anthropic provider stream error: {}", msg));
+        }
+
+        let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+
+        match event_type {
+            "content_block_start" => {
+                let index = val.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                if let Some(cb) = val.get("content_block") {
+                    let cb_type = cb.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                    if cb_type == "tool_use" {
+                        let id = cb.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+                        let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                        let entry = self.tool_calls.entry(index).or_default();
+                        entry.id = id;
+                        entry.name = name;
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let index = val.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                if let Some(delta) = val.get("delta") {
+                    let d_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                    match d_type {
+                        "text_delta" => {
+                            if let Some(txt) = delta.get("text").and_then(|t| t.as_str()) {
+                                self.content.push_str(txt);
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(th) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                self.reasoning.push_str(th);
+                                on_reasoning(th);
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(pj) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                                let entry = self.tool_calls.entry(index).or_default();
+                                entry.arguments.push_str(pj);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(delta) = val.get("delta") {
+                    if let Some(sr) = delta.get("stop_reason").and_then(|s| s.as_str()) {
+                        self.finish_reason = Some(sr.to_string());
+                    }
+                }
+            }
+            "message_stop" => {
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    pub fn finalize(mut self) -> Result<LlmResponse, String> {
+        let mut sorted_indices: Vec<usize> = self.tool_calls.keys().cloned().collect();
+        sorted_indices.sort_unstable();
+
+        let mut final_tool_calls = Vec::new();
+        for idx in sorted_indices {
+            if let Some(tc) = self.tool_calls.remove(&idx) {
+                let args_str = if tc.arguments.trim().is_empty() {
+                    "{}"
+                } else {
+                    tc.arguments.trim()
+                };
+                let parsed_args: serde_json::Value =
+                    serde_json::from_str(args_str).map_err(|e| {
+                        format!(
+                            "Anthropic model returned malformed tool-call JSON for '{}': {}",
                             tc.name, e
                         )
                     })?;
