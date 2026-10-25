@@ -148,6 +148,17 @@ pub struct ReconciliationOutcome {
     pub reconciliation_summary: String,
 }
 
+/// Context and candidate changes inherited from an upstream dependency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DependencyEvidence {
+    pub task_id: String,
+    pub agent_id: String,
+    pub status: String,
+    pub output: Option<String>,
+    pub modified_files: Vec<String>,
+    pub diff_stat: Option<String>,
+}
+
 /// Bundled workflow manifests, embedded at compile time.
 pub const BUNDLED_WORKFLOWS: &[(&str, &str)] = &[(
     "software-change",
@@ -160,9 +171,9 @@ fn legacy_role_to_agent(role: &str) -> Option<&'static str> {
     match role {
         "repository_investigator" => Some("forge-devops"),
         "implementation_engineer" => Some("forge-devops"),
-        "test_regression_specialist" => Some("forge-devops"),
-        "code_reviewer" => Some("apex-orchestrator"),
-        "documentation_reviewer" => Some("forge-devops"),
+        "test_regression_specialist" => Some("test-regression-specialist"),
+        "code_reviewer" => Some("code-reviewer"),
+        "documentation_reviewer" => Some("documentation-reviewer"),
         _ => None,
     }
 }
@@ -830,6 +841,7 @@ impl MultiAgentOrchestrator {
             worktree: Option<PathBuf>,
             attempt: u32,
             model: String,
+            dependency_context: Vec<DependencyEvidence>,
         }
         let mut jobs: Vec<JobSpec> = Vec::with_capacity(ids.len());
         for id in ids {
@@ -846,12 +858,53 @@ impl MultiAgentOrchestrator {
                 t.child_run_id = Some(child_run_id.clone());
                 t.status = "running".to_string();
             }
+
+            // Collect upstream dependencies
+            let upstream_tasks: Vec<SpecialistTask> = ws
+                .tasks
+                .iter()
+                .filter(|t| ws.tasks[index].depends_on.contains(&t.task_id))
+                .cloned()
+                .collect();
+            let upstream_refs: Vec<&SpecialistTask> = upstream_tasks.iter().collect();
+
+            // Snapshot any uncommitted changes in upstream worktrees and gather evidence
+            let mut dep_evidence: Vec<DependencyEvidence> = Vec::new();
+            for dep in &upstream_tasks {
+                let (modified_files, diff_stat) = if let Some(ref dir) = dep.isolated_worktree_path
+                {
+                    if dir.exists() {
+                        let _ = snapshot_worktree_changes(dir, &dep.task_id);
+                        let files = get_worktree_changed_files(
+                            &ws.project_path,
+                            dir,
+                            dep.base_commit.as_deref(),
+                        );
+                        let stat = get_worktree_diff_stat(dir, dep.base_commit.as_deref());
+                        (files, stat)
+                    } else {
+                        (Vec::new(), None)
+                    }
+                } else {
+                    (Vec::new(), None)
+                };
+                dep_evidence.push(DependencyEvidence {
+                    task_id: dep.task_id.clone(),
+                    agent_id: dep.agent_id.clone(),
+                    status: dep.status.clone(),
+                    output: dep.output.clone(),
+                    modified_files,
+                    diff_stat,
+                });
+            }
+
             if ws.tasks[index].isolated_worktree {
-                match Self::setup_isolated_worktree(
+                match Self::setup_isolated_worktree_with_dependencies(
                     &ws.project_path,
                     &ws.workspace_id,
                     id,
                     ws.tasks[index].attempts,
+                    &upstream_refs,
                 ) {
                     Ok((dir, branch, base_commit)) => {
                         let t = &mut ws.tasks[index];
@@ -883,6 +936,7 @@ impl MultiAgentOrchestrator {
                 worktree: t.isolated_worktree_path.clone(),
                 attempt: t.attempts,
                 model: parent.model.clone(),
+                dependency_context: dep_evidence,
             });
         }
 
@@ -895,13 +949,12 @@ impl MultiAgentOrchestrator {
         let mut futures = Vec::with_capacity(jobs.len());
         for job in jobs.drain(..) {
             order.push((job.child_run_id.clone(), job.task_index));
-            let objective_message = match &job.worktree {
-                Some(dir) => format!(
-                    "{}\n\n(Workspace isolation: your working copies live in the isolated worktree at {:?}. Do not modify the original project tree.)",
-                    job.objective, dir
-                ),
-                None => job.objective.clone(),
-            };
+            let objective_message = format_task_prompt(
+                &job.objective,
+                job.worktree.as_deref(),
+                &ws.project_path,
+                &job.dependency_context,
+            );
             let history = vec![crate::agent::ChatMessage {
                 role: "user".to_string(),
                 content: crate::agent::MessageContent::from_text(objective_message),
@@ -1014,6 +1067,9 @@ impl MultiAgentOrchestrator {
                     t.output = Some(output);
                     t.error = None;
                     t.completed_at = Some(chrono::Utc::now().timestamp_millis());
+                    if let Some(ref dir) = t.isolated_worktree_path {
+                        let _ = snapshot_worktree_changes(dir, &t.task_id);
+                    }
                 }
                 Err(e) => {
                     let t = &mut ws.tasks[task_index];
@@ -1039,12 +1095,30 @@ impl MultiAgentOrchestrator {
 
     /// Set up an isolated working environment for a task using a Git worktree
     /// when the project is a Git repository, or a shadow scratch directory if
-    /// not. Uses collision-resistant directory and branch names scoped to workspace, task, and attempt.
+    /// not. Inherits candidate changes from upstream isolated dependencies.
     pub fn setup_isolated_worktree(
         project_root: &Path,
         workspace_id: &str,
         task_id: &str,
         attempt: u32,
+    ) -> Result<(PathBuf, Option<String>, Option<String>), String> {
+        Self::setup_isolated_worktree_with_dependencies(
+            project_root,
+            workspace_id,
+            task_id,
+            attempt,
+            &[],
+        )
+    }
+
+    /// Set up an isolated working environment for a task, cleanly transferring
+    /// candidate changes from completed upstream tasks while detecting conflicts.
+    pub fn setup_isolated_worktree_with_dependencies(
+        project_root: &Path,
+        workspace_id: &str,
+        task_id: &str,
+        attempt: u32,
+        upstream_tasks: &[&SpecialistTask],
     ) -> Result<(PathBuf, Option<String>, Option<String>), String> {
         let scratch_base = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1078,9 +1152,23 @@ impl MultiAgentOrchestrator {
         let worktree_dir = scratch_base.join(dir_name);
         let branch_name = format!("kyro-wt-{}-{}-a{}", safe_ws, safe_task, attempt);
 
+        let upstream_isolated: Vec<&&SpecialistTask> = upstream_tasks
+            .iter()
+            .filter(|t| t.isolated_worktree && t.isolated_worktree_path.is_some())
+            .collect();
+
+        // 1. Snapshot any uncommitted working tree changes in upstream worktrees
+        for up in &upstream_isolated {
+            if let Some(ref up_dir) = up.isolated_worktree_path {
+                if up_dir.exists() {
+                    let _ = snapshot_worktree_changes(up_dir, &up.task_id);
+                }
+            }
+        }
+
         let is_git = project_root.join(".git").exists();
         if is_git {
-            let base_commit = Command::new("git")
+            let parent_head = Command::new("git")
                 .arg("-C")
                 .arg(project_root)
                 .args(["rev-parse", "HEAD"])
@@ -1094,20 +1182,107 @@ impl MultiAgentOrchestrator {
                     }
                 });
 
+            // 2. Conflict detection: if multiple upstreams modified the same file, reject early
+            if upstream_isolated.len() > 1 {
+                for i in 0..upstream_isolated.len() {
+                    for j in (i + 1)..upstream_isolated.len() {
+                        let path_i = upstream_isolated[i]
+                            .isolated_worktree_path
+                            .as_ref()
+                            .unwrap();
+                        let path_j = upstream_isolated[j]
+                            .isolated_worktree_path
+                            .as_ref()
+                            .unwrap();
+                        let files_i = get_worktree_changed_files(
+                            project_root,
+                            path_i,
+                            upstream_isolated[i].base_commit.as_deref(),
+                        );
+                        let files_j = get_worktree_changed_files(
+                            project_root,
+                            path_j,
+                            upstream_isolated[j].base_commit.as_deref(),
+                        );
+                        let overlap: Vec<String> = files_i
+                            .into_iter()
+                            .filter(|f| files_j.contains(f))
+                            .collect();
+                        if !overlap.is_empty() {
+                            return Err(format!(
+                                "Dependency conflict: upstream tasks '{}' and '{}' both modified: {}",
+                                upstream_isolated[i].task_id,
+                                upstream_isolated[j].task_id,
+                                overlap.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
+
             if worktree_dir.exists() {
                 let _ = fs::remove_dir_all(&worktree_dir);
             }
+
+            // 3. Determine start point and base commit
+            let (start_point, base_commit) = if let Some(first_up) = upstream_isolated.first() {
+                let start = first_up
+                    .worktree_branch
+                    .clone()
+                    .unwrap_or_else(|| "HEAD".to_string());
+                let base = first_up.base_commit.clone().or_else(|| parent_head.clone());
+                (start, base)
+            } else {
+                ("HEAD".to_string(), parent_head.clone())
+            };
 
             let output = Command::new("git")
                 .arg("-C")
                 .arg(project_root)
                 .args(["worktree", "add", "-b", &branch_name])
                 .arg(&worktree_dir)
-                .arg("HEAD")
+                .arg(&start_point)
                 .output();
 
             match output {
                 Ok(out) if out.status.success() => {
+                    // Merge any additional upstream branches into this new worktree branch
+                    if upstream_isolated.len() > 1 {
+                        for other_up in &upstream_isolated[1..] {
+                            if let Some(ref other_branch) = other_up.worktree_branch {
+                                let merge_out = Command::new("git")
+                                    .arg("-C")
+                                    .arg(&worktree_dir)
+                                    .args([
+                                        "merge",
+                                        "--no-ff",
+                                        "-m",
+                                        &format!(
+                                            "Merge non-conflicting changes from task '{}'",
+                                            other_up.task_id
+                                        ),
+                                        other_branch,
+                                    ])
+                                    .output();
+                                match merge_out {
+                                    Ok(m) if m.status.success() => {}
+                                    Ok(m) => {
+                                        let err = String::from_utf8_lossy(&m.stderr);
+                                        return Err(format!(
+                                            "Failed to merge upstream branch '{}': {}",
+                                            other_branch, err
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        return Err(format!(
+                                            "Failed to run git merge for '{}': {}",
+                                            other_branch, e
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Ok((worktree_dir, Some(branch_name), base_commit))
                 }
                 Ok(out) => {
@@ -1116,18 +1291,66 @@ impl MultiAgentOrchestrator {
                         "[Workspace] git worktree add failed ({}): falling back to shadow copy",
                         err
                     );
-                    Self::fallback_shadow_copy(project_root, &worktree_dir)?;
+                    Self::setup_shadow_from_upstreams(
+                        project_root,
+                        &worktree_dir,
+                        &upstream_isolated,
+                    )?;
                     Ok((worktree_dir, None, base_commit))
                 }
                 Err(e) => {
-                    log::warn!("[Workspace] Failed to run git worktree add: {}: falling back to shadow copy", e);
-                    Self::fallback_shadow_copy(project_root, &worktree_dir)?;
+                    log::warn!(
+                        "[Workspace] Failed to run git worktree add: {}: falling back to shadow copy",
+                        e
+                    );
+                    Self::setup_shadow_from_upstreams(
+                        project_root,
+                        &worktree_dir,
+                        &upstream_isolated,
+                    )?;
                     Ok((worktree_dir, None, base_commit))
                 }
             }
         } else {
-            Self::fallback_shadow_copy(project_root, &worktree_dir)?;
+            Self::setup_shadow_from_upstreams(project_root, &worktree_dir, &upstream_isolated)?;
             Ok((worktree_dir, None, None))
+        }
+    }
+
+    fn setup_shadow_from_upstreams(
+        project_root: &Path,
+        worktree_dir: &Path,
+        upstream_isolated: &[&&SpecialistTask],
+    ) -> Result<(), String> {
+        if upstream_isolated.is_empty() {
+            Self::fallback_shadow_copy(project_root, worktree_dir)
+        } else {
+            let first_dir = upstream_isolated[0]
+                .isolated_worktree_path
+                .as_ref()
+                .unwrap();
+            Self::fallback_shadow_copy(first_dir, worktree_dir)?;
+            if upstream_isolated.len() > 1 {
+                for other_up in &upstream_isolated[1..] {
+                    let other_dir = other_up.isolated_worktree_path.as_ref().unwrap();
+                    let changed_files = get_worktree_changed_files(
+                        project_root,
+                        other_dir,
+                        other_up.base_commit.as_deref(),
+                    );
+                    for file_rel in changed_files {
+                        let src_file = other_dir.join(&file_rel);
+                        let dst_file = worktree_dir.join(&file_rel);
+                        if src_file.is_file() {
+                            if let Some(parent) = dst_file.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            let _ = fs::copy(&src_file, &dst_file);
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1208,6 +1431,8 @@ impl MultiAgentOrchestrator {
                 reconciliation_summary: "No isolated worktree found to reconcile.".to_string(),
             });
         }
+
+        let _ = snapshot_worktree_changes(worktree_path, "reconcile");
 
         let is_git = project_root.join(".git").exists();
         if is_git {
@@ -1350,14 +1575,24 @@ impl MultiAgentOrchestrator {
         }
 
         // Generic directory diff for non-git projects
+        let modified = get_worktree_changed_files(project_root, worktree_path, None);
+        let changes_detected = !modified.is_empty();
+        let summary = if changes_detected {
+            format!(
+                "{} file(s) modified in shadow workspace directory.",
+                modified.len()
+            )
+        } else {
+            "No code modifications made in isolated worktree.".to_string()
+        };
         Ok(ReconciliationOutcome {
             workspace_id: workspace_id.to_string(),
-            changes_detected: false,
-            modified_files: vec![],
+            changes_detected,
+            modified_files: modified,
             unified_diff: String::new(),
             conflicts_detected: vec![],
             can_safely_merge: true,
-            reconciliation_summary: "Generic directory comparison complete.".to_string(),
+            reconciliation_summary: summary,
         })
     }
 
@@ -1370,6 +1605,8 @@ impl MultiAgentOrchestrator {
         if !project_root.exists() || !worktree_path.exists() {
             return Err("Project root or worktree path does not exist".to_string());
         }
+
+        let _ = snapshot_worktree_changes(worktree_path, "reconcile");
 
         let is_git = project_root.join(".git").exists();
         if is_git {
@@ -1456,6 +1693,254 @@ impl MultiAgentOrchestrator {
             false
         }
     }
+
+    /// Stage and commit any dirty working tree or untracked changes in an isolated worktree
+    /// so they are durable on its branch and available for inheritance or diffing.
+    pub fn snapshot_worktree_changes(worktree_path: &Path, task_id: &str) -> bool {
+        snapshot_worktree_changes(worktree_path, task_id)
+    }
+
+    /// Retrieve the list of files modified, added, or deleted in an isolated worktree.
+    pub fn get_worktree_changed_files(
+        project_root: &Path,
+        worktree_path: &Path,
+        base_commit: Option<&str>,
+    ) -> Vec<String> {
+        get_worktree_changed_files(project_root, worktree_path, base_commit)
+    }
+
+    /// Retrieve the diff stat summary of an isolated worktree.
+    pub fn get_worktree_diff_stat(
+        worktree_path: &Path,
+        base_commit: Option<&str>,
+    ) -> Option<String> {
+        get_worktree_diff_stat(worktree_path, base_commit)
+    }
+
+    /// Compose the bounded user message for a workflow task, injecting upstream context,
+    /// candidate change evidence, and worktree isolation instructions.
+    pub fn format_task_prompt(
+        objective: &str,
+        worktree: Option<&Path>,
+        project_path: &Path,
+        dependencies: &[DependencyEvidence],
+    ) -> String {
+        format_task_prompt(objective, worktree, project_path, dependencies)
+    }
+}
+
+/// Stage and commit any dirty working tree or untracked changes in an isolated worktree
+/// so they are durable on its branch and available for inheritance or diffing.
+pub fn snapshot_worktree_changes(worktree_path: &Path, task_id: &str) -> bool {
+    if !worktree_path.exists() {
+        return false;
+    }
+    let has_git = worktree_path.join(".git").exists();
+    if !has_git {
+        return false;
+    }
+    let status_out = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain"])
+        .output();
+    let Ok(status) = status_out else {
+        return false;
+    };
+    if status.status.success() && !status.stdout.is_empty() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["add", "-A"])
+            .output();
+        let commit_res = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args([
+                "-c",
+                "user.name=Kyro Agent",
+                "-c",
+                "user.email=agent@kyro.local",
+                "commit",
+                "-m",
+                &format!("Snapshot candidate changes from task '{}'", task_id),
+            ])
+            .output();
+        return commit_res.map(|c| c.status.success()).unwrap_or(false);
+    }
+    false
+}
+
+/// Retrieve the list of files modified, added, or deleted in an isolated worktree
+/// relative to the given base commit or project root.
+pub fn get_worktree_changed_files(
+    project_root: &Path,
+    worktree_path: &Path,
+    base_commit: Option<&str>,
+) -> Vec<String> {
+    if !worktree_path.exists() {
+        return Vec::new();
+    }
+    if worktree_path.join(".git").exists() {
+        let mut files = HashSet::new();
+        let target = base_commit.unwrap_or("HEAD");
+        if let Ok(out) = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["diff", "--name-only", target])
+            .output()
+        {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        files.insert(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        if let Ok(out) = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["status", "--porcelain"])
+            .output()
+        {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let trimmed = line.trim();
+                    if trimmed.len() >= 3 {
+                        let p = trimmed[3..].trim();
+                        let f = if let Some((_, dest)) = p.split_once(" -> ") {
+                            dest.trim()
+                        } else {
+                            p
+                        };
+                        if !f.is_empty() {
+                            files.insert(f.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let mut v: Vec<String> = files.into_iter().collect();
+        v.sort();
+        v
+    } else {
+        let mut files = Vec::new();
+        collect_dir_diff(project_root, worktree_path, Path::new(""), &mut files);
+        files.sort();
+        files
+    }
+}
+
+fn collect_dir_diff(base: &Path, modified: &Path, rel: &Path, out: &mut Vec<String>) {
+    let mod_dir = modified.join(rel);
+    let Ok(entries) = fs::read_dir(&mod_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str == ".git" || name_str == "node_modules" || name_str == "target" {
+            continue;
+        }
+        let child_rel = if rel.as_os_str().is_empty() {
+            PathBuf::from(&file_name)
+        } else {
+            rel.join(&file_name)
+        };
+        let base_file = base.join(&child_rel);
+        let mod_file = mod_dir.join(&file_name);
+        if mod_file.is_dir() {
+            collect_dir_diff(base, modified, &child_rel, out);
+        } else if mod_file.is_file() {
+            if !base_file.exists() {
+                out.push(child_rel.to_string_lossy().to_string());
+            } else if let (Ok(m1), Ok(m2)) = (fs::read(&base_file), fs::read(&mod_file)) {
+                if m1 != m2 {
+                    out.push(child_rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Retrieve the diff stat summary of an isolated worktree.
+pub fn get_worktree_diff_stat(worktree_path: &Path, base_commit: Option<&str>) -> Option<String> {
+    if !worktree_path.join(".git").exists() {
+        return None;
+    }
+    let target = base_commit.unwrap_or("HEAD");
+    if let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--stat", target])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Compose the bounded user message for a workflow task, injecting upstream context,
+/// candidate change evidence, and worktree isolation instructions.
+pub fn format_task_prompt(
+    objective: &str,
+    worktree: Option<&Path>,
+    project_path: &Path,
+    dependencies: &[DependencyEvidence],
+) -> String {
+    let mut message = format!("# Task Objective\n{}\n", objective);
+
+    if let Some(dir) = worktree {
+        message.push_str(&format!(
+            "\n# Workspace Isolation\nYour working directory is the isolated worktree at `{}`.\nAll file edits and test commands must be executed within this directory.\nDo not modify the original project tree at `{}`.\n",
+            dir.display(),
+            project_path.display()
+        ));
+    }
+
+    if !dependencies.is_empty() {
+        message.push_str("\n# Upstream Dependency Context & Candidate Changes\n");
+        message.push_str("The following upstream stages have completed and produced candidate outputs and changes:\n\n");
+        for dep in dependencies {
+            message.push_str(&format!(
+                "## Stage: `{}` (Agent: @{})\n",
+                dep.task_id, dep.agent_id
+            ));
+            message.push_str(&format!("- Status: {}\n", dep.status));
+            if !dep.modified_files.is_empty() {
+                message.push_str("- Modified / Added Files in Candidate Change:\n");
+                for f in &dep.modified_files {
+                    message.push_str(&format!("  - `{}`\n", f));
+                }
+            }
+            if let Some(ref stat) = dep.diff_stat {
+                if !stat.trim().is_empty() {
+                    message.push_str(&format!("- Change Summary:\n```\n{}\n```\n", stat.trim()));
+                }
+            }
+            if let Some(ref out) = dep.output {
+                let trimmed = out.trim();
+                if !trimmed.is_empty() {
+                    let bounded = if trimmed.chars().count() > 8000 {
+                        let head: String = trimmed.chars().take(8000).collect();
+                        format!("{}...\n[Output truncated at 8000 characters]", head)
+                    } else {
+                        trimmed.to_string()
+                    };
+                    message.push_str(&format!("- Output Deliverable:\n{}\n\n", bounded));
+                }
+            }
+        }
+    }
+
+    message
 }
 
 /// Child run ids must be unique in the durable table; on a retry-after-restart
@@ -1490,14 +1975,18 @@ mod tests {
         let spec = parse_workflow_manifest(content).expect("bundled workflow parses");
         assert_eq!(spec.id, "software-change");
         assert_eq!(spec.concurrency, 2);
-        assert_eq!(spec.tasks.len(), 4);
+        assert_eq!(spec.tasks.len(), 5);
         assert_eq!(spec.tasks[1].depends_on, vec!["investigate"]);
         assert!(spec.tasks[1].isolated_worktree);
+        assert_eq!(spec.tasks[2].agent_id, "test-regression-specialist");
+        assert_eq!(spec.tasks[3].agent_id, "code-reviewer");
+        assert_eq!(spec.tasks[4].agent_id, "documentation-reviewer");
         let order = topological_order(&spec).unwrap();
         let pos = |id: &str| order.iter().position(|t| t == id).unwrap();
         assert!(pos("investigate") < pos("implement"));
         assert!(pos("implement") < pos("verify"));
         assert!(pos("verify") < pos("review"));
+        assert!(pos("review") < pos("documentation"));
     }
 
     #[test]
@@ -1697,5 +2186,636 @@ mod tests {
                     .map(|w| w == workspace_id)
             })
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn workflow_handoff_carries_candidate_changes_across_isolated_stages_in_git() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kyro_handoff_git_{}", uuid::Uuid::new_v4()));
+        let project_root = test_dir.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        // 1. Initialize git repo with baseline commit
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["init"])
+            .output()
+            .unwrap();
+        fs::write(project_root.join("README.md"), "Initial project\n").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "README.md"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args([
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=test@test.local",
+                "commit",
+                "-m",
+                "Initial commit",
+            ])
+            .output()
+            .unwrap();
+
+        let ws_id = format!("ws_{}", uuid::Uuid::new_v4());
+
+        // Stage 1: Implementer runs in isolated worktree
+        let (impl_dir, impl_branch, impl_base) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "implement",
+                1,
+                &[],
+            )
+            .expect("implement worktree must succeed");
+
+        // Implementer modifies README.md and creates calculator.rs
+        fs::write(
+            impl_dir.join("README.md"),
+            "Initial project\nModified by Implementer\n",
+        )
+        .unwrap();
+        fs::create_dir_all(impl_dir.join("src")).unwrap();
+        fs::write(
+            impl_dir.join("src/calculator.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .unwrap();
+
+        // Verification requirement 6: original project root remains UNCHANGED!
+        assert_eq!(
+            fs::read_to_string(project_root.join("README.md")).unwrap(),
+            "Initial project\n"
+        );
+        assert!(!project_root.join("src/calculator.rs").exists());
+
+        // Snapshot changes in implement worktree
+        assert!(MultiAgentOrchestrator::snapshot_worktree_changes(
+            &impl_dir,
+            "implement"
+        ));
+
+        let impl_task = SpecialistTask {
+            task_id: "implement".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Implement calculator".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("c1".to_string()),
+            isolated_worktree_path: Some(impl_dir.clone()),
+            worktree_branch: impl_branch.clone(),
+            base_commit: impl_base.clone(),
+            output: Some("Added calculator.rs and updated README".to_string()),
+            error: None,
+            started_at: Some(10),
+            completed_at: Some(20),
+        };
+
+        // Stage 2: Verifier runs in its own isolated worktree depending on implement
+        let (verify_dir, verify_branch, verify_base) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "verify",
+                1,
+                &[&impl_task],
+            )
+            .expect("verify worktree must succeed and inherit candidate changes");
+
+        // Verification requirement 3: verifier can inspect implementation's actual changes
+        assert!(verify_dir.join("src/calculator.rs").exists());
+        assert_eq!(
+            fs::read_to_string(verify_dir.join("src/calculator.rs")).unwrap(),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+        );
+        assert!(fs::read_to_string(verify_dir.join("README.md"))
+            .unwrap()
+            .contains("Modified by Implementer"));
+
+        // Verifier adds test suite to candidate changes
+        fs::create_dir_all(verify_dir.join("tests")).unwrap();
+        fs::write(
+            verify_dir.join("tests/test_calculator.rs"),
+            "#[test] fn test_add() { assert_eq!(add(2, 2), 4); }\n",
+        )
+        .unwrap();
+
+        assert!(MultiAgentOrchestrator::snapshot_worktree_changes(
+            &verify_dir,
+            "verify"
+        ));
+
+        let verify_task = SpecialistTask {
+            task_id: "verify".to_string(),
+            agent_id: "test-regression-specialist".to_string(),
+            objective: "Verify calculator".to_string(),
+            depends_on: vec!["implement".to_string()],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("c2".to_string()),
+            isolated_worktree_path: Some(verify_dir.clone()),
+            worktree_branch: verify_branch.clone(),
+            base_commit: verify_base.clone(),
+            output: Some("All 1 unit tests passed with 100% assertion coverage".to_string()),
+            error: None,
+            started_at: Some(25),
+            completed_at: Some(35),
+        };
+
+        // Stage 3: Reviewer runs in its own isolated worktree depending on verify
+        let (review_dir, review_branch, _review_base) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "review",
+                1,
+                &[&verify_task],
+            )
+            .expect("review worktree must succeed and inherit verified candidate changes");
+
+        // Verification requirement 4: reviewer can inspect candidate changes AND tests
+        assert!(review_dir.join("src/calculator.rs").exists());
+        assert!(review_dir.join("tests/test_calculator.rs").exists());
+        assert!(fs::read_to_string(review_dir.join("README.md"))
+            .unwrap()
+            .contains("Modified by Implementer"));
+
+        // Check reconciliation analysis on reviewer's candidate worktree
+        let outcome = MultiAgentOrchestrator::reconcile_changes(&project_root, &review_dir, &ws_id)
+            .expect("reconcile_changes must succeed");
+
+        assert!(outcome.changes_detected);
+        assert!(outcome.can_safely_merge);
+        assert!(outcome.conflicts_detected.is_empty());
+        assert!(outcome
+            .modified_files
+            .iter()
+            .any(|f| f.ends_with("README.md")));
+        assert!(outcome
+            .modified_files
+            .iter()
+            .any(|f| f.ends_with("calculator.rs")));
+        assert!(outcome
+            .modified_files
+            .iter()
+            .any(|f| f.ends_with("test_calculator.rs")));
+        assert!(outcome.unified_diff.contains("pub fn add"));
+        assert!(outcome.unified_diff.contains("test_add"));
+
+        // Verification requirement 6: original project root STILL untouched before reconciliation!
+        assert_eq!(
+            fs::read_to_string(project_root.join("README.md")).unwrap(),
+            "Initial project\n"
+        );
+        assert!(!project_root.join("src/calculator.rs").exists());
+
+        // Verification requirement 7: final reconciliation integrates the work cleanly
+        let apply_res = MultiAgentOrchestrator::apply_reconciliation(
+            &project_root,
+            &review_dir,
+            review_branch.as_deref(),
+        )
+        .expect("apply_reconciliation must succeed");
+
+        assert!(apply_res.contains("Successfully merged branch"));
+        assert_eq!(
+            fs::read_to_string(project_root.join("src/calculator.rs")).unwrap(),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project_root.join("tests/test_calculator.rs")).unwrap(),
+            "#[test] fn test_add() { assert_eq!(add(2, 2), 4); }\n"
+        );
+
+        // Cleanup isolated worktrees
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &impl_dir,
+            impl_branch.as_deref(),
+        );
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &verify_dir,
+            verify_branch.as_deref(),
+        );
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &review_dir,
+            review_branch.as_deref(),
+        );
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn workflow_handoff_detects_conflicts_between_concurrent_dependencies() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kyro_conflict_test_{}", uuid::Uuid::new_v4()));
+        let project_root = test_dir.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["init"])
+            .output()
+            .unwrap();
+        fs::write(project_root.join("shared.txt"), "Original content\n").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "shared.txt"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args([
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=test@test.local",
+                "commit",
+                "-m",
+                "Initial",
+            ])
+            .output()
+            .unwrap();
+
+        let ws_id = format!("ws_{}", uuid::Uuid::new_v4());
+
+        // Upstream Task 1
+        let (dir_1, branch_1, base_1) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "task_1",
+                1,
+                &[],
+            )
+            .unwrap();
+        fs::write(dir_1.join("shared.txt"), "Branch 1 edit\n").unwrap();
+        MultiAgentOrchestrator::snapshot_worktree_changes(&dir_1, "task_1");
+
+        let task_1 = SpecialistTask {
+            task_id: "task_1".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Edit shared".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("c1".to_string()),
+            isolated_worktree_path: Some(dir_1.clone()),
+            worktree_branch: branch_1.clone(),
+            base_commit: base_1.clone(),
+            output: Some("Edited shared".to_string()),
+            error: None,
+            started_at: Some(1),
+            completed_at: Some(2),
+        };
+
+        // Upstream Task 2 modifies the SAME file
+        let (dir_2, branch_2, base_2) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "task_2",
+                1,
+                &[],
+            )
+            .unwrap();
+        fs::write(dir_2.join("shared.txt"), "Branch 2 conflicting edit\n").unwrap();
+        MultiAgentOrchestrator::snapshot_worktree_changes(&dir_2, "task_2");
+
+        let task_2 = SpecialistTask {
+            task_id: "task_2".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Conflicting edit".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("c2".to_string()),
+            isolated_worktree_path: Some(dir_2.clone()),
+            worktree_branch: branch_2.clone(),
+            base_commit: base_2.clone(),
+            output: Some("Also edited shared".to_string()),
+            error: None,
+            started_at: Some(3),
+            completed_at: Some(4),
+        };
+
+        // Downstream Task 3 depends on BOTH task_1 and task_2
+        let err = MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+            &project_root,
+            &ws_id,
+            "task_3",
+            1,
+            &[&task_1, &task_2],
+        )
+        .expect_err("conflicting dependencies must be detected and rejected");
+
+        assert!(err.contains("Dependency conflict"), "Error: {}", err);
+        assert!(err.contains("shared.txt"), "Error: {}", err);
+
+        // Cleanup
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &dir_1,
+            branch_1.as_deref(),
+        );
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &dir_2,
+            branch_2.as_deref(),
+        );
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn workflow_handoff_merges_disjoint_concurrent_dependencies() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kyro_disjoint_test_{}", uuid::Uuid::new_v4()));
+        let project_root = test_dir.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["init"])
+            .output()
+            .unwrap();
+        fs::write(project_root.join("init.txt"), "Base\n").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args(["add", "init.txt"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&project_root)
+            .args([
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=test@test.local",
+                "commit",
+                "-m",
+                "Initial",
+            ])
+            .output()
+            .unwrap();
+
+        let ws_id = format!("ws_{}", uuid::Uuid::new_v4());
+
+        // Task A creates module_a.rs
+        let (dir_a, branch_a, base_a) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "task_a",
+                1,
+                &[],
+            )
+            .unwrap();
+        fs::write(dir_a.join("module_a.rs"), "pub fn a() -> bool { true }\n").unwrap();
+        MultiAgentOrchestrator::snapshot_worktree_changes(&dir_a, "task_a");
+
+        let task_a = SpecialistTask {
+            task_id: "task_a".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Add module A".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("ca".to_string()),
+            isolated_worktree_path: Some(dir_a.clone()),
+            worktree_branch: branch_a.clone(),
+            base_commit: base_a.clone(),
+            output: Some("Created module A".to_string()),
+            error: None,
+            started_at: Some(1),
+            completed_at: Some(2),
+        };
+
+        // Task B creates module_b.rs (disjoint file!)
+        let (dir_b, branch_b, base_b) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "task_b",
+                1,
+                &[],
+            )
+            .unwrap();
+        fs::write(dir_b.join("module_b.rs"), "pub fn b() -> bool { false }\n").unwrap();
+        MultiAgentOrchestrator::snapshot_worktree_changes(&dir_b, "task_b");
+
+        let task_b = SpecialistTask {
+            task_id: "task_b".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Add module B".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("cb".to_string()),
+            isolated_worktree_path: Some(dir_b.clone()),
+            worktree_branch: branch_b.clone(),
+            base_commit: base_b.clone(),
+            output: Some("Created module B".to_string()),
+            error: None,
+            started_at: Some(3),
+            completed_at: Some(4),
+        };
+
+        // Downstream Task C depends on both task_a and task_b
+        let (dir_c, branch_c, _) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "task_c",
+                1,
+                &[&task_a, &task_b],
+            )
+            .expect("disjoint dependencies must merge cleanly into downstream worktree");
+
+        // Task C receives both module_a.rs and module_b.rs!
+        assert!(dir_c.join("module_a.rs").exists());
+        assert!(dir_c.join("module_b.rs").exists());
+
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &dir_a,
+            branch_a.as_deref(),
+        );
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &dir_b,
+            branch_b.as_deref(),
+        );
+        MultiAgentOrchestrator::cleanup_isolated_worktree(
+            &project_root,
+            &dir_c,
+            branch_c.as_deref(),
+        );
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn workflow_handoff_shadow_copy_mode_without_git() {
+        let test_dir =
+            std::env::temp_dir().join(format!("kyro_shadow_test_{}", uuid::Uuid::new_v4()));
+        let project_root = test_dir.join("project");
+        fs::create_dir_all(&project_root).unwrap();
+
+        fs::write(project_root.join("config.json"), "{\"env\": \"prod\"}\n").unwrap();
+        let ws_id = format!("ws_{}", uuid::Uuid::new_v4());
+
+        // Stage 1 in shadow copy mode
+        let (dir_1, branch_1, _) =
+            MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+                &project_root,
+                &ws_id,
+                "shadow_impl",
+                1,
+                &[],
+            )
+            .unwrap();
+        assert!(branch_1.is_none()); // Non-git has no branch
+        fs::write(dir_1.join("config.json"), "{\"env\": \"staging\"}\n").unwrap();
+        fs::write(dir_1.join("new_shadow.txt"), "Shadow file\n").unwrap();
+
+        let task_1 = SpecialistTask {
+            task_id: "shadow_impl".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Update config".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: Some("cs1".to_string()),
+            isolated_worktree_path: Some(dir_1.clone()),
+            worktree_branch: None,
+            base_commit: None,
+            output: Some("Config updated in shadow".to_string()),
+            error: None,
+            started_at: Some(1),
+            completed_at: Some(2),
+        };
+
+        // Stage 2 receives shadow copy changes from Stage 1
+        let (dir_2, _, _) = MultiAgentOrchestrator::setup_isolated_worktree_with_dependencies(
+            &project_root,
+            &ws_id,
+            "shadow_verify",
+            1,
+            &[&task_1],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir_2.join("config.json")).unwrap(),
+            "{\"env\": \"staging\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir_2.join("new_shadow.txt")).unwrap(),
+            "Shadow file\n"
+        );
+
+        // Reconcile shadow changes
+        let outcome =
+            MultiAgentOrchestrator::reconcile_changes(&project_root, &dir_2, &ws_id).unwrap();
+        assert!(outcome.changes_detected);
+        assert!(outcome.modified_files.contains(&"config.json".to_string()));
+        assert!(outcome
+            .modified_files
+            .contains(&"new_shadow.txt".to_string()));
+
+        // Apply reconciliation
+        MultiAgentOrchestrator::apply_reconciliation(&project_root, &dir_2, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(project_root.join("config.json")).unwrap(),
+            "{\"env\": \"staging\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project_root.join("new_shadow.txt")).unwrap(),
+            "Shadow file\n"
+        );
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn format_task_prompt_constructs_bounded_evidence_message() {
+        let worktree = PathBuf::from("/tmp/worktree_test");
+        let project = PathBuf::from("/home/user/project");
+
+        let long_output = "a".repeat(10_000);
+        let deps = vec![
+            DependencyEvidence {
+                task_id: "investigate".to_string(),
+                agent_id: "forge-devops".to_string(),
+                status: "completed".to_string(),
+                output: Some("Mapped 3 files and 2 modules".to_string()),
+                modified_files: vec![],
+                diff_stat: None,
+            },
+            DependencyEvidence {
+                task_id: "implement".to_string(),
+                agent_id: "forge-devops".to_string(),
+                status: "completed".to_string(),
+                output: Some(long_output),
+                modified_files: vec!["src/lib.rs".to_string(), "Cargo.toml".to_string()],
+                diff_stat: Some("2 files changed, 10 insertions(+)".to_string()),
+            },
+        ];
+
+        let prompt = MultiAgentOrchestrator::format_task_prompt(
+            "Verify all changes",
+            Some(&worktree),
+            &project,
+            &deps,
+        );
+
+        assert!(prompt.contains("# Task Objective\nVerify all changes"));
+        assert!(prompt.contains("# Workspace Isolation"));
+        assert!(prompt.contains("/tmp/worktree_test"));
+        assert!(prompt.contains("## Stage: `investigate` (Agent: @forge-devops)"));
+        assert!(prompt.contains("Mapped 3 files and 2 modules"));
+        assert!(prompt.contains("## Stage: `implement` (Agent: @forge-devops)"));
+        assert!(prompt.contains("`src/lib.rs`"));
+        assert!(prompt.contains("`Cargo.toml`"));
+        assert!(prompt.contains("2 files changed, 10 insertions(+)"));
+        // Output bounded to 8000 chars
+        assert!(prompt.contains("[Output truncated at 8000 characters]"));
+        assert!(!prompt.contains(&"a".repeat(9000)));
     }
 }

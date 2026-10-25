@@ -24,7 +24,7 @@ tasks:
     isolated_worktree: true
     retries: 1
   - task_id: verify
-    agent_id: forge-devops
+    agent_id: test-regression-specialist
     objective: "Run the relevant build, tests, and diagnostics in the isolated worktree and verify the change for: {{objective}}. Report verification results truthfully."
     depends_on:
       - implement
@@ -32,23 +32,30 @@ tasks:
     isolated_worktree: true
     retries: 1
   - task_id: review
-    agent_id: apex-orchestrator
+    agent_id: code-reviewer
     objective: "Review the produced diff and verify the change is safe to integrate for: {{objective}}. List risks and required follow-ups."
     depends_on:
       - verify
     optional: false
     isolated_worktree: true
     retries: 0
+  - task_id: documentation
+    agent_id: documentation-reviewer
+    objective: "Check and update relevant documentation, API contracts, and user guides for: {{objective}}."
+    depends_on:
+      - review
+    optional: true
+    isolated_worktree: true
+    retries: 0
 ---
 
 # Software Change Pipeline
 
-The default developer workflow. Each stage is a real delegated agent run:
-investigation feeds implementation, implementation is verified by a separate
-test stage, and integration requires review. Implementation, verification, and
-review execute in an isolated Git worktree (or shadow copy) and produce diffs
-for reviewed reconciliation - nothing is merged into the user's tree
-automatically.
+The default developer workflow coordinating specialized Kyro agents:
+1. Investigation feeds implementation: Forge investigates the project and maps affected modules and tests.
+2. Isolated implementation: Forge implements the targeted change inside an isolated worktree without touching the user's working copy.
+3. Verification: The Test Specialist examines the candidate changes, runs focused tests, and records verification evidence.
+4. Code Review: The Code Reviewer inspects the candidate diff and verification evidence, assessing safety and edge cases.
+5. Documentation: The Documentation Specialist verifies and aligns documentation, API contracts, and guides.
 
-Adapt or replace this workflow by editing the manifest; stages are optional and
-can be assigned to any enabled agent, including custom agents.
+All candidate work remains isolated in a dedicated Git worktree (or shadow copy) until human-reviewed reconciliation.

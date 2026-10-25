@@ -51,6 +51,18 @@ pub const BUILTIN_MANIFESTS: &[(&str, &str)] = &[
         include_str!("../../resources/agents/scout-web.md"),
     ),
     (
+        "test-regression-specialist",
+        include_str!("../../resources/agents/test-regression-specialist.md"),
+    ),
+    (
+        "code-reviewer",
+        include_str!("../../resources/agents/code-reviewer.md"),
+    ),
+    (
+        "documentation-reviewer",
+        include_str!("../../resources/agents/documentation-reviewer.md"),
+    ),
+    (
         "kyro-routine-worker",
         include_str!("../../resources/agents/kyro-routine-worker.md"),
     ),
@@ -1262,6 +1274,11 @@ fn legacy_profile_mapping(id: &str) -> Option<&'static str> {
     match id {
         "telegram-bot" => Some("kyro-remote-worker"),
         "manual-routine-worker" | "scheduled-routine-worker" => Some("kyro-routine-worker"),
+        "repository_investigator" => Some("forge-devops"),
+        "implementation_engineer" => Some("forge-devops"),
+        "test_regression_specialist" => Some("test-regression-specialist"),
+        "code_reviewer" => Some("code-reviewer"),
+        "documentation_reviewer" => Some("documentation-reviewer"),
         _ => None,
     }
 }
@@ -1586,6 +1603,192 @@ mod tests {
             reg.resolve("sylink"),
             Err(ResolveError::UnknownProfile(_))
         ));
+    }
+
+    #[test]
+    fn all_bundled_profiles_parse_resolve_and_have_unique_identities() {
+        let reg = AgentRegistry::embedded_only();
+        assert_eq!(BUILTIN_MANIFESTS.len(), 8);
+
+        let profiles = reg.active_profiles();
+        assert_eq!(profiles.len(), 8);
+
+        // Unique IDs
+        let mut seen_ids = HashSet::new();
+        for p in &profiles {
+            assert!(
+                seen_ids.insert(p.id.clone()),
+                "Duplicate builtin profile id: {}",
+                p.id
+            );
+        }
+
+        // Unique aliases & names (case-insensitive)
+        let mut seen_tokens = HashMap::new();
+        for p in &profiles {
+            for alias in &p.aliases {
+                let lower = alias.to_lowercase();
+                if let Some(owner) = seen_tokens.insert(lower.clone(), p.id.clone()) {
+                    panic!(
+                        "Token '{}' collides between agent '{}' and '{}'",
+                        lower, owner, p.id
+                    );
+                }
+            }
+        }
+
+        // Direct resolution by id
+        for (id, _) in BUILTIN_MANIFESTS {
+            let res = reg.resolve(id).expect("builtin profile must resolve");
+            assert_eq!(res.id, *id);
+            assert_eq!(res.origin, ProfileOrigin::Builtin);
+            assert!(res.enabled);
+        }
+
+        // Resolution by primary aliases
+        assert_eq!(reg.resolve("apex").unwrap().id, "apex-orchestrator");
+        assert_eq!(reg.resolve("forge").unwrap().id, "forge-devops");
+        assert_eq!(reg.resolve("scout").unwrap().id, "scout-web");
+        assert_eq!(reg.resolve("qa").unwrap().id, "test-regression-specialist");
+        assert_eq!(
+            reg.resolve("tester").unwrap().id,
+            "test-regression-specialist"
+        );
+        assert_eq!(
+            reg.resolve("test-specialist").unwrap().id,
+            "test-regression-specialist"
+        );
+        assert_eq!(reg.resolve("reviewer").unwrap().id, "code-reviewer");
+        assert_eq!(reg.resolve("cr").unwrap().id, "code-reviewer");
+        assert_eq!(
+            reg.resolve("doc-reviewer").unwrap().id,
+            "documentation-reviewer"
+        );
+        assert_eq!(reg.resolve("docs").unwrap().id, "documentation-reviewer");
+        assert_eq!(
+            reg.resolve("routine-worker").unwrap().id,
+            "kyro-routine-worker"
+        );
+        assert_eq!(
+            reg.resolve("remote-worker").unwrap().id,
+            "kyro-remote-worker"
+        );
+    }
+
+    #[test]
+    fn delegation_policies_for_workers_and_specialists() {
+        let reg = AgentRegistry::embedded_only();
+
+        // Specialists can accept delegation and have delegation enabled
+        let test_spec = reg.resolve("test-regression-specialist").unwrap();
+        assert!(test_spec.accepts_delegation());
+        assert!(test_spec.delegation.enabled);
+        assert!(test_spec.tool_allowed("delegate_task"));
+        assert!(test_spec
+            .context
+            .memory_scopes
+            .contains(&"project".to_string()));
+
+        let reviewer = reg.resolve("code-reviewer").unwrap();
+        assert!(reviewer.accepts_delegation());
+        assert!(reviewer.delegation.enabled);
+        assert!(reviewer.tool_allowed("delegate_task"));
+        assert!(reviewer
+            .context
+            .memory_scopes
+            .contains(&"project".to_string()));
+
+        let doc_spec = reg.resolve("documentation-reviewer").unwrap();
+        assert!(doc_spec.accepts_delegation());
+        assert!(doc_spec.delegation.enabled);
+        assert!(doc_spec.tool_allowed("delegate_task"));
+        assert!(doc_spec
+            .context
+            .memory_scopes
+            .contains(&"project".to_string()));
+
+        // Apex and Forge have project memory scope
+        let apex = reg.resolve("apex-orchestrator").unwrap();
+        assert!(apex.context.memory_scopes.contains(&"project".to_string()));
+        let forge = reg.resolve("forge-devops").unwrap();
+        assert!(forge.context.memory_scopes.contains(&"project".to_string()));
+
+        // Routine and Remote workers CANNOT delegate
+        let routine = reg.resolve("kyro-routine-worker").unwrap();
+        assert!(!routine.delegation.enabled);
+        assert_eq!(routine.delegation.max_depth, 0);
+        assert_eq!(routine.delegation.max_children, 0);
+        assert!(!routine.tool_allowed("delegate_task"));
+
+        let remote = reg.resolve("kyro-remote-worker").unwrap();
+        assert!(!remote.delegation.enabled);
+        assert_eq!(remote.delegation.max_depth, 0);
+        assert_eq!(remote.delegation.max_children, 0);
+        assert!(!remote.tool_allowed("delegate_task"));
+    }
+
+    #[test]
+    fn legacy_role_migration_resolves_specialists() {
+        let reg = AgentRegistry::embedded_only();
+
+        assert_eq!(
+            reg.resolve_lenient("test_regression_specialist")
+                .unwrap()
+                .id,
+            "test-regression-specialist"
+        );
+        assert_eq!(
+            reg.resolve_lenient("code_reviewer").unwrap().id,
+            "code-reviewer"
+        );
+        assert_eq!(
+            reg.resolve_lenient("documentation_reviewer").unwrap().id,
+            "documentation-reviewer"
+        );
+        assert_eq!(
+            reg.resolve_lenient("repository_investigator").unwrap().id,
+            "forge-devops"
+        );
+        assert_eq!(
+            reg.resolve_lenient("implementation_engineer").unwrap().id,
+            "forge-devops"
+        );
+        assert_eq!(
+            reg.resolve_lenient("telegram-bot").unwrap().id,
+            "kyro-remote-worker"
+        );
+        assert_eq!(
+            reg.resolve_lenient("manual-routine-worker").unwrap().id,
+            "kyro-routine-worker"
+        );
+    }
+
+    #[test]
+    fn resetting_specialist_overrides_restores_factory_defaults() {
+        let cfg = TempConfig::new();
+        let mut reg = AgentRegistry::load(cfg.config()).unwrap();
+
+        for specialist_id in [
+            "test-regression-specialist",
+            "code-reviewer",
+            "documentation-reviewer",
+        ] {
+            let override_doc = format!(
+                "---\nid: {}\nname: Custom Name\nrole: Custom Role\n---\n\n# Custom body\n",
+                specialist_id
+            );
+            reg.save_profile(specialist_id, &override_doc)
+                .expect("override must save");
+            let overridden = reg.resolve(specialist_id).unwrap();
+            assert_eq!(overridden.origin, ProfileOrigin::Override);
+            assert_eq!(overridden.role, "Custom Role");
+
+            reg.reset_builtin(specialist_id)
+                .expect("reset must succeed");
+            let restored = reg.resolve(specialist_id).unwrap();
+            assert_eq!(restored.origin, ProfileOrigin::Builtin);
+            assert_ne!(restored.role, "Custom Role");
+        }
     }
 
     #[test]

@@ -2806,6 +2806,13 @@ The program is started as an explicit executable plus argument vector; free-form
                         }
                     };
 
+                let caller_api_key = {
+                    let map = self.active_runs.lock().await;
+                    map.get(run_id)
+                        .map(|ctx| ctx.api_key.clone())
+                        .unwrap_or_default()
+                };
+
                 let child_api_key =
                     match crate::agent::router::ModelRouter::select_api_key_for_route(
                         &child_route,
@@ -2813,8 +2820,8 @@ The program is started as an explicit executable plus argument vector; free-form
                     ) {
                         Ok(k) => k,
                         Err(e) => {
-                            if !api_key.trim().is_empty() {
-                                api_key.to_string()
+                            if !caller_api_key.trim().is_empty() {
+                                caller_api_key
                             } else {
                                 return (
                                     format!(
