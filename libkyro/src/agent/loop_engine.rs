@@ -2806,12 +2806,18 @@ The program is started as an explicit executable plus argument vector; free-form
                         }
                     };
 
-                let caller_api_key = {
+                let (caller_api_key, caller_model) = {
                     let map = self.active_runs.lock().await;
                     map.get(run_id)
-                        .map(|ctx| ctx.api_key.clone())
+                        .map(|ctx| (ctx.api_key.clone(), ctx.model.clone()))
                         .unwrap_or_default()
                 };
+
+                let parent_route =
+                    crate::agent::router::ModelRouter::resolve_model_route(&caller_model).ok();
+                let parent_is_test_mock = base_url
+                    .map(|ep| ep.contains("127.0.0.1") || ep.contains("localhost"))
+                    .unwrap_or(false);
 
                 let child_api_key =
                     match crate::agent::router::ModelRouter::select_api_key_for_route(
@@ -2820,7 +2826,13 @@ The program is started as an explicit executable plus argument vector; free-form
                     ) {
                         Ok(k) => k,
                         Err(e) => {
-                            if !caller_api_key.trim().is_empty() {
+                            let same_provider = parent_route
+                                .as_ref()
+                                .map(|pr| pr.provider == child_route.provider)
+                                .unwrap_or(false);
+                            if (same_provider || parent_is_test_mock)
+                                && !caller_api_key.trim().is_empty()
+                            {
                                 caller_api_key
                             } else {
                                 return (
@@ -2838,8 +2850,6 @@ The program is started as an explicit executable plus argument vector; free-form
                 // Explicit test mock endpoints are preserved across delegated children;
                 // otherwise the child model resolves to its own provider route endpoint (Bug 15)
                 let child_base_url = if let Some(parent_ep) = base_url {
-                    let parent_is_test_mock =
-                        parent_ep.contains("127.0.0.1") || parent_ep.contains("localhost");
                     if parent_is_test_mock || parent_ep == child_route.base_url {
                         Some(parent_ep.to_string())
                     } else {

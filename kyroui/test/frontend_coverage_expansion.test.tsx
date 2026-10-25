@@ -260,8 +260,9 @@ describe("TodayDashboardView Rejection & Quick Actions", () => {
       expect(invoke).toHaveBeenCalledWith(
         "resolve_approval",
         expect.objectContaining({
-          requestId: "appr_reject_1",
-          approved: false,
+          id: "appr_reject_1",
+          decision: "denied",
+          resolvedBy: "today_dashboard",
         })
       );
     });

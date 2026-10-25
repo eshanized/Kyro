@@ -745,8 +745,9 @@ describe("MyRoutinesView & TodayDashboard Integration Tests", () => {
       expect(invoke).toHaveBeenCalledWith(
         "resolve_approval",
         expect.objectContaining({
-          requestId: "appr_101",
-          approved: true,
+          id: "appr_101",
+          decision: "approved",
+          resolvedBy: "today_dashboard",
         })
       );
     });

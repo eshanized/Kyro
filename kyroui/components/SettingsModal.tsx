@@ -71,8 +71,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     nvidia_configured: false,
     telegram_configured: false,
     telegram_chat_id: "",
+    openai_configured: false,
+    anthropic_configured: false,
+    google_configured: false,
+    groq_configured: false,
+    mistral_configured: false,
+    deepseek_configured: false,
+    openrouter_configured: false,
+    together_configured: false,
   });
   const [newNvidiaKey, setNewNvidiaKey] = useState("");
+  const [newOpenaiKey, setNewOpenaiKey] = useState("");
+  const [newAnthropicKey, setNewAnthropicKey] = useState("");
+  const [newGoogleKey, setNewGoogleKey] = useState("");
+  const [newGroqKey, setNewGroqKey] = useState("");
+  const [newMistralKey, setNewMistralKey] = useState("");
+  const [newDeepseekKey, setNewDeepseekKey] = useState("");
+  const [newOpenrouterKey, setNewOpenrouterKey] = useState("");
+  const [newTogetherKey, setNewTogetherKey] = useState("");
   const [newTelegramToken, setNewTelegramToken] = useState("");
   const [telegramChatId, setTelegramChatId] = useState("");
   const [modelChoice, setModelChoice] = useState(selectedModel);
@@ -224,6 +240,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (newTelegramToken.trim()) {
         keysToSave.telegram_bot_token = newTelegramToken.trim();
       }
+      if (newOpenaiKey.trim()) {
+        keysToSave.openai = newOpenaiKey.trim();
+      }
+      if (newAnthropicKey.trim()) {
+        keysToSave.anthropic = newAnthropicKey.trim();
+      }
+      if (newGoogleKey.trim()) {
+        keysToSave.google = newGoogleKey.trim();
+      }
+      if (newGroqKey.trim()) {
+        keysToSave.groq = newGroqKey.trim();
+      }
+      if (newMistralKey.trim()) {
+        keysToSave.mistral = newMistralKey.trim();
+      }
+      if (newDeepseekKey.trim()) {
+        keysToSave.deepseek = newDeepseekKey.trim();
+      }
+      if (newOpenrouterKey.trim()) {
+        keysToSave.openrouter = newOpenrouterKey.trim();
+      }
+      if (newTogetherKey.trim()) {
+        keysToSave.together = newTogetherKey.trim();
+      }
       keysToSave.telegram_chat_id = telegramChatId.trim();
 
       await invoke("save_api_keys", { keys: keysToSave });
@@ -234,6 +274,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setIsSaved(true);
       setNewNvidiaKey("");
       setNewTelegramToken("");
+      setNewOpenaiKey("");
+      setNewAnthropicKey("");
+      setNewGoogleKey("");
+      setNewGroqKey("");
+      setNewMistralKey("");
+      setNewDeepseekKey("");
+      setNewOpenrouterKey("");
+      setNewTogetherKey("");
       await loadSettings();
       setTimeout(() => setIsSaved(false), 2000);
     } catch (err) {
@@ -438,6 +486,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <option value="meta/llama-3.3-70b-instruct">
                     Meta Llama-3.3-70B-Instruct (Fast Code & Reasoning)
                   </option>
+                  <option value="openai/gpt-4o">OpenAI GPT-4o</option>
+                  <option value="anthropic/claude-3-5-sonnet">Anthropic Claude 3.5 Sonnet</option>
+                  <option value="google/gemini-1.5-pro">Google Gemini 1.5 Pro</option>
+                  <option value="groq/llama-3.3-70b-versatile">Groq Llama 3.3 70B</option>
+                  <option value="deepseek/deepseek-chat">DeepSeek Chat</option>
+                  <option value="mistral/mistral-large-latest">Mistral Large</option>
+                  <option value="openrouter/auto">OpenRouter Auto</option>
+                  <option value="together/meta-llama/Llama-3.3-70B-Instruct-Turbo">Together Llama 3.3 70B</option>
+                  <option value="ollama/llama3.2">Local Ollama Llama 3.2</option>
                 </select>
               </div>
 
@@ -446,6 +503,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
                   <NvidiaIcon className="w-3.5 h-3.5 text-[#76B900]" />
                   <span>NVIDIA NIM API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_NVIDIA_API_KEY)</span>
                 </label>
                 <div className="flex gap-2">
                   <input
@@ -469,6 +527,260 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </button>
                   )}
                 </div>
+              </div>
+
+              {/* OpenAI Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-purple-400" />
+                  <span>OpenAI API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_OPENAI_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.openai_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "sk-..."
+                    }
+                    value={newOpenaiKey}
+                    onChange={(e) => setNewOpenaiKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.openai_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("openai")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Anthropic Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Anthropic API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_ANTHROPIC_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.anthropic_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "sk-ant-..."
+                    }
+                    value={newAnthropicKey}
+                    onChange={(e) => setNewAnthropicKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.anthropic_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("anthropic")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Google Gemini Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Google Gemini API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_GOOGLE_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.google_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "AIza..."
+                    }
+                    value={newGoogleKey}
+                    onChange={(e) => setNewGoogleKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.google_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("google")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Groq Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-orange-400" />
+                  <span>Groq API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_GROQ_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.groq_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "gsk_..."
+                    }
+                    value={newGroqKey}
+                    onChange={(e) => setNewGroqKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.groq_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("groq")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* DeepSeek Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>DeepSeek API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_DEEPSEEK_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.deepseek_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "sk-..."
+                    }
+                    value={newDeepseekKey}
+                    onChange={(e) => setNewDeepseekKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.deepseek_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("deepseek")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Mistral Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-yellow-400" />
+                  <span>Mistral API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_MISTRAL_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.mistral_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "mis_..."
+                    }
+                    value={newMistralKey}
+                    onChange={(e) => setNewMistralKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.mistral_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("mistral")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* OpenRouter Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>OpenRouter API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_OPENROUTER_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.openrouter_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "sk-or-..."
+                    }
+                    value={newOpenrouterKey}
+                    onChange={(e) => setNewOpenrouterKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.openrouter_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("openrouter")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Together AI Key */}
+              <div>
+                <label className="block text-xs font-semibold text-neutral-200 mb-1.5 flex items-center gap-1.5">
+                  <Key className="w-3.5 h-3.5 text-purple-400" />
+                  <span>Together AI API Key</span>
+                  <span className="text-[10px] text-neutral-500 font-mono font-normal">(or KYRO_TOGETHER_API_KEY)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    placeholder={
+                      metadata?.together_configured
+                        ? "•••••••••••••••••••••••• (Configured in Vault)"
+                        : "tog_..."
+                    }
+                    value={newTogetherKey}
+                    onChange={(e) => setNewTogetherKey(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#000000] border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-neutral-500 font-mono"
+                  />
+                  {metadata.together_configured && (
+                    <button
+                      onClick={() => setSecretPendingDeletion("together")}
+                      className="px-3 py-2 bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/40 rounded-xl text-xs flex items-center gap-1 transition"
+                      title="Purge key from secure vault"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Purge
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Local Ollama Info */}
+              <div className="p-3 bg-neutral-900/50 border border-neutral-800 rounded-xl text-xs text-neutral-400 flex items-center justify-between">
+                <span>Local Ollama (<code>http://127.0.0.1:11434/v1</code>)</span>
+                <span className="text-green-400 text-[11px] font-medium">No Key Required</span>
               </div>
             </div>
           )}

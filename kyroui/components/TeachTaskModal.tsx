@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   HabitSettingsRecord,
   HabitSuggestionRecord,
@@ -7,6 +8,14 @@ import {
   SkillRecord,
   SkillStep,
 } from "../types/agent";
+
+interface SkillProgressEvent {
+  skill_id?: string;
+  skillId?: string;
+  step: number;
+  total: number;
+  description: string;
+}
 import {
   Play,
   Trash2,
@@ -55,6 +64,7 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
   const [recordName, setRecordName] = useState("");
   const [recordDesc, setRecordDesc] = useState("");
   const [replayingId, setReplayingId] = useState<string | null>(null);
+  const [replayProgress, setReplayProgress] = useState<SkillProgressEvent | null>(null);
 
   // Accept suggestion modal state
   const [acceptingSuggestion, setAcceptingSuggestion] = useState<HabitSuggestionRecord | null>(null);
@@ -250,8 +260,42 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
     }
   };
 
+  useEffect(() => {
+    if (!isOpen) {
+      setReplayProgress(null);
+      return;
+    }
+
+    let unlisten: (() => void) | undefined;
+    try {
+      const p = listen<SkillProgressEvent>("skill:progress", (event) => {
+        const payload = event.payload;
+        const eventSkillId = payload.skill_id || payload.skillId;
+        if (replayingId && eventSkillId && eventSkillId !== replayingId) {
+          return;
+        }
+        setReplayProgress(payload);
+      });
+      if (p && typeof p.then === "function") {
+        p.then((fn) => {
+          unlisten = fn;
+        }).catch(() => {});
+      }
+    } catch {
+      // Graceful fallback when listen is not available in test environments
+    }
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+      setReplayProgress(null);
+    };
+  }, [isOpen, replayingId]);
+
   const handleReplaySkill = async (id: string) => {
     setReplayingId(id);
+    setReplayProgress(null);
     try {
       await invoke("replay_skill", { skillId: id });
       setNotice(null);
@@ -259,6 +303,7 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
       setNotice({ tone: "error", message: "Error replaying skill: " + err });
     } finally {
       setReplayingId(null);
+      setReplayProgress(null);
     }
   };
 
@@ -549,6 +594,26 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
                     </div>
                   </div>
 
+                  {replayingId === selectedSkill.id && replayProgress && (
+                    <div className="p-3 bg-purple-950/40 border border-purple-800/60 rounded-xl space-y-1.5">
+                      <div className="flex items-center justify-between text-xs text-purple-200 font-medium">
+                        <span>Replaying Step {replayProgress.step} of {replayProgress.total}</span>
+                        <span>{Math.round((replayProgress.step / Math.max(replayProgress.total, 1)) * 100)}%</span>
+                      </div>
+                      <div className="w-full bg-neutral-800 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-purple-500 h-1.5 rounded-full transition-all duration-300"
+                          style={{ width: `${(replayProgress.step / Math.max(replayProgress.total, 1)) * 100}%` }}
+                        />
+                      </div>
+                      {replayProgress.description && (
+                        <div className="text-[11px] text-neutral-300 font-mono truncate">
+                          {replayProgress.description}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div>
                     <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-2">
                       Recorded Steps ({parseSteps(selectedSkill.steps_json).length})
@@ -593,41 +658,62 @@ export const TeachTaskModal: React.FC<TeachTaskModalProps> = ({
                     <div
                       key={s.id}
                       onClick={() => setSelectedSkill(s)}
-                      className={`p-4 bg-[#171717] border rounded-xl flex items-center justify-between gap-4 transition cursor-pointer ${
+                      className={`p-4 bg-[#171717] border rounded-xl transition cursor-pointer space-y-2.5 ${
                         selectedSkill?.id === s.id
                           ? "border-neutral-500 bg-[#1a1a1a]"
                           : "border-[#262626] hover:border-neutral-700"
                       }`}
                     >
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
-                          <span>{s.name}</span>
-                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/60 text-neutral-400 border border-neutral-800">
-                            {s.id}
-                          </span>
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
+                            <span>{s.name}</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/60 text-neutral-400 border border-neutral-800">
+                              {s.id}
+                            </span>
+                          </div>
+                          {s.description && (
+                            <div className="text-xs text-neutral-400 truncate mt-0.5">{s.description}</div>
+                          )}
                         </div>
-                        {s.description && (
-                          <div className="text-xs text-neutral-400 truncate mt-0.5">{s.description}</div>
-                        )}
+                        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            onClick={() => handleReplaySkill(s.id)}
+                            disabled={replayingId === s.id}
+                            className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 text-xs font-medium flex items-center gap-1.5 transition"
+                          >
+                            <Play className="w-3 h-3 fill-current" />
+                            {replayingId === s.id ? "Replaying..." : "Replay"}
+                          </button>
+                          <button
+                            onClick={() => promptDeleteSkill(s)}
+                            className="p-1.5 text-neutral-400 hover:text-red-400 rounded-lg hover:bg-neutral-800 transition"
+                            title="Delete task"
+                            aria-label="Delete task"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => handleReplaySkill(s.id)}
-                          disabled={replayingId === s.id}
-                          className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 text-xs font-medium flex items-center gap-1.5 transition"
-                        >
-                          <Play className="w-3 h-3 fill-current" />
-                          {replayingId === s.id ? "Replaying..." : "Replay"}
-                        </button>
-                        <button
-                          onClick={() => promptDeleteSkill(s)}
-                          className="p-1.5 text-neutral-400 hover:text-red-400 rounded-lg hover:bg-neutral-800 transition"
-                          title="Delete task"
-                          aria-label="Delete task"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
+                      {replayingId === s.id && replayProgress && (
+                        <div className="mt-2.5 p-2.5 bg-purple-950/40 border border-purple-800/60 rounded-lg space-y-1">
+                          <div className="flex items-center justify-between text-xs text-purple-200">
+                            <span>Step {replayProgress.step} of {replayProgress.total}</span>
+                            <span>{Math.round((replayProgress.step / Math.max(replayProgress.total, 1)) * 100)}%</span>
+                          </div>
+                          <div className="w-full bg-neutral-800 rounded-full h-1 overflow-hidden">
+                            <div
+                              className="bg-purple-500 h-1 rounded-full transition-all duration-300"
+                              style={{ width: `${(replayProgress.step / Math.max(replayProgress.total, 1)) * 100}%` }}
+                            />
+                          </div>
+                          {replayProgress.description && (
+                            <div className="text-[10px] text-neutral-400 font-mono truncate">
+                              {replayProgress.description}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

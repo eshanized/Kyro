@@ -166,15 +166,71 @@ impl ModelRouter {
                     return Ok(k.clone());
                 }
             }
-            other => {
-                if let Some(env_key) =
-                    std::env::var(format!("KYRO_{}_API_KEY", other.to_uppercase()))
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                {
-                    return Ok(env_key);
+            "openai" => {
+                if let Some(k) = vault_keys.openai.as_ref().filter(|k| !k.trim().is_empty()) {
+                    return Ok(k.clone());
                 }
             }
+            "anthropic" => {
+                if let Some(k) = vault_keys
+                    .anthropic
+                    .as_ref()
+                    .filter(|k| !k.trim().is_empty())
+                {
+                    return Ok(k.clone());
+                }
+            }
+            "google" => {
+                if let Some(k) = vault_keys.google.as_ref().filter(|k| !k.trim().is_empty()) {
+                    return Ok(k.clone());
+                }
+            }
+            "groq" => {
+                if let Some(k) = vault_keys.groq.as_ref().filter(|k| !k.trim().is_empty()) {
+                    return Ok(k.clone());
+                }
+            }
+            "mistral" => {
+                if let Some(k) = vault_keys.mistral.as_ref().filter(|k| !k.trim().is_empty()) {
+                    return Ok(k.clone());
+                }
+            }
+            "deepseek" => {
+                if let Some(k) = vault_keys
+                    .deepseek
+                    .as_ref()
+                    .filter(|k| !k.trim().is_empty())
+                {
+                    return Ok(k.clone());
+                }
+            }
+            "openrouter" => {
+                if let Some(k) = vault_keys
+                    .openrouter
+                    .as_ref()
+                    .filter(|k| !k.trim().is_empty())
+                {
+                    return Ok(k.clone());
+                }
+            }
+            "together" => {
+                if let Some(k) = vault_keys
+                    .together
+                    .as_ref()
+                    .filter(|k| !k.trim().is_empty())
+                {
+                    return Ok(k.clone());
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(env_key) =
+            std::env::var(format!("KYRO_{}_API_KEY", route.provider.to_uppercase()))
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        {
+            return Ok(env_key);
         }
 
         Err(format!(

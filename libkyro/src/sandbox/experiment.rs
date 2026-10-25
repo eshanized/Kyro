@@ -703,10 +703,16 @@ impl ExperimentRunner {
             error: None,
         };
 
-        // Persist initial record
-        self.db
-            .create_code_experiment(&record)
-            .map_err(|e| format!("Database error creating experiment record: {}", e))?;
+        // Persist initial record (update existing record if already created, or insert new)
+        if self.db.get_code_experiment(&id).ok().flatten().is_some() {
+            self.db
+                .update_code_experiment(&record)
+                .map_err(|e| format!("Database error updating experiment record: {}", e))?;
+        } else {
+            self.db
+                .create_code_experiment(&record)
+                .map_err(|e| format!("Database error creating experiment record: {}", e))?;
+        }
 
         // Execute via runner
         let timeout_dur = Duration::from_secs(limits.timeout_seconds);

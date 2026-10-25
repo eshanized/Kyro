@@ -101,13 +101,14 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
   const handleAddComment = async () => {
     if (!selectedArtifact || !commentInput.trim()) return;
     setIsAddingComment(true);
+    setStatusMessage(null);
     try {
       await invoke("add_artifact_comment", {
         id: selectedArtifact.id,
         comment: commentInput.trim(),
         feedToAgent: true,
       });
-      setStatusMessage("Comment added and sent to active agent task as feedback.");
+      setStatusMessage("Comment saved and queued into conversation history for the next agent turn.");
       setCommentInput("");
       const list = await invoke<ArtifactRecord[]>("list_artifacts", {
         runId: runId || null,
@@ -119,7 +120,8 @@ export const ArtifactsModal: React.FC<ArtifactsModalProps> = ({
         setSelectedArtifact(updated);
       }
     } catch (e: any) {
-      setStatusMessage(`Error adding comment: ${e}`);
+      const errMsg = typeof e === "string" ? e : e?.message || String(e);
+      setStatusMessage(`Error adding comment: ${errMsg}`);
     } finally {
       setIsAddingComment(false);
     }

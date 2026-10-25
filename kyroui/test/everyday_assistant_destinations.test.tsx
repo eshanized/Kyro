@@ -200,9 +200,9 @@ describe("Kyro Everyday Destinations & Workflows", () => {
 
       await waitFor(() => {
         expect(invoke).toHaveBeenCalledWith("resolve_approval", {
-          requestId: "app-urgent-1",
-          approved: true,
-          note: "Approved from Today dashboard",
+          id: "app-urgent-1",
+          decision: "approved",
+          resolvedBy: "today_dashboard",
         });
       });
     });

@@ -500,3 +500,115 @@ fn test_bug_15_mixed_provider_parent_child_delegation_resolution() {
     assert_ne!(parent_route.base_url, child_route.base_url);
     assert_ne!(parent_route.credential_key, child_route.credential_key);
 }
+
+#[test]
+fn test_issue_23_cross_provider_delegation_fallback_rejected() {
+    let vault_keys = ApiKeys {
+        nvidia: Some("nv-parent-secret-12345".to_string()),
+        ..Default::default()
+    };
+
+    // Anthropic child model
+    let anthropic_route = ModelRouter::resolve_model_route("anthropic/claude-3-5-sonnet").unwrap();
+    let err = ModelRouter::select_api_key_for_route(&anthropic_route, &vault_keys)
+        .expect_err("Child Anthropic must fail when Anthropic key is missing");
+
+    // Parent's NVIDIA key is never sent or selected for Anthropic
+    assert!(!err.contains("nv-parent-secret-12345"));
+    assert!(err.contains("No API key configured for provider 'anthropic'"));
+
+    // OpenAI child model
+    let openai_route = ModelRouter::resolve_model_route("openai/gpt-4o").unwrap();
+    let err_oai = ModelRouter::select_api_key_for_route(&openai_route, &vault_keys)
+        .expect_err("Child OpenAI must fail when OpenAI key is missing");
+    assert!(!err_oai.contains("nv-parent-secret-12345"));
+    assert!(err_oai.contains("No API key configured for provider 'openai'"));
+
+    // Same-provider delegation (NVIDIA -> NVIDIA) succeeds
+    let nvidia_child_route =
+        ModelRouter::resolve_model_route("meta/llama-3.3-70b-instruct").unwrap();
+    assert_eq!(nvidia_child_route.provider, "nvidia");
+    let selected_key = ModelRouter::select_api_key_for_route(&nvidia_child_route, &vault_keys)
+        .expect("Same-provider delegation uses NVIDIA key");
+    assert_eq!(selected_key, "nv-parent-secret-12345");
+}
+
+#[test]
+fn test_issue_34_complete_provider_vault_support() {
+    let vault_keys = ApiKeys {
+        openai: Some("sk-openai-key".to_string()),
+        anthropic: Some("sk-ant-key".to_string()),
+        google: Some("aiza-google-key".to_string()),
+        groq: Some("gsk-groq-key".to_string()),
+        mistral: Some("mis-mistral-key".to_string()),
+        deepseek: Some("sk-deepseek-key".to_string()),
+        openrouter: Some("sk-or-key".to_string()),
+        together: Some("tog-together-key".to_string()),
+        ..Default::default()
+    };
+
+    // OpenAI
+    let oai_route = ModelRouter::resolve_model_route("openai/gpt-4o").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&oai_route, &vault_keys).unwrap(),
+        "sk-openai-key"
+    );
+
+    // Anthropic
+    let ant_route = ModelRouter::resolve_model_route("anthropic/claude-3-5-sonnet").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&ant_route, &vault_keys).unwrap(),
+        "sk-ant-key"
+    );
+
+    // Google
+    let google_route = ModelRouter::resolve_model_route("google/gemini-1.5-pro").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&google_route, &vault_keys).unwrap(),
+        "aiza-google-key"
+    );
+
+    // Groq
+    let groq_route = ModelRouter::resolve_model_route("groq/llama-3.3-70b-versatile").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&groq_route, &vault_keys).unwrap(),
+        "gsk-groq-key"
+    );
+
+    // Mistral
+    let mistral_route = ModelRouter::resolve_model_route("mistral-large-latest").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&mistral_route, &vault_keys).unwrap(),
+        "mis-mistral-key"
+    );
+
+    // DeepSeek
+    let deepseek_route = ModelRouter::resolve_model_route("deepseek/deepseek-chat").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&deepseek_route, &vault_keys).unwrap(),
+        "sk-deepseek-key"
+    );
+
+    // OpenRouter
+    let openrouter_route = ModelRouter::resolve_model_route("openrouter/auto").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&openrouter_route, &vault_keys).unwrap(),
+        "sk-or-key"
+    );
+
+    // Together
+    let together_route =
+        ModelRouter::resolve_model_route("together/meta-llama/Llama-3.3-70B-Instruct-Turbo")
+            .unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&together_route, &vault_keys).unwrap(),
+        "tog-together-key"
+    );
+
+    // Local Ollama requires NO key
+    let ollama_route = ModelRouter::resolve_model_route("ollama/llama3.2").unwrap();
+    assert_eq!(
+        ModelRouter::select_api_key_for_route(&ollama_route, &ApiKeys::default()).unwrap(),
+        ""
+    );
+}

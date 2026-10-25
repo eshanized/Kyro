@@ -15,6 +15,7 @@ use crate::storage::{AgentRun, Database};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng as yaml;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,73 @@ use crate::multibot::group::MultiBotOrchestrator;
 
 /// Maximum number of concurrent team runs a workspace may schedule.
 const MAX_WORKFLOW_CONCURRENCY: u32 = 8;
+
+pub const SHADOW_MANIFEST_FILENAME: &str = ".kyro_shadow_manifest.json";
+
+/// File manifest storing baseline relative file paths and their SHA256 hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowManifest {
+    pub timestamp: i64,
+    pub files: HashMap<String, String>,
+}
+
+/// Compute SHA-256 hash of a file's contents.
+pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let out = hasher.finalize();
+    Ok(out.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+}
+
+/// Robust directory traversal collecting relative paths and SHA256 hashes.
+/// Surfaces I/O errors and permission issues rather than silently ignoring entries.
+pub fn collect_shadow_manifest(
+    base: &Path,
+    rel: &Path,
+    manifest: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let dir = base.join(rel);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let read_dir = fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+
+    for entry_res in read_dir {
+        let entry = entry_res
+            .map_err(|e| format!("Failed to read directory entry in {}: {}", dir.display(), e))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if name_str == ".git"
+            || name_str == "node_modules"
+            || name_str == "target"
+            || name_str == "dist"
+            || name_str == SHADOW_MANIFEST_FILENAME
+        {
+            continue;
+        }
+
+        let child_rel = if rel.as_os_str().is_empty() {
+            PathBuf::from(&name)
+        } else {
+            rel.join(&name)
+        };
+
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect {}: {}", entry.path().display(), e))?;
+
+        if file_type.is_dir() {
+            collect_shadow_manifest(base, &child_rel, manifest)?;
+        } else if file_type.is_file() {
+            let hash = compute_file_sha256(&entry.path())?;
+            manifest.insert(child_rel.to_string_lossy().to_string(), hash);
+        }
+    }
+    Ok(())
+}
 
 /// Template placeholder replaced with the workspace's primary objective.
 pub const OBJECTIVE_PLACEHOLDER: &str = "{{objective}}";
@@ -1317,13 +1385,52 @@ impl MultiAgentOrchestrator {
         }
     }
 
+    /// Selects the terminal candidate tasks in the dependency graph.
+    /// If candidate tasks form a linear pipeline, selects the final completed stage.
+    /// If multiple independent terminal tasks exist, returns all of them.
+    pub fn find_terminal_candidates(ws: &MultiAgentWorkspace) -> Vec<&SpecialistTask> {
+        let worktree_tasks: Vec<&SpecialistTask> = ws
+            .tasks
+            .iter()
+            .filter(|t| t.isolated_worktree_path.is_some())
+            .collect();
+        if worktree_tasks.is_empty() {
+            return Vec::new();
+        }
+
+        let completed: Vec<&SpecialistTask> = worktree_tasks
+            .iter()
+            .filter(|t| t.status == "completed")
+            .copied()
+            .collect();
+        let pool = if !completed.is_empty() {
+            completed
+        } else {
+            worktree_tasks
+        };
+
+        let mut depended_on = HashSet::new();
+        for t in &pool {
+            for dep in &t.depends_on {
+                depended_on.insert(dep.as_str());
+            }
+        }
+
+        let terminal: Vec<&SpecialistTask> = pool
+            .into_iter()
+            .filter(|t| !depended_on.contains(t.task_id.as_str()))
+            .collect();
+
+        terminal
+    }
+
     fn setup_shadow_from_upstreams(
         project_root: &Path,
         worktree_dir: &Path,
         upstream_isolated: &[&&SpecialistTask],
     ) -> Result<(), String> {
         if upstream_isolated.is_empty() {
-            Self::fallback_shadow_copy(project_root, worktree_dir)
+            Self::fallback_shadow_copy(project_root, worktree_dir)?;
         } else {
             let first_dir = upstream_isolated[0]
                 .isolated_worktree_path
@@ -1343,15 +1450,31 @@ impl MultiAgentOrchestrator {
                         let dst_file = worktree_dir.join(&file_rel);
                         if src_file.is_file() {
                             if let Some(parent) = dst_file.parent() {
-                                let _ = fs::create_dir_all(parent);
+                                fs::create_dir_all(parent)
+                                    .map_err(|e| format!("Failed to create parent dir: {}", e))?;
                             }
-                            let _ = fs::copy(&src_file, &dst_file);
+                            fs::copy(&src_file, &dst_file)
+                                .map_err(|e| format!("Failed to copy upstream file: {}", e))?;
                         }
                     }
                 }
             }
-            Ok(())
         }
+
+        // Record baseline manifest and file hashes so non-git reconciliation can detect
+        // additions, modifications, deletions, and concurrent external changes safely.
+        let mut baseline_files = HashMap::new();
+        collect_shadow_manifest(project_root, Path::new(""), &mut baseline_files)?;
+        let manifest = ShadowManifest {
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            files: baseline_files,
+        };
+        let json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| format!("Failed to serialize shadow manifest: {}", e))?;
+        fs::write(worktree_dir.join(SHADOW_MANIFEST_FILENAME), json)
+            .map_err(|e| format!("Failed to write shadow baseline manifest: {}", e))?;
+
+        Ok(())
     }
 
     /// Cleans up an isolated worktree after completion or cancellation.
@@ -1383,31 +1506,51 @@ impl MultiAgentOrchestrator {
     }
 
     /// Fallback shadow copy of source tree into isolated scratch folder.
-    fn fallback_shadow_copy(src: &Path, dst: &Path) -> Result<(), String> {
-        let _ = fs::create_dir_all(dst);
-        let read_dir = fs::read_dir(src).map_err(|e| format!("Failed to read source: {}", e))?;
+    /// Traverses robustly and surfaces I/O and permission errors.
+    pub fn fallback_shadow_copy(src: &Path, dst: &Path) -> Result<(), String> {
+        fs::create_dir_all(dst).map_err(|e| {
+            format!(
+                "Failed to create destination directory {}: {}",
+                dst.display(),
+                e
+            )
+        })?;
+        let read_dir = fs::read_dir(src)
+            .map_err(|e| format!("Failed to read source directory {}: {}", src.display(), e))?;
 
-        for entry in read_dir.flatten() {
+        for entry_res in read_dir {
+            let entry = entry_res.map_err(|e| {
+                format!("Failed to read directory entry in {}: {}", src.display(), e)
+            })?;
             let path = entry.path();
             let file_name = entry.file_name();
             let name_str = file_name.to_string_lossy();
 
-            // Skip heavy build or vcs folders
+            // Skip heavy build or vcs folders and shadow manifest metadata
             if name_str == "node_modules"
                 || name_str == "target"
                 || name_str == ".git"
                 || name_str == "dist"
+                || name_str == SHADOW_MANIFEST_FILENAME
             {
                 continue;
             }
 
             let target = dst.join(&file_name);
-            if let Ok(file_type) = entry.file_type() {
-                if file_type.is_file() {
-                    let _ = fs::copy(&path, &target);
-                } else if file_type.is_dir() {
-                    let _ = Self::fallback_shadow_copy(&path, &target);
-                }
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("Failed to inspect {}: {}", path.display(), e))?;
+            if file_type.is_file() {
+                fs::copy(&path, &target).map_err(|e| {
+                    format!(
+                        "Failed to copy {} to {}: {}",
+                        path.display(),
+                        target.display(),
+                        e
+                    )
+                })?;
+            } else if file_type.is_dir() {
+                Self::fallback_shadow_copy(&path, &target)?;
             }
         }
         Ok(())
@@ -1574,24 +1717,129 @@ impl MultiAgentOrchestrator {
             });
         }
 
-        // Generic directory diff for non-git projects
-        let modified = get_worktree_changed_files(project_root, worktree_path, None);
-        let changes_detected = !modified.is_empty();
-        let summary = if changes_detected {
+        // Generic directory diff for non-git projects with baseline manifest and conflict detection
+        let manifest_path = worktree_path.join(SHADOW_MANIFEST_FILENAME);
+        let baseline_files = if manifest_path.exists() {
+            let content = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+            let manifest: ShadowManifest =
+                serde_json::from_str(&content).map_err(|e| e.to_string())?;
+            manifest.files
+        } else {
+            let mut base = HashMap::new();
+            collect_shadow_manifest(project_root, Path::new(""), &mut base)?;
+            base
+        };
+
+        let mut candidate_files = HashMap::new();
+        collect_shadow_manifest(worktree_path, Path::new(""), &mut candidate_files)?;
+
+        let mut current_project_files = HashMap::new();
+        collect_shadow_manifest(project_root, Path::new(""), &mut current_project_files)?;
+
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut deleted = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut diff_builder = String::new();
+
+        // 1. Candidate modifications & additions relative to baseline
+        for (file_rel, cand_hash) in &candidate_files {
+            match baseline_files.get(file_rel) {
+                Some(base_hash) => {
+                    if cand_hash != base_hash {
+                        modified.push(file_rel.clone());
+                        if let Some(curr_hash) = current_project_files.get(file_rel) {
+                            if curr_hash != base_hash {
+                                conflicts.push(format!(
+                                    "Concurrent modification in project root: {}",
+                                    file_rel
+                                ));
+                            }
+                        } else {
+                            conflicts.push(format!(
+                                "Concurrent external deletion in project root: {}",
+                                file_rel
+                            ));
+                        }
+
+                        let base_content =
+                            fs::read_to_string(project_root.join(file_rel)).unwrap_or_default();
+                        let cand_content =
+                            fs::read_to_string(worktree_path.join(file_rel)).unwrap_or_default();
+                        diff_builder.push_str(&format!("--- a/{}\n+++ b/{}\n", file_rel, file_rel));
+                        for line in cand_content.lines() {
+                            if !base_content.contains(line) {
+                                diff_builder.push_str(&format!("+{}\n", line));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    added.push(file_rel.clone());
+                    if current_project_files.contains_key(file_rel) {
+                        conflicts
+                            .push(format!("Concurrent creation in project root: {}", file_rel));
+                    }
+                    let cand_content =
+                        fs::read_to_string(worktree_path.join(file_rel)).unwrap_or_default();
+                    diff_builder.push_str(&format!("--- /dev/null\n+++ b/{}\n", file_rel));
+                    for line in cand_content.lines() {
+                        diff_builder.push_str(&format!("+{}\n", line));
+                    }
+                }
+            }
+        }
+
+        // 2. Candidate deletions
+        for (file_rel, base_hash) in &baseline_files {
+            if !candidate_files.contains_key(file_rel) {
+                deleted.push(file_rel.clone());
+                if let Some(curr_hash) = current_project_files.get(file_rel) {
+                    if curr_hash != base_hash {
+                        conflicts.push(format!(
+                            "Concurrent modification of file deleted by candidate: {}",
+                            file_rel
+                        ));
+                    }
+                }
+                diff_builder.push_str(&format!(
+                    "--- a/{}\n+++ /dev/null\n@@ -1 +0,0 @@\n-(file deleted)\n",
+                    file_rel
+                ));
+            }
+        }
+
+        let mut all_modified = Vec::new();
+        all_modified.extend(modified.clone());
+        all_modified.extend(added.clone());
+        all_modified.extend(deleted.clone());
+        all_modified.sort();
+
+        let changes_detected = !all_modified.is_empty();
+        let can_safely_merge = changes_detected && conflicts.is_empty();
+        let summary = if !conflicts.is_empty() {
             format!(
-                "{} file(s) modified in shadow workspace directory.",
-                modified.len()
+                "Non-git conflicts detected in {} file(s) between shadow workspace and project root. Manual resolution required.",
+                conflicts.len()
+            )
+        } else if changes_detected {
+            format!(
+                "Non-git changes successfully detected: {} modified, {} added, {} deleted.",
+                modified.len(),
+                added.len(),
+                deleted.len()
             )
         } else {
             "No code modifications made in isolated worktree.".to_string()
         };
+
         Ok(ReconciliationOutcome {
             workspace_id: workspace_id.to_string(),
             changes_detected,
-            modified_files: modified,
-            unified_diff: String::new(),
-            conflicts_detected: vec![],
-            can_safely_merge: true,
+            modified_files: all_modified,
+            unified_diff: diff_builder,
+            conflicts_detected: conflicts,
+            can_safely_merge,
             reconciliation_summary: summary,
         })
     }
@@ -1634,14 +1882,29 @@ impl MultiAgentOrchestrator {
                     Err(format!("Git merge failed: {}", err))
                 }
             } else {
+                // If branch_name is None, diff against base_commit or HEAD~1 to avoid empty diff against HEAD
+                let diff_target = "HEAD~1";
                 let diff_out = Command::new("git")
                     .arg("-C")
                     .arg(worktree_path)
-                    .args(["diff", "HEAD"])
+                    .args(["diff", diff_target])
                     .output()
                     .map_err(|e| format!("Failed to generate diff: {}", e))?;
 
-                if diff_out.stdout.is_empty() {
+                let patch_bytes = if !diff_out.stdout.is_empty() {
+                    diff_out.stdout
+                } else {
+                    // Fall back to git diff HEAD
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(worktree_path)
+                        .args(["diff", "HEAD"])
+                        .output()
+                        .map_err(|e| format!("Failed to generate diff: {}", e))?
+                        .stdout
+                };
+
+                if patch_bytes.is_empty() {
                     return Ok("No changes to apply.".to_string());
                 }
 
@@ -1657,7 +1920,7 @@ impl MultiAgentOrchestrator {
 
                 if let Some(mut stdin) = apply_child.stdin.take() {
                     use std::io::Write;
-                    let _ = stdin.write_all(&diff_out.stdout);
+                    let _ = stdin.write_all(&patch_bytes);
                 }
 
                 let apply_out = apply_child
@@ -1672,8 +1935,86 @@ impl MultiAgentOrchestrator {
                 }
             }
         } else {
-            Self::fallback_shadow_copy(worktree_path, project_root)?;
-            Ok("Successfully synced files from worktree back to project root.".to_string())
+            // Non-git safe apply:
+            // 1. Re-verify for concurrent modifications
+            let manifest_path = worktree_path.join(SHADOW_MANIFEST_FILENAME);
+            let baseline_files = if manifest_path.exists() {
+                let content = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+                let manifest: ShadowManifest =
+                    serde_json::from_str(&content).map_err(|e| e.to_string())?;
+                manifest.files
+            } else {
+                HashMap::new()
+            };
+
+            let mut candidate_files = HashMap::new();
+            collect_shadow_manifest(worktree_path, Path::new(""), &mut candidate_files)?;
+
+            let mut current_project_files = HashMap::new();
+            collect_shadow_manifest(project_root, Path::new(""), &mut current_project_files)?;
+
+            // Fail closed if destination files were concurrently modified
+            if !baseline_files.is_empty() {
+                for (file_rel, cand_hash) in &candidate_files {
+                    if let Some(base_hash) = baseline_files.get(file_rel) {
+                        if cand_hash != base_hash {
+                            if let Some(curr_hash) = current_project_files.get(file_rel) {
+                                if curr_hash != base_hash {
+                                    return Err(format!("Cannot apply reconciliation: file '{}' was concurrently modified in project root", file_rel));
+                                }
+                            }
+                        }
+                    } else if current_project_files.contains_key(file_rel) {
+                        return Err(format!("Cannot apply reconciliation: file '{}' was concurrently created in project root", file_rel));
+                    }
+                }
+            }
+
+            // 2. Apply ONLY candidate-modified and added files
+            let mut applied_count = 0;
+            for (file_rel, cand_hash) in &candidate_files {
+                let is_changed = baseline_files
+                    .get(file_rel)
+                    .map(|h| h != cand_hash)
+                    .unwrap_or(true);
+                if is_changed {
+                    let src = worktree_path.join(file_rel);
+                    let dst = project_root.join(file_rel);
+                    if let Some(parent) = dst.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|e| format!("Failed to create parent dir: {}", e))?;
+                    }
+                    fs::copy(&src, &dst).map_err(|e| {
+                        format!(
+                            "Failed to copy {} to {}: {}",
+                            src.display(),
+                            dst.display(),
+                            e
+                        )
+                    })?;
+                    applied_count += 1;
+                }
+            }
+
+            // 3. Remove deleted files
+            let mut deleted_count = 0;
+            for file_rel in baseline_files.keys() {
+                if !candidate_files.contains_key(file_rel) {
+                    let dst = project_root.join(file_rel);
+                    if dst.exists() {
+                        let _ = fs::remove_file(&dst);
+                        deleted_count += 1;
+                    }
+                }
+            }
+
+            // Clean up shadow manifest from destination if it exists
+            let _ = fs::remove_file(project_root.join(SHADOW_MANIFEST_FILENAME));
+
+            Ok(format!(
+                "Successfully applied non-git changes: {} file(s) updated/added, {} file(s) removed.",
+                applied_count, deleted_count
+            ))
         }
     }
 

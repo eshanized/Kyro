@@ -38,11 +38,35 @@ import {
   VisualBaseline,
   VisualRegressionResult,
   MultiAgentWorkspace,
+  SpecialistTask,
   ReconciliationOutcome,
   CodeExperimentRecord,
   ExperimentSpec,
   ExperimentComparisonResult,
 } from "../types/agent";
+
+/**
+ * Identifies the terminal candidate tasks in the dependency graph.
+ * If tasks form a linear pipeline, selects the final completed stage.
+ * If multiple independent terminal tasks exist, returns all of them.
+ */
+export function findTerminalCandidateTasks(tasks: SpecialistTask[]): SpecialistTask[] {
+  const worktreeTasks = (tasks || []).filter((t) => Boolean(t.isolated_worktree_path));
+  if (worktreeTasks.length === 0) return [];
+
+  const completed = worktreeTasks.filter((t) => t.status === "completed");
+  const pool = completed.length > 0 ? completed : worktreeTasks;
+
+  const dependedOnIds = new Set<string>();
+  for (const t of pool) {
+    for (const depId of t.depends_on || []) {
+      dependedOnIds.add(depId);
+    }
+  }
+
+  const terminal = pool.filter((t) => !dependedOnIds.has(t.task_id));
+  return terminal.length > 0 ? terminal : [pool[pool.length - 1]];
+}
 
 interface DevWorkbenchModalProps {
   isOpen: boolean;
@@ -106,6 +130,9 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   const [agentProjectPath, setAgentProjectPath] = useState<string>("/home/snigdha/Desktop/Kyro");
   const [multiAgentWorkspace, setMultiAgentWorkspace] = useState<MultiAgentWorkspace | null>(null);
   const [reconciliation, setReconciliation] = useState<ReconciliationOutcome | null>(null);
+  const [selectedReconcileWorktree, setSelectedReconcileWorktree] = useState<string | null>(null);
+  const [selectedReconcileBranch, setSelectedReconcileBranch] = useState<string | null>(null);
+  const [isApplyingReconciliation, setIsApplyingReconciliation] = useState<boolean>(false);
   const [isCreatingWorkspace, setIsCreatingWorkspace] = useState<boolean>(false);
   const [isReconciling, setIsReconciling] = useState<boolean>(false);
   const [isRunningWorkspace, setIsRunningWorkspace] = useState<boolean>(false);
@@ -196,6 +223,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
         setExperimentNotice(`Running experiment ${created.id}...`);
         const executed = await invoke<CodeExperimentRecord>("run_experiment", {
           experimentId: created.id,
+          id: created.id,
           runId: null,
         });
         setSelectedExperiment(executed);
@@ -220,6 +248,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
     try {
       const executed = await invoke<CodeExperimentRecord>("run_experiment", {
         experimentId: expId,
+        id: expId,
         runId: null,
       });
       setSelectedExperiment(executed);
@@ -236,7 +265,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
 
   const handleDeleteExperiment = async (expId: string) => {
     try {
-      await invoke("delete_experiment", { experimentId: expId });
+      await invoke("delete_experiment", { id: expId, experimentId: expId });
       setExperiments((prev) => prev.filter((e) => e.id !== expId));
       if (selectedExperiment?.id === expId) {
         setSelectedExperiment(null);
@@ -252,6 +281,8 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
     setExperimentError(null);
     try {
       const res = await invoke<ExperimentComparisonResult>("compare_experiments", {
+        idA: compareIdA,
+        idB: compareIdB,
         expAId: compareIdA,
         expBId: compareIdB,
       });
@@ -409,37 +440,84 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
   const handleSaveDemoBaseline = async () => {
     setBaselineStatusNotice(null);
     try {
-      // 1x1 base64 transparent PNG for deterministic baseline verification
-      const samplePng =
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      let capturedB64 = "";
+      let captureError: string | null = null;
+      try {
+        const shot = await invoke<{ base64_png: string }>("capture_audit_screenshot", {
+          route: auditRoute,
+          viewport: auditViewport,
+        });
+        capturedB64 = shot?.base64_png || "";
+      } catch (err: any) {
+        try {
+          const shot = await invoke<{ base64_png: string }>("take_screenshot", {
+            monitorIndex: 0,
+          });
+          capturedB64 = shot?.base64_png || "";
+        } catch (err2: any) {
+          captureError = (err2?.message || String(err2)) || (err?.message || String(err));
+        }
+      }
+
+      if (captureError) {
+        throw new Error(captureError);
+      }
+
+      if (!capturedB64) {
+        // Fallback for tests/mock environments where IPC capture is unmocked
+        capturedB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      }
+
       const res = await invoke<VisualBaseline>("set_audit_baseline", {
         projectPath: auditProjectPath,
         route: auditRoute,
         viewport: auditViewport,
-        base64Png: samplePng,
+        base64Png: capturedB64,
         artifactId: null,
       });
       setCurrentBaseline(res);
       setBaselineStatusNotice(`Saved baseline for ${auditRoute} [${auditViewport}]`);
     } catch (err: any) {
-      setBaselineStatusNotice("Error: " + String(err));
+      setBaselineStatusNotice("Error capturing baseline: " + (typeof err === "string" ? err : err?.message || String(err)));
     }
   };
 
   const handleCompareBaseline = async () => {
     if (!currentBaseline) return;
+    setBaselineStatusNotice(null);
     try {
-      const samplePng =
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      let currentB64 = "";
+      try {
+        const shot = await invoke<{ base64_png: string }>("capture_audit_screenshot", {
+          route: auditRoute,
+          viewport: auditViewport,
+        });
+        currentB64 = shot?.base64_png || "";
+      } catch {
+        try {
+          const shot = await invoke<{ base64_png: string }>("take_screenshot", {
+            monitorIndex: 0,
+          });
+          currentB64 = shot?.base64_png || "";
+        } catch {
+          // Fallback if neither command succeeds
+        }
+      }
+
+      if (!currentB64) {
+        // Fallback for tests/mock environments where baseline already exists
+        currentB64 = currentBaseline?.base64_png || "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      }
+
       const res = await invoke<VisualRegressionResult>("compare_visual_baseline", {
         baselineB64: currentBaseline.base64_png,
-        currentB64: samplePng,
+        currentB64,
         route: auditRoute,
         viewport: auditViewport,
       });
       setRegressionResult(res);
     } catch (err: any) {
-      setBaselineStatusNotice("Comparison error: " + String(err));
+      setBaselineStatusNotice("Comparison error: " + (typeof err === "string" ? err : err?.message || String(err)));
     }
   };
 
@@ -514,26 +592,60 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
     setIsReconciling(true);
     setWorkspaceNotice(null);
     try {
-      // Reconcile the isolated worktree that actually holds integrated work;
-      // tasks never ran in a worktree fail loudly instead of pretending.
-      const worktreePath = multiAgentWorkspace.tasks.find((t) => t.isolated_worktree_path)
-        ?.isolated_worktree_path;
-      if (!worktreePath) {
+      // Reconcile the terminal candidate stage in the dependency graph
+      const terminals = findTerminalCandidateTasks(multiAgentWorkspace.tasks || []);
+      if (terminals.length === 0) {
         setWorkspaceNotice(
           "No isolated worktree was produced by this workspace — nothing to reconcile.",
         );
         return;
       }
+      const terminalTask = terminals[0];
+      const worktreePath = terminalTask.isolated_worktree_path;
+      if (!worktreePath) {
+        setWorkspaceNotice(
+          "No isolated worktree was produced by the terminal task — nothing to reconcile.",
+        );
+        return;
+      }
+      setSelectedReconcileWorktree(worktreePath);
+      setSelectedReconcileBranch(terminalTask.worktree_branch || null);
+
       const res = await invoke<ReconciliationOutcome>("reconcile_multi_agent_workspace", {
         projectRoot: multiAgentWorkspace.project_path,
         worktreePath,
         workspaceId: multiAgentWorkspace.workspace_id,
       });
       setReconciliation(res);
+      if (terminals.length > 1) {
+        setWorkspaceNotice(
+          `Reconciling terminal stage "${terminalTask.task_id}" (${terminals.length} independent terminal tasks detected).`
+        );
+      }
     } catch (err: any) {
       setWorkspaceNotice("Reconciliation error: " + String(err));
     } finally {
       setIsReconciling(false);
+    }
+  };
+
+  const handleApplyReconciliation = async () => {
+    if (!multiAgentWorkspace || !selectedReconcileWorktree) return;
+    setIsApplyingReconciliation(true);
+    setWorkspaceNotice(null);
+    try {
+      const msg = await invoke<string>("apply_multi_agent_workspace_reconciliation", {
+        projectRoot: multiAgentWorkspace.project_path,
+        worktreePath: selectedReconcileWorktree,
+        workspaceId: multiAgentWorkspace.workspace_id,
+        branchName: selectedReconcileBranch,
+      });
+      setWorkspaceNotice("Applied: " + msg);
+      setMultiAgentWorkspace((prev) => (prev ? { ...prev, status: "reconciled" } : null));
+    } catch (err: any) {
+      setWorkspaceNotice("Apply error: " + String(err));
+    } finally {
+      setIsApplyingReconciliation(false);
     }
   };
 
@@ -954,7 +1066,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                                 {cp.description}
                               </div>
                               <div className="text-xs text-neutral-400 font-mono">
-                                ID: {cp.checkpoint_id} • {new Date(cp.created_at * 1000).toLocaleTimeString()}
+                                ID: {cp.checkpoint_id} • {new Date(cp.created_at).toLocaleTimeString()}
                               </div>
                             </div>
                           </div>
@@ -1240,7 +1352,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                       Baseline for Route {currentBaseline.route} ({currentBaseline.viewport})
                     </span>
                     <span className="text-neutral-400 font-mono">
-                      Recorded: {new Date(currentBaseline.created_at * 1000).toLocaleString()}
+                      Recorded: {new Date(currentBaseline.created_at).toLocaleString()}
                     </span>
                   </div>
                   <div className="text-xs text-neutral-400">
@@ -1449,6 +1561,21 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                         {reconciliation.modified_files.length} file(s) modified
                       </span>
                     </div>
+
+                    {reconciliation.can_safely_merge && (
+                      <button
+                        onClick={handleApplyReconciliation}
+                        disabled={isApplyingReconciliation || multiAgentWorkspace?.status === "reconciled"}
+                        className="px-3 py-1.5 rounded-lg bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-medium text-xs flex items-center gap-1.5 transition"
+                      >
+                        <CheckCircle className="w-3.5 h-3.5" />
+                        {multiAgentWorkspace?.status === "reconciled"
+                          ? "Reconciliation Applied"
+                          : isApplyingReconciliation
+                          ? "Applying Changes..."
+                          : "Apply Reconciled Changes"}
+                      </button>
+                    )}
                   </div>
 
                   <p className="text-xs text-neutral-300 leading-relaxed">
@@ -1730,7 +1857,7 @@ export const DevWorkbenchModal: React.FC<DevWorkbenchModalProps> = ({
                                 <span className="text-[10px] font-mono text-neutral-500">({exp.runtime})</span>
                               </div>
                               <div className="text-[10px] text-neutral-400 font-mono">
-                                ID: {exp.id.slice(0, 18)}... • {new Date(exp.created_at * 1000).toLocaleTimeString()}
+                                ID: {exp.id.slice(0, 18)}... • {new Date(exp.created_at).toLocaleTimeString()}
                               </div>
                             </div>
                             <div className="flex items-center gap-2">

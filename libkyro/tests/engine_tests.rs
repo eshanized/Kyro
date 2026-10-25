@@ -4897,8 +4897,7 @@ fn model_router_binds_models_to_their_true_providers() {
         ModelRouter::resolve_model_route(kyro_lib::agent::router::DEFAULT_NEMOTRON_MODEL).unwrap();
     let keys = kyro_lib::storage::ApiKeys {
         nvidia: Some("nvault-key".to_string()),
-        telegram_bot_token: None,
-        telegram_chat_id: None,
+        ..Default::default()
     };
     let key = ModelRouter::select_api_key_for_route(&nvidia_route, &keys)
         .expect("vault nvidia key is selected");

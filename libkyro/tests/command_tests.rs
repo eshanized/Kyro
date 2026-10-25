@@ -145,6 +145,7 @@ async fn test_vault_and_api_keys_commands() {
         nvidia: Some("nv-test-key".to_string()),
         telegram_bot_token: Some("bot-token".to_string()),
         telegram_chat_id: Some("12345".to_string()),
+        ..Default::default()
     };
     save_api_keys(state.clone(), keys).unwrap();
 
@@ -1793,4 +1794,478 @@ async fn test_selected_model_persistence_and_fallback() {
     // 5. Empty model identifier rejects with error
     let empty_res = save_selected_model(state.clone(), "   ".to_string()).await;
     assert!(empty_res.is_err());
+}
+
+#[tokio::test]
+async fn test_issue_24_fixed_vs_inherit_model_resolution() {
+    use kyro_lib::agent::manifest::parse_manifest;
+    use kyro_lib::agent::router::ModelRouter;
+
+    // 1. Manifest with fixed model
+    let fixed_manifest_doc = r#"---
+id: fixed-agent
+name: Fixed Agent
+role: Code Specialist
+model:
+  mode: fixed
+  model: meta/llama-3.2-11b-vision-instruct
+---
+Instructions here
+"#;
+    let fixed_profile = parse_manifest(fixed_manifest_doc).expect("parse fixed manifest");
+    assert_eq!(fixed_profile.frontmatter.model.mode, "fixed");
+
+    // Primary run logic for fixed profile: ignores caller-selected model
+    let caller_selected = "openai/gpt-4o".to_string();
+    let effective_fixed = match fixed_profile.frontmatter.model.mode.as_str() {
+        "fixed" => fixed_profile
+            .frontmatter
+            .model
+            .model
+            .clone()
+            .unwrap_or_else(|| caller_selected.clone()),
+        "inherit" => caller_selected.clone(),
+        _ => caller_selected.clone(),
+    };
+    assert_eq!(effective_fixed, "meta/llama-3.2-11b-vision-instruct");
+
+    // 2. Manifest with inherit mode
+    let inherit_manifest_doc = r#"---
+id: inherit-agent
+name: Inherit Agent
+role: Assistant
+model:
+  mode: inherit
+---
+Instructions here
+"#;
+    let inherit_profile = parse_manifest(inherit_manifest_doc).expect("parse inherit manifest");
+    assert_eq!(inherit_profile.frontmatter.model.mode, "inherit");
+
+    let effective_inherit = match inherit_profile.frontmatter.model.mode.as_str() {
+        "fixed" => inherit_profile
+            .frontmatter
+            .model
+            .model
+            .clone()
+            .unwrap_or_else(|| caller_selected.clone()),
+        "inherit" => caller_selected.clone(),
+        _ => caller_selected.clone(),
+    };
+    assert_eq!(effective_inherit, "openai/gpt-4o");
+
+    // 3. Missing credential for the effective model fails closed
+    let empty_vault = kyro_lib::storage::ApiKeys::default();
+    let fixed_route = ModelRouter::resolve_model_route(&effective_fixed).unwrap();
+    assert_eq!(fixed_route.provider, "nvidia");
+    let err = ModelRouter::select_api_key_for_route(&fixed_route, &empty_vault)
+        .expect_err("Missing key for fixed model must fail closed");
+    assert!(err.contains("No API key configured for provider 'nvidia'"));
+}
+
+#[tokio::test]
+async fn test_issue_26_experiment_lifecycle_contracts() {
+    use kyro_lib::commands::{
+        compare_experiments, create_experiment, delete_experiment, get_experiment,
+        list_experiments, run_experiment,
+    };
+    use kyro_lib::sandbox::experiment::ExperimentSpec;
+
+    let (_ctx, state) = setup_test_context("exp_lifecycle");
+
+    let spec_a = ExperimentSpec {
+        id: None,
+        name: "test-lifecycle-a".to_string(),
+        runtime: "python".to_string(),
+        custom_image: None,
+        script: Some("print('hello a')".to_string()),
+        argv: None,
+        workspace_path: None,
+        network_mode: Some("none".to_string()),
+        limits: None,
+    };
+
+    let spec_b = ExperimentSpec {
+        id: None,
+        name: "test-lifecycle-b".to_string(),
+        runtime: "python".to_string(),
+        custom_image: None,
+        script: Some("print('hello b')".to_string()),
+        argv: None,
+        workspace_path: None,
+        network_mode: Some("none".to_string()),
+        limits: None,
+    };
+
+    // 1. Create experiments
+    let created_a = create_experiment(state.clone(), spec_a).unwrap();
+    let created_b = create_experiment(state.clone(), spec_b).unwrap();
+    assert_eq!(created_a.name, "test-lifecycle-a");
+    assert_eq!(created_b.name, "test-lifecycle-b");
+
+    // 2. Listing shows both
+    let list = list_experiments(state.clone(), None).unwrap();
+    assert!(list.iter().any(|e| e.id == created_a.id));
+    assert!(list.iter().any(|e| e.id == created_b.id));
+
+    // 3. Compare using both idA/idB and expAId/expBId wire styles
+    let comp1 = compare_experiments(
+        state.clone(),
+        Some(created_a.id.clone()),
+        Some(created_b.id.clone()),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(comp1.exp_a_id, created_a.id);
+    assert_eq!(comp1.exp_b_id, created_b.id);
+
+    let comp2 = compare_experiments(
+        state.clone(),
+        None,
+        None,
+        Some(created_a.id.clone()),
+        Some(created_b.id.clone()),
+    )
+    .unwrap();
+    assert_eq!(comp2.exp_a_id, created_a.id);
+    assert_eq!(comp2.exp_b_id, created_b.id);
+
+    // 4. Delete using id and experiment_id
+    let del_a = delete_experiment(state.clone(), Some(created_a.id.clone()), None).unwrap();
+    assert!(del_a);
+    let after_del_a = get_experiment(state.clone(), created_a.id.clone()).unwrap();
+    assert!(after_del_a.is_none());
+
+    let del_b = delete_experiment(state.clone(), None, Some(created_b.id.clone())).unwrap();
+    assert!(del_b);
+    let after_del_b = get_experiment(state.clone(), created_b.id.clone()).unwrap();
+    assert!(after_del_b.is_none());
+
+    // 5. Deleting missing experiment returns error or false
+    let missing_del =
+        delete_experiment(state.clone(), Some("nonexistent-exp-id".to_string()), None).unwrap();
+    assert!(!missing_del);
+
+    // 6. Running nonexistent experiment by ID fails with clear not found error
+    let missing_run = run_experiment(
+        state.clone(),
+        None,
+        Some("nonexistent-exp-id".to_string()),
+        None,
+        None,
+    )
+    .await;
+    assert!(missing_run.is_err());
+    assert!(missing_run
+        .unwrap_err()
+        .contains("Experiment 'nonexistent-exp-id' not found"));
+}
+
+#[tokio::test]
+async fn test_issue_27_reconciliation_inspection_does_not_mark_reconciled_until_applied() {
+    let (_ctx, state) = setup_test_context("issue27");
+    let proj_dir = _ctx.dir.join("proj_issue27");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::write(proj_dir.join("main.rs"), "fn main() {}\n").unwrap();
+
+    let ws = create_multi_agent_workspace(
+        state.clone(),
+        "run-parent-issue27".to_string(),
+        proj_dir.to_string_lossy().to_string(),
+        "Reconcile safely".to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Simulate completion of workspace
+    let config_root = state.engine.config_root().await.unwrap();
+    let mut loaded = kyro_lib::multibot::workspace::MultiAgentOrchestrator::load_workspace(
+        &config_root,
+        &ws.workspace_id,
+    )
+    .unwrap();
+    loaded.status = "completed".to_string();
+    kyro_lib::multibot::workspace::MultiAgentOrchestrator::save_workspace(&config_root, &loaded)
+        .unwrap();
+
+    // 1. Calling reconcile_multi_agent_workspace should generate review diff but NOT mark workspace reconciled
+    let recon_outcome = reconcile_multi_agent_workspace(
+        state.clone(),
+        proj_dir.to_string_lossy().to_string(),
+        proj_dir.to_string_lossy().to_string(),
+        ws.workspace_id.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recon_outcome.workspace_id, ws.workspace_id);
+
+    // Verify workspace status is STILL "completed", not "reconciled"
+    let after_review = kyro_lib::multibot::workspace::MultiAgentOrchestrator::load_workspace(
+        &config_root,
+        &ws.workspace_id,
+    )
+    .unwrap();
+    assert_eq!(after_review.status, "completed");
+
+    // 2. Now call apply_multi_agent_workspace_reconciliation
+    let apply_res = apply_multi_agent_workspace_reconciliation(
+        state.clone(),
+        proj_dir.to_string_lossy().to_string(),
+        proj_dir.to_string_lossy().to_string(),
+        Some(ws.workspace_id.clone()),
+        None,
+    )
+    .await;
+    assert!(apply_res.is_ok());
+
+    // After applying, status is marked "reconciled"
+    let after_apply = kyro_lib::multibot::workspace::MultiAgentOrchestrator::load_workspace(
+        &config_root,
+        &ws.workspace_id,
+    )
+    .unwrap();
+    assert_eq!(after_apply.status, "reconciled");
+}
+
+#[tokio::test]
+async fn test_issue_28_terminal_candidate_in_dependency_graph() {
+    let (_ctx, state) = setup_test_context("issue28");
+    let proj_dir = _ctx.dir.join("proj_issue28");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+
+    let mut ws = create_multi_agent_workspace(
+        state.clone(),
+        "run-parent-issue28".to_string(),
+        proj_dir.to_string_lossy().to_string(),
+        "Dependency pipeline".to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Define a 3-stage linear pipeline: investigate -> implement -> verify
+    ws.tasks = vec![
+        kyro_lib::multibot::workspace::SpecialistTask {
+            task_id: "investigate".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Analyze".to_string(),
+            depends_on: vec![],
+            optional: false,
+            isolated_worktree: false,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: None,
+            isolated_worktree_path: None,
+            worktree_branch: None,
+            base_commit: None,
+            output: Some("analyzed".to_string()),
+            error: None,
+            started_at: None,
+            completed_at: None,
+        },
+        kyro_lib::multibot::workspace::SpecialistTask {
+            task_id: "implement".to_string(),
+            agent_id: "forge-devops".to_string(),
+            objective: "Code".to_string(),
+            depends_on: vec!["investigate".to_string()],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: None,
+            isolated_worktree_path: Some(_ctx.dir.join("wt_implement")),
+            worktree_branch: Some("branch_implement".to_string()),
+            base_commit: None,
+            output: Some("coded".to_string()),
+            error: None,
+            started_at: None,
+            completed_at: None,
+        },
+        kyro_lib::multibot::workspace::SpecialistTask {
+            task_id: "verify".to_string(),
+            agent_id: "test-regression-specialist".to_string(),
+            objective: "Test".to_string(),
+            depends_on: vec!["implement".to_string()],
+            optional: false,
+            isolated_worktree: true,
+            max_attempts: 1,
+            attempts: 1,
+            status: "completed".to_string(),
+            child_run_id: None,
+            isolated_worktree_path: Some(_ctx.dir.join("wt_verify")),
+            worktree_branch: Some("branch_verify".to_string()),
+            base_commit: None,
+            output: Some("verified".to_string()),
+            error: None,
+            started_at: None,
+            completed_at: None,
+        },
+    ];
+
+    let terminals =
+        kyro_lib::multibot::workspace::MultiAgentOrchestrator::find_terminal_candidates(&ws);
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].task_id, "verify");
+    assert_eq!(
+        terminals[0].isolated_worktree_path,
+        Some(_ctx.dir.join("wt_verify"))
+    );
+}
+
+#[tokio::test]
+async fn test_issue_29_non_git_shadow_reconciliation_and_conflict_detection() {
+    let (_ctx, _state) = setup_test_context("issue29");
+    let proj_dir = _ctx.dir.join("proj_nongit");
+    let shadow_dir = _ctx.dir.join("shadow_nongit");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::write(proj_dir.join("file_keep.txt"), "keep original\n").unwrap();
+    std::fs::write(proj_dir.join("file_mod.txt"), "initial content\n").unwrap();
+    std::fs::write(proj_dir.join("file_del.txt"), "delete me\n").unwrap();
+
+    // 1. Shadow copy
+    kyro_lib::multibot::workspace::MultiAgentOrchestrator::fallback_shadow_copy(
+        &proj_dir,
+        &shadow_dir,
+    )
+    .unwrap();
+
+    // Record baseline manifest in shadow_dir
+    let mut base_files = std::collections::HashMap::new();
+    kyro_lib::multibot::workspace::collect_shadow_manifest(
+        &proj_dir,
+        std::path::Path::new(""),
+        &mut base_files,
+    )
+    .unwrap();
+    let manifest = kyro_lib::multibot::workspace::ShadowManifest {
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        files: base_files,
+    };
+    std::fs::write(
+        shadow_dir.join(kyro_lib::multibot::workspace::SHADOW_MANIFEST_FILENAME),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    // 2. Candidate modifies file_mod.txt, adds file_add.txt, deletes file_del.txt
+    std::fs::write(
+        shadow_dir.join("file_mod.txt"),
+        "modified content by candidate\n",
+    )
+    .unwrap();
+    std::fs::write(shadow_dir.join("file_add.txt"), "new file by candidate\n").unwrap();
+    std::fs::remove_file(shadow_dir.join("file_del.txt")).unwrap();
+
+    // 3. Reconcile without conflict
+    let outcome1 = kyro_lib::multibot::workspace::MultiAgentOrchestrator::reconcile_changes(
+        &proj_dir,
+        &shadow_dir,
+        "ws_test_29",
+    )
+    .unwrap();
+    assert!(outcome1.changes_detected);
+    assert!(outcome1.can_safely_merge);
+    assert!(outcome1.conflicts_detected.is_empty());
+    assert!(outcome1
+        .modified_files
+        .contains(&"file_mod.txt".to_string()));
+    assert!(outcome1
+        .modified_files
+        .contains(&"file_add.txt".to_string()));
+    assert!(outcome1
+        .modified_files
+        .contains(&"file_del.txt".to_string()));
+
+    // 4. Now simulate concurrent modification in project root to file_mod.txt
+    std::fs::write(
+        proj_dir.join("file_mod.txt"),
+        "concurrent external modification in root\n",
+    )
+    .unwrap();
+    let outcome2 = kyro_lib::multibot::workspace::MultiAgentOrchestrator::reconcile_changes(
+        &proj_dir,
+        &shadow_dir,
+        "ws_test_29",
+    )
+    .unwrap();
+    assert!(!outcome2.can_safely_merge);
+    assert_eq!(outcome2.conflicts_detected.len(), 1);
+    assert!(outcome2.conflicts_detected[0]
+        .contains("Concurrent modification in project root: file_mod.txt"));
+
+    // 5. Applying reconciliation when conflict exists MUST fail closed
+    let apply_err = kyro_lib::multibot::workspace::MultiAgentOrchestrator::apply_reconciliation(
+        &proj_dir,
+        &shadow_dir,
+        None,
+    );
+    assert!(apply_err.is_err());
+    assert!(apply_err.unwrap_err().contains("concurrently modified"));
+}
+
+#[tokio::test]
+async fn test_issue_32_artifact_feedback_validation_and_error_propagation() {
+    let (_ctx, state) = setup_test_context("issue32");
+
+    // 1. Create artifact without conversation ID
+    let art_no_conv = create_artifact(
+        state.clone(),
+        None,
+        None, // no conversation ID
+        "screenshot.png".to_string(),
+        "binary_data".to_string(),
+        "image".to_string(),
+    )
+    .unwrap();
+
+    // 2. Feeding feedback to agent on artifact without conversation must reject with error
+    let res_err = add_artifact_comment(
+        state.clone(),
+        art_no_conv.id.clone(),
+        "Looks blurry".to_string(),
+        true, // feed_to_agent: true
+    );
+    assert!(res_err.is_err());
+    assert!(res_err
+        .unwrap_err()
+        .contains("not associated with an active conversation"));
+
+    // 3. Create conversation and artifact with valid conversation ID
+    let conv_id = "conv_art_test".to_string();
+    state
+        .db
+        .create_conversation(&conv_id, "Test Conversation", "default")
+        .unwrap();
+
+    let art_with_conv = create_artifact(
+        state.clone(),
+        None,
+        Some(conv_id.clone()),
+        "chart.png".to_string(),
+        "chart_data".to_string(),
+        "image".to_string(),
+    )
+    .unwrap();
+
+    // 4. Feeding feedback to agent on valid conversation succeeds and injects user feedback message
+    let res_ok = add_artifact_comment(
+        state.clone(),
+        art_with_conv.id.clone(),
+        "Increase font size of legend".to_string(),
+        true,
+    );
+    assert!(res_ok.is_ok());
+
+    let msgs = state.db.get_messages(&conv_id).unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, "user");
+    assert!(msgs[0].content.contains("Increase font size of legend"));
+    assert!(msgs[0].content.contains(&art_with_conv.name));
 }

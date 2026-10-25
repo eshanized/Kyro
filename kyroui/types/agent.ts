@@ -121,12 +121,28 @@ export interface ApiKeys {
   nvidia?: string;
   telegram_bot_token?: string;
   telegram_chat_id?: string;
+  openai?: string;
+  anthropic?: string;
+  google?: string;
+  groq?: string;
+  mistral?: string;
+  deepseek?: string;
+  openrouter?: string;
+  together?: string;
 }
 
 export interface ApiKeysMetadata {
   nvidia_configured: boolean;
   telegram_configured: boolean;
   telegram_chat_id?: string;
+  openai_configured?: boolean;
+  anthropic_configured?: boolean;
+  google_configured?: boolean;
+  groq_configured?: boolean;
+  mistral_configured?: boolean;
+  deepseek_configured?: boolean;
+  openrouter_configured?: boolean;
+  together_configured?: boolean;
 }
 
 export interface AgentRun {

@@ -180,9 +180,9 @@ describe("Phase C Frontend Coverage to >= 95%", () => {
       fireEvent.click(approveBtn);
       await waitFor(() => {
         expect(mockedInvoke).toHaveBeenCalledWith("resolve_approval", {
-          requestId: "appr-1",
-          approved: true,
-          note: "Approved from Today dashboard",
+          id: "appr-1",
+          decision: "approved",
+          resolvedBy: "today_dashboard",
         });
       });
     });
@@ -249,9 +249,9 @@ describe("Phase C Frontend Coverage to >= 95%", () => {
       fireEvent.click(rejectBtn);
       await waitFor(() => {
         expect(mockedInvoke).toHaveBeenCalledWith("resolve_approval", {
-          requestId: "appr-2",
-          approved: false,
-          note: "Rejected from Today dashboard",
+          id: "appr-2",
+          decision: "denied",
+          resolvedBy: "today_dashboard",
         });
       });
     });

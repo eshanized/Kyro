@@ -225,9 +225,9 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
                     onClick={async () => {
                       try {
                         await invoke("resolve_approval", {
-                          requestId: req.id,
-                          approved: true,
-                          note: "Approved from Today dashboard",
+                          id: req.id,
+                          decision: "approved",
+                          resolvedBy: "today_dashboard",
                         });
                         setActionNotice(`Approved action for '${req.tool_name}'.`);
                         await loadDashboard();
@@ -243,9 +243,9 @@ export const TodayDashboardView: React.FC<TodayDashboardViewProps> = ({
                     onClick={async () => {
                       try {
                         await invoke("resolve_approval", {
-                          requestId: req.id,
-                          approved: false,
-                          note: "Rejected from Today dashboard",
+                          id: req.id,
+                          decision: "denied",
+                          resolvedBy: "today_dashboard",
                         });
                         setActionNotice(`Rejected action for '${req.tool_name}'.`);
                         await loadDashboard();

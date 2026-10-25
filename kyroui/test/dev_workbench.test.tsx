@@ -197,6 +197,9 @@ describe("Kyro Dev Workbench Modal", () => {
       if (cmd === "compare_visual_baseline") {
         return Promise.resolve(mockComparison);
       }
+      if (cmd === "capture_audit_screenshot" || cmd === "take_screenshot") {
+        return Promise.resolve({ width: 1280, height: 800, base64_png: mockBaseline.base64_png });
+      }
       return Promise.resolve([]);
     });
 
@@ -329,5 +332,134 @@ describe("Kyro Dev Workbench Modal", () => {
       expect(screen.getByText("1 file(s) modified")).toBeInTheDocument();
       expect(screen.getByText("Clean reconciliation with 0 merge conflicts across isolated worktrees.")).toBeInTheDocument();
     });
+  });
+
+  it("handles experiment lifecycle: create, run, rerun, compare, delete and verifies millisecond timestamp", async () => {
+    const fixedTimestampMs = 1714000000000;
+    const mockExpA = {
+      id: "exp-test-1",
+      name: "test-fibonacci-a",
+      run_id: null,
+      runtime: "python",
+      image: "python:3.11-alpine",
+      script: "print(55)",
+      argv_json: "[]",
+      workspace_path: null,
+      output_dir: "/tmp/out_a",
+      network_mode: "none",
+      cpu_limit: 1.0,
+      memory_limit_mb: 512,
+      timeout_seconds: 60,
+      status: "succeeded",
+      exit_code: 0,
+      stdout_tail: "55\n",
+      stderr_tail: null,
+      result_summary: "Experiment succeeded",
+      artifact_ids_json: "[]",
+      created_at: fixedTimestampMs,
+      started_at: fixedTimestampMs,
+      completed_at: fixedTimestampMs + 200,
+      error: null,
+    };
+
+    const mockExpB = {
+      ...mockExpA,
+      id: "exp-test-2",
+      name: "test-fibonacci-b",
+    };
+
+    const mockComparison = {
+      exp_a_id: "exp-test-1",
+      exp_b_id: "exp-test-2",
+      exit_code_match: true,
+      stdout_match: true,
+      stderr_match: true,
+      diff_summary: "Outputs match identically.",
+    };
+
+    (invoke as any).mockImplementation((cmd: string, args: any) => {
+      if (cmd === "list_experiments") {
+        return Promise.resolve([mockExpA, mockExpB]);
+      }
+      if (cmd === "create_experiment") {
+        return Promise.resolve(mockExpA);
+      }
+      if (cmd === "run_experiment") {
+        return Promise.resolve({ ...mockExpA, status: "succeeded" });
+      }
+      if (cmd === "delete_experiment") {
+        return Promise.resolve(true);
+      }
+      if (cmd === "compare_experiments") {
+        return Promise.resolve(mockComparison);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<DevWorkbenchModal isOpen={true} onClose={vi.fn()} initialTab="experiments" />);
+
+    expect(screen.getByText("Sandboxed Code-Execution Agents")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText("test-fibonacci-a")).toBeInTheDocument();
+      expect(screen.getByText("test-fibonacci-b")).toBeInTheDocument();
+    });
+
+    // Check millisecond timestamp formatting (Issue #33)
+    const expectedTime = new Date(fixedTimestampMs).toLocaleTimeString();
+    expect(screen.getAllByText(new RegExp(expectedTime)).length).toBeGreaterThan(0);
+
+    // Save spec only
+    const saveOnlyBtn = screen.getByText("Save Spec Only");
+    fireEvent.click(saveOnlyBtn);
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("create_experiment", expect.objectContaining({ spec: expect.any(Object) }));
+    });
+
+    // Run experiment directly (Issue #26)
+    const runNowBtn = screen.getByText("Run Isolated Experiment");
+    fireEvent.click(runNowBtn);
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith(
+        "run_experiment",
+        expect.objectContaining({
+          experimentId: "exp-test-1",
+          id: "exp-test-1",
+        })
+      );
+    });
+
+    // Delete experiment (Issue #26)
+    const deleteBtns = screen.getAllByTitle("Delete record");
+    fireEvent.click(deleteBtns[0]);
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith(
+        "delete_experiment",
+        expect.objectContaining({
+          id: "exp-test-1",
+          experimentId: "exp-test-1",
+        })
+      );
+    });
+
+    // Compare experiments (Issue #26)
+    const selects = screen.getAllByRole("combobox");
+    const expASelect = selects.find((s) => s.innerHTML.includes("Select Experiment A...")) as HTMLSelectElement;
+    const expBSelect = selects.find((s) => s.innerHTML.includes("Select Experiment B...")) as HTMLSelectElement;
+    if (expASelect && expBSelect) {
+      fireEvent.change(expASelect, { target: { value: "exp-test-1" } });
+      fireEvent.change(expBSelect, { target: { value: "exp-test-2" } });
+      const compareBtn = screen.getByText("Compare Runs");
+      fireEvent.click(compareBtn);
+      await waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith(
+          "compare_experiments",
+          expect.objectContaining({
+            idA: "exp-test-1",
+            idB: "exp-test-2",
+          })
+        );
+      });
+    }
   });
 });

@@ -21,6 +21,14 @@ pub struct ApiKeys {
     pub nvidia: Option<String>,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
+    pub openai: Option<String>,
+    pub anthropic: Option<String>,
+    pub google: Option<String>,
+    pub groq: Option<String>,
+    pub mistral: Option<String>,
+    pub deepseek: Option<String>,
+    pub openrouter: Option<String>,
+    pub together: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -28,6 +36,14 @@ pub struct ApiKeysMetadata {
     pub nvidia_configured: bool,
     pub telegram_configured: bool,
     pub telegram_chat_id: Option<String>,
+    pub openai_configured: bool,
+    pub anthropic_configured: bool,
+    pub google_configured: bool,
+    pub groq_configured: bool,
+    pub mistral_configured: bool,
+    pub deepseek_configured: bool,
+    pub openrouter_configured: bool,
+    pub together_configured: bool,
 }
 
 #[derive(Clone)]
@@ -364,11 +380,27 @@ impl Vault {
             .db
             .get_setting("telegram_chat_id")
             .map_err(|e| e.to_string())?;
+        let openai = self.get_secret("openai")?;
+        let anthropic = self.get_secret("anthropic")?;
+        let google = self.get_secret("google")?;
+        let groq = self.get_secret("groq")?;
+        let mistral = self.get_secret("mistral")?;
+        let deepseek = self.get_secret("deepseek")?;
+        let openrouter = self.get_secret("openrouter")?;
+        let together = self.get_secret("together")?;
 
         Ok(ApiKeysMetadata {
             nvidia_configured: nvidia.map(|s| !s.is_empty()).unwrap_or(false),
             telegram_configured: telegram.map(|s| !s.is_empty()).unwrap_or(false),
             telegram_chat_id: chat_id,
+            openai_configured: openai.map(|s| !s.is_empty()).unwrap_or(false),
+            anthropic_configured: anthropic.map(|s| !s.is_empty()).unwrap_or(false),
+            google_configured: google.map(|s| !s.is_empty()).unwrap_or(false),
+            groq_configured: groq.map(|s| !s.is_empty()).unwrap_or(false),
+            mistral_configured: mistral.map(|s| !s.is_empty()).unwrap_or(false),
+            deepseek_configured: deepseek.map(|s| !s.is_empty()).unwrap_or(false),
+            openrouter_configured: openrouter.map(|s| !s.is_empty()).unwrap_or(false),
+            together_configured: together.map(|s| !s.is_empty()).unwrap_or(false),
         })
     }
 
@@ -379,11 +411,27 @@ impl Vault {
             .db
             .get_setting("telegram_chat_id")
             .map_err(|e| e.to_string())?;
+        let openai = self.get_secret("openai")?;
+        let anthropic = self.get_secret("anthropic")?;
+        let google = self.get_secret("google")?;
+        let groq = self.get_secret("groq")?;
+        let mistral = self.get_secret("mistral")?;
+        let deepseek = self.get_secret("deepseek")?;
+        let openrouter = self.get_secret("openrouter")?;
+        let together = self.get_secret("together")?;
 
         Ok(ApiKeys {
             nvidia,
             telegram_bot_token,
             telegram_chat_id,
+            openai,
+            anthropic,
+            google,
+            groq,
+            mistral,
+            deepseek,
+            openrouter,
+            together,
         })
     }
 
@@ -398,6 +446,30 @@ impl Vault {
             self.db
                 .set_setting("telegram_chat_id", c)
                 .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref k) = keys.openai {
+            self.set_secret("openai", k)?;
+        }
+        if let Some(ref k) = keys.anthropic {
+            self.set_secret("anthropic", k)?;
+        }
+        if let Some(ref k) = keys.google {
+            self.set_secret("google", k)?;
+        }
+        if let Some(ref k) = keys.groq {
+            self.set_secret("groq", k)?;
+        }
+        if let Some(ref k) = keys.mistral {
+            self.set_secret("mistral", k)?;
+        }
+        if let Some(ref k) = keys.deepseek {
+            self.set_secret("deepseek", k)?;
+        }
+        if let Some(ref k) = keys.openrouter {
+            self.set_secret("openrouter", k)?;
+        }
+        if let Some(ref k) = keys.together {
+            self.set_secret("together", k)?;
         }
         Ok(())
     }

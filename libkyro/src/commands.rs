@@ -472,10 +472,13 @@ pub async fn replay_skill<R: tauri::Runtime>(
     };
 
     let app_handle = app.clone();
+    let sid = skill.id.clone();
     SkillReplayer::execute(&skill, Some(&state.db), None, move |step, total, desc| {
         let _ = app_handle.emit(
             "skill:progress",
             serde_json::json!({
+                "skill_id": sid,
+                "skillId": sid,
                 "step": step,
                 "total": total,
                 "description": desc
@@ -1117,18 +1120,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
     let keys = state.vault.get_all_keys()?;
 
     let effective_run_id = run_id.unwrap_or_else(|| format!("run_{}", uuid::Uuid::new_v4()));
-    let selected_model = model.unwrap_or_else(|| DEFAULT_NEMOTRON_MODEL.to_string());
-
-    // Authoritative provider resolution: bind the selected model to its
-    // provider, endpoint and credential BEFORE any network work. An absent
-    // credential for the resolved provider fails here instead of silently
-    // routing the request through another provider's endpoint/key.
-    let model_route = crate::agent::router::ModelRouter::resolve_model_route(&selected_model)?;
-    let api_key = crate::agent::router::ModelRouter::select_api_key_for_route(&model_route, &keys)?;
-    // The whole lifecycle of this run uses the resolved route family; the
-    // concrete endpoint is handed to the engine through registered context so
-    // that every completion call agrees about where to send the request.
-    let resolved_base_url = model_route.base_url.clone();
+    let caller_selected_model = model.unwrap_or_else(|| DEFAULT_NEMOTRON_MODEL.to_string());
 
     // Deprecated client-supplied prompt: the engine composes the authoritative
     // system prompt from the agent profile (Stage C). The argument is kept for
@@ -1157,6 +1149,28 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .resolve_agent(Some(&routing.target_agent_id))
         .await?;
     let effective_bot_id = resolved_profile.id.clone();
+
+    // Respect profile model settings (fixed vs inherit)
+    let effective_model = match resolved_profile.model.mode.as_str() {
+        "fixed" => resolved_profile
+            .model
+            .model
+            .clone()
+            .unwrap_or_else(|| caller_selected_model.clone()),
+        "inherit" => caller_selected_model.clone(),
+        _ => caller_selected_model.clone(),
+    };
+
+    // Authoritative provider resolution: bind the effective model to its
+    // provider, endpoint and credential BEFORE any network work. An absent
+    // credential for the resolved provider fails here instead of silently
+    // routing the request through another provider's endpoint/key.
+    let model_route = crate::agent::router::ModelRouter::resolve_model_route(&effective_model)?;
+    let api_key = crate::agent::router::ModelRouter::select_api_key_for_route(&model_route, &keys)?;
+    // The whole lifecycle of this run uses the resolved route family; the
+    // concrete endpoint is handed to the engine through registered context so
+    // that every completion call agrees about where to send the request.
+    let resolved_base_url = model_route.base_url.clone();
 
     let policy = crate::governance::PolicyEngine::load(&state.db);
     let autonomy_mode = match policy.task_autonomy_mode.trim().to_lowercase().as_str() {
@@ -1197,7 +1211,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
 
     let run_snapshot = RunConfigSnapshot {
         profile: resolved_profile.clone(),
-        effective_model: selected_model.clone(),
+        effective_model: effective_model.clone(),
         workspace_root: None,
         isolated_worktree_path: None,
         isolated_worktree: None,
@@ -1236,7 +1250,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         id: effective_run_id.clone(),
         conversation_id: conversation_id.clone(),
         agent_id: effective_bot_id,
-        model: selected_model.clone(),
+        model: effective_model.clone(),
         prompt: task_prompt,
         status: "running".to_string(),
         created_at: now,
@@ -1287,7 +1301,7 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
         .engine
         .run_step_extended(
             &effective_run_id,
-            &selected_model,
+            &effective_model,
             &api_key,
             Some(resolved_base_url.as_str()),
             &sys,
@@ -1616,23 +1630,36 @@ pub fn add_artifact_comment(
         .map_err(|e| e.to_string())?;
 
     if feed_to_agent {
-        if let Some(conv_id) = art.conversation_id {
-            let msg = crate::storage::Message {
-                id: format!("msg_{}", uuid::Uuid::new_v4()),
-                conversation_id: conv_id,
-                role: "user".to_string(),
-                content: format!(
-                    "[User Feedback on visual artifact '{}' ({}): {}]",
-                    art.name,
-                    art.id,
-                    comment.trim()
-                ),
-                tool_calls_json: None,
-                observations_json: None,
-                created_at: chrono::Utc::now().timestamp_millis(),
-            };
-            let _ = state.db.add_message(&msg);
+        let conv_id = art.conversation_id.ok_or_else(|| {
+            format!(
+                "Artifact '{}' is not associated with an active conversation to receive feedback",
+                id
+            )
+        })?;
+        if conv_id.trim().is_empty() {
+            return Err(format!(
+                "Artifact '{}' has empty conversation identifier; cannot feed to agent",
+                id
+            ));
         }
+        let msg = crate::storage::Message {
+            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            conversation_id: conv_id,
+            role: "user".to_string(),
+            content: format!(
+                "[User Feedback on visual artifact '{}' ({}): {}]",
+                art.name,
+                art.id,
+                comment.trim()
+            ),
+            tool_calls_json: None,
+            observations_json: None,
+            created_at: chrono::Utc::now().timestamp_millis(),
+        };
+        state
+            .db
+            .add_message(&msg)
+            .map_err(|e| format!("Failed to inject feedback into conversation history: {}", e))?;
     }
 
     Ok(true)
@@ -2766,36 +2793,132 @@ pub async fn reconcile_multi_agent_workspace(
     worktree_path: String,
     workspace_id: String,
 ) -> Result<ReconciliationOutcome, String> {
-    let outcome = MultiAgentOrchestrator::reconcile_changes(
-        Path::new(&project_root),
-        Path::new(&worktree_path),
-        &workspace_id,
-    )?;
-    // Record the review outcome on the durable workspace when one exists and
-    // produced integrable work. A workspace that fully failed (nothing ran
-    // successfully) keeps its failed status — "reconciled" is never fake
-    // success.
+    let root = Path::new(&project_root);
+    let mut resolved_worktree = std::path::PathBuf::from(&worktree_path);
+
+    // If worktree_path does not exist or workspace exists, check terminal candidates
     if let Some(config_root) = state.engine.config_root().await {
-        if let Ok(mut ws) = MultiAgentOrchestrator::load_workspace(&config_root, &workspace_id) {
-            if matches!(ws.status.as_str(), "completed" | "failed_partial") {
-                let _ = MultiAgentOrchestrator::mark_reconciled(&config_root, &mut ws);
+        if let Ok(ws) = MultiAgentOrchestrator::load_workspace(&config_root, &workspace_id) {
+            let terminals = MultiAgentOrchestrator::find_terminal_candidates(&ws);
+            if (!resolved_worktree.exists() || worktree_path.trim().is_empty())
+                && !terminals.is_empty()
+            {
+                if let Some(first) = terminals.first() {
+                    if let Some(ref path) = first.isolated_worktree_path {
+                        resolved_worktree = path.clone();
+                    }
+                }
+            }
+
+            // Conflict detection across independent terminal branches
+            if terminals.len() > 1 {
+                for i in 0..terminals.len() {
+                    for j in (i + 1)..terminals.len() {
+                        if let (Some(path_i), Some(path_j)) = (
+                            &terminals[i].isolated_worktree_path,
+                            &terminals[j].isolated_worktree_path,
+                        ) {
+                            let files_i = MultiAgentOrchestrator::get_worktree_changed_files(
+                                root,
+                                path_i,
+                                terminals[i].base_commit.as_deref(),
+                            );
+                            let files_j = MultiAgentOrchestrator::get_worktree_changed_files(
+                                root,
+                                path_j,
+                                terminals[j].base_commit.as_deref(),
+                            );
+                            let overlaps: Vec<String> = files_i
+                                .into_iter()
+                                .filter(|f| files_j.contains(f))
+                                .collect();
+                            if !overlaps.is_empty() {
+                                return Ok(ReconciliationOutcome {
+                                    workspace_id: workspace_id.clone(),
+                                    changes_detected: true,
+                                    modified_files: overlaps.clone(),
+                                    unified_diff: String::new(),
+                                    conflicts_detected: vec![format!(
+                                        "Branching conflict: independent terminal tasks '{}' and '{}' both modified: {}",
+                                        terminals[i].task_id,
+                                        terminals[j].task_id,
+                                        overlaps.join(", ")
+                                    )],
+                                    can_safely_merge: false,
+                                    reconciliation_summary: format!(
+                                        "Conflicting modifications detected between terminal tasks '{}' and '{}'. Manual review required.",
+                                        terminals[i].task_id, terminals[j].task_id
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+
+    let outcome =
+        MultiAgentOrchestrator::reconcile_changes(root, &resolved_worktree, &workspace_id)?;
+
+    // Note: Diff inspection NEVER marks the workspace "reconciled".
+    // "reconciled" status is recorded ONLY after successful application via apply_multi_agent_workspace_reconciliation.
     Ok(outcome)
 }
 
 #[tauri::command]
 pub async fn apply_multi_agent_workspace_reconciliation(
+    state: State<'_, AppState>,
     project_root: String,
     worktree_path: String,
+    workspace_id: Option<String>,
     branch_name: Option<String>,
 ) -> Result<String, String> {
-    MultiAgentOrchestrator::apply_reconciliation(
+    let result = MultiAgentOrchestrator::apply_reconciliation(
         Path::new(&project_root),
         Path::new(&worktree_path),
         branch_name.as_deref(),
-    )
+    )?;
+
+    // Record the reconciled state only after successful application
+    if let Some(ws_id) = workspace_id {
+        if let Some(config_root) = state.engine.config_root().await {
+            if let Ok(mut ws) = MultiAgentOrchestrator::load_workspace(&config_root, &ws_id) {
+                let _ = MultiAgentOrchestrator::mark_reconciled(&config_root, &mut ws);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn capture_audit_screenshot(
+    state: State<'_, AppState>,
+    route: Option<String>,
+    viewport: Option<String>,
+) -> Result<ScreenshotResult, String> {
+    let _ = (route, viewport);
+    let sessions = state.browser.list_sessions().await;
+    if let Some(session) = sessions.first() {
+        if let Ok(res) = state.browser.screenshot(&session.session_id, false).await {
+            if res.status == "success" {
+                let b64 = res
+                    .data
+                    .get("base64_png")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !b64.is_empty() {
+                    return Ok(ScreenshotResult {
+                        width: 1280,
+                        height: 800,
+                        base64_png: b64.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    take_screenshot(Some(0))
 }
 
 // -----------------------------------------------------------------------------
@@ -4052,11 +4175,48 @@ pub fn create_experiment(
 #[tauri::command]
 pub async fn run_experiment(
     state: State<'_, AppState>,
-    spec: ExperimentSpec,
+    spec: Option<ExperimentSpec>,
+    experiment_id: Option<String>,
+    id: Option<String>,
+    run_id: Option<String>,
 ) -> Result<CodeExperimentRecord, String> {
     let runner = ExperimentRunner::new(state.db.clone());
     let token = crate::agent::cancellation::CancellationToken::new();
-    runner.execute(spec, None, token).await
+
+    let target_spec = if let Some(s) = spec {
+        s
+    } else if let Some(exp_id) = experiment_id.or(id) {
+        let existing = state
+            .db
+            .get_code_experiment(&exp_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Experiment '{}' not found", exp_id))?;
+
+        let argv: Option<Vec<String>> = serde_json::from_str(&existing.argv_json).ok();
+        ExperimentSpec {
+            id: Some(existing.id),
+            name: existing.name,
+            runtime: existing.runtime,
+            custom_image: Some(existing.image),
+            script: existing.script,
+            argv,
+            workspace_path: existing.workspace_path,
+            network_mode: Some(existing.network_mode),
+            limits: Some(crate::sandbox::experiment::ResourceLimits {
+                cpu: existing.cpu_limit,
+                memory_mb: existing.memory_limit_mb,
+                pids_limit: 100,
+                timeout_seconds: existing.timeout_seconds,
+                max_output_bytes: 65536,
+            }),
+        }
+    } else {
+        return Err(
+            "Either 'spec' or 'experimentId' must be provided to run_experiment".to_string(),
+        );
+    };
+
+    runner.execute(target_spec, run_id.as_deref(), token).await
 }
 
 #[tauri::command]
@@ -4079,30 +4239,45 @@ pub fn list_experiments(
 }
 
 #[tauri::command]
-pub fn delete_experiment(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+pub fn delete_experiment(
+    state: State<'_, AppState>,
+    id: Option<String>,
+    experiment_id: Option<String>,
+) -> Result<bool, String> {
+    let target_id = id
+        .or(experiment_id)
+        .ok_or_else(|| "Experiment ID is required".to_string())?;
     state
         .db
-        .delete_code_experiment(&id)
+        .delete_code_experiment(&target_id)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn compare_experiments(
     state: State<'_, AppState>,
-    id_a: String,
-    id_b: String,
+    id_a: Option<String>,
+    id_b: Option<String>,
+    exp_a_id: Option<String>,
+    exp_b_id: Option<String>,
 ) -> Result<ExperimentComparisonResult, String> {
+    let target_a = id_a
+        .or(exp_a_id)
+        .ok_or_else(|| "Experiment A ID is required".to_string())?;
+    let target_b = id_b
+        .or(exp_b_id)
+        .ok_or_else(|| "Experiment B ID is required".to_string())?;
     let exp_a = state
         .db
-        .get_code_experiment(&id_a)
+        .get_code_experiment(&target_a)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Experiment A '{}' not found", id_a))?;
+        .ok_or_else(|| format!("Experiment A '{}' not found", target_a))?;
 
     let exp_b = state
         .db
-        .get_code_experiment(&id_b)
+        .get_code_experiment(&target_b)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Experiment B '{}' not found", id_b))?;
+        .ok_or_else(|| format!("Experiment B '{}' not found", target_b))?;
 
     Ok(ExperimentRunner::compare(&exp_a, &exp_b))
 }
