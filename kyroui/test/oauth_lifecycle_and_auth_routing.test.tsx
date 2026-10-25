@@ -398,4 +398,37 @@ describe("Bug 17: OAuth flow lifecycle is cancellable, non-overlapping and one-s
       expect(mockInvoke).toHaveBeenCalledWith("start_oauth_flow", expect.anything());
     });
   });
+
+  it("aborts polling and cancels session when get_oauth_status fails repeatedly (Bug 17)", async () => {
+    mockInvoke.mockImplementation(async (cmd: string, args: any) => {
+      const base = await okBase(cmd, args);
+      if (cmd === "start_oauth_flow") {
+        return {
+          session_id: "sess_errors",
+          auth_url: "http://127.0.0.1:4567/auth",
+          redirect_uri: "http://127.0.0.1:4567/callback",
+          expires_at: Date.now() + 60000,
+        };
+      }
+      if (cmd === "get_oauth_status") {
+        throw new Error("backend connection dropped");
+      }
+      return base;
+    });
+
+    render(<ConnectionsModal isOpen={true} onClose={vi.fn()} initialTab="discover" />);
+    await waitFor(() => expect(screen.getByText("Gmail")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Gmail"));
+    clickConnectForRow("Gmail");
+    fireEvent.click(screen.getByText(/Launch Gmail Sign-In/i));
+
+    await waitFor(
+      () => {
+        expect(screen.getByText(/OAuth connection error: backend connection dropped/i)).toBeInTheDocument();
+      },
+      { timeout: 12000 }
+    );
+
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_oauth_flow", { sessionId: "sess_errors" });
+  }, 15000);
 });

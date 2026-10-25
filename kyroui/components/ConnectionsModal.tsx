@@ -170,6 +170,24 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
     pollInFlightRef.current = false;
   }, [isOpen]);
 
+  // Unmounting the modal component cancels any live backend session and
+  // clears poll intervals (Bug 17 lifecycle ownership).
+  useEffect(() => {
+    return () => {
+      oauthLifecycleRef.current += 1;
+      clearOauthPollTimer();
+      const session = oauthSessionRef.current;
+      if (session && !completionStartedRef.current) {
+        invoke("cancel_oauth_flow", { sessionId: session.sessionId }).catch((e) =>
+          console.warn("Cancel OAuth error on unmount:", e)
+        );
+      }
+      oauthSessionRef.current = null;
+      completionStartedRef.current = false;
+      pollInFlightRef.current = false;
+    };
+  }, []);
+
   // Manage Account / Policies dialog state
   const [managingAccount, setManagingAccount] = useState<ConnectedAccountSummary | null>(null);
   const [accountPolicies, setAccountPolicies] = useState<ConnectorToolPolicyRecord[]>([]);
@@ -318,6 +336,7 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
 
   const pollOAuthCompletion = (sessionId: string, generation: number) => {
     let attempts = 0;
+    let consecutiveErrors = 0;
     const maxAttempts = 80; // 2 minutes at 1.5s interval
 
     const tick = async () => {
@@ -328,26 +347,6 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
         clearOauthPollTimer();
         return;
       }
-
-      // Overlap guard BEFORE awaiting: a slow status response must never let
-      // the next tick start a second concurrent status request.
-      if (pollInFlightRef.current) return;
-      pollInFlightRef.current = true;
-
-      let statusView: OAuthSessionStatusView;
-      try {
-        statusView = await invoke<OAuthSessionStatusView>("get_oauth_status", {
-          sessionId,
-        });
-      } catch (err: any) {
-        pollInFlightRef.current = false;
-        console.warn("OAuth status poll error:", err);
-        return;
-      }
-      pollInFlightRef.current = false;
-
-      // Ignore late responses that resolved after close/cancel.
-      if (generation !== oauthLifecycleRef.current) return;
 
       attempts++;
       if (attempts > maxAttempts) {
@@ -364,6 +363,41 @@ export const ConnectionsModal: React.FC<ConnectionsModalProps> = ({
         showMessage("OAuth authentication timed out. Please try again.", "error");
         return;
       }
+
+      // Overlap guard BEFORE awaiting: a slow status response must never let
+      // the next tick start a second concurrent status request.
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
+
+      let statusView: OAuthSessionStatusView;
+      try {
+        statusView = await invoke<OAuthSessionStatusView>("get_oauth_status", {
+          sessionId,
+        });
+        consecutiveErrors = 0;
+      } catch (err: any) {
+        pollInFlightRef.current = false;
+        consecutiveErrors++;
+        console.warn(`OAuth status poll error (${consecutiveErrors}/5):`, err);
+        if (consecutiveErrors >= 5) {
+          clearOauthPollTimer();
+          setOauthPolling(false);
+          setIsSubmittingConnect(false);
+          const session = oauthSessionRef.current;
+          if (session) {
+            invoke("cancel_oauth_flow", { sessionId: session.sessionId }).catch(
+              (e) => console.warn("Cancel OAuth error:", e)
+            );
+          }
+          setOauthSessionBoth(null);
+          showMessage(`OAuth connection error: ${err?.message || err}`, "error");
+        }
+        return;
+      }
+      pollInFlightRef.current = false;
+
+      // Ignore late responses that resolved after close/cancel.
+      if (generation !== oauthLifecycleRef.current) return;
 
       if (statusView.status === "completed") {
         // One-shot guard: even if two polls observed completion before the
