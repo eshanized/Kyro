@@ -79,6 +79,12 @@ class MockFileReader {
       if (this.onload) this.onload();
     }, 5);
   }
+  readAsArrayBuffer(file: any) {
+    this.result = new Uint8Array(file._bytes ?? []).buffer;
+    setTimeout(() => {
+      if (this.onload) this.onload();
+    }, 5);
+  }
 }
 
 describe("Intent classification honesty (bug 5)", () => {
@@ -431,5 +437,33 @@ describe("Attachment policy (bug 19)", () => {
       ).toBeInTheDocument()
     );
     expect(screen.queryByText("malware.rs")).not.toBeInTheDocument();
+  });
+
+  it("rejects an invalid UTF-8 byte sequence in text file (Bug 19)", async () => {
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const invalidUtf8 = new File([new Uint8Array([0xff, 0xfe, 0xfd])], "invalid.txt", { type: "text/plain" });
+    (invalidUtf8 as any)._bytes = [0xff, 0xfe, 0xfd];
+    fireEvent.change(fileInput, { target: { files: [invalidUtf8] } });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/not valid UTF-8 text/i)
+      ).toBeInTheDocument()
+    );
+    expect(screen.queryByText("invalid.txt")).not.toBeInTheDocument();
+  });
+
+  it("rejects ELF executable magic bytes even with .txt extension (Bug 19)", async () => {
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const elfFile = new File([new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 1, 1, 1, 0])], "binary.txt", { type: "text/plain" });
+    (elfFile as any)._bytes = [0x7f, 0x45, 0x4c, 0x46, 1, 1, 1, 0];
+    fireEvent.change(fileInput, { target: { files: [elfFile] } });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/contains binary data and cannot be attached as text/i)
+      ).toBeInTheDocument()
+    );
+    expect(screen.queryByText("binary.txt")).not.toBeInTheDocument();
   });
 });

@@ -2329,6 +2329,19 @@ pub async fn extract_attachment_text(
         // extension with non-PDF content fails here instead of being pasted.
         DocumentAssistant::extract_pdf_text(&bytes)?
     } else {
+        // Binary magic byte checks for text/code attachments
+        if bytes.len() >= 4
+            && (&bytes[0..4] == b"\x7fELF"
+                || &bytes[0..2] == b"MZ"
+                || &bytes[0..4] == b"\xfe\xed\xfa\xce"
+                || &bytes[0..4] == b"\xce\xfa\xed\xfe"
+                || &bytes[0..4] == b"\xfe\xed\xfa\xcf"
+                || &bytes[0..4] == b"\xcf\xfa\xed\xfe"
+                || &bytes[0..4] == b"\0asm"
+                || &bytes[0..4] == b"PK\x03\x04")
+        {
+            return Err("Attachment contains binary executable/archive data and cannot be inserted as text".to_string());
+        }
         let decoded = String::from_utf8(bytes).map_err(|_| {
             "Attachment is not valid UTF-8 text; binary content cannot be attached as text"
         })?;

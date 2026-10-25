@@ -124,6 +124,70 @@ export function classifyAttachment(file: FileTypeMeta): AttachmentClassification
   };
 }
 
+/**
+ * Strict UTF-8 verification for file attachments (Bug 19).
+ * Decodes the array buffer with fatal=true so invalid UTF-8 sequences throw
+ * rather than being silently coerced to Unicode replacement characters (U+FFFD).
+ */
+export function validateStrictUtf8(buffer: ArrayBuffer): string {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  return decoder.decode(buffer);
+}
+
+/**
+ * Checks for known binary file signatures / executable magic bytes (Bug 19).
+ * Returns true if the buffer matches ELF, PE/DOS, Mach-O, ZIP/JAR, WebAssembly,
+ * or contains null bytes in the header.
+ */
+export function detectBinaryMagicBytes(buffer: ArrayBuffer): boolean {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 2) return false;
+
+  // ELF executable: \x7fELF
+  if (bytes.length >= 4 && bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46) {
+    return true;
+  }
+
+  // PE / DOS executable: MZ
+  if (bytes[0] === 0x4d && bytes[1] === 0x5a) {
+    return true;
+  }
+
+  // Mach-O binaries: 0xfeedface, 0xfeedfacf, 0xcafebabe, 0xcefaedfe, 0xcffaedfe
+  if (bytes.length >= 4) {
+    const magic = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+    if (
+      magic === 0xfeedface ||
+      magic === 0xfeedfacf ||
+      magic === 0xcefaedfe ||
+      magic === 0xcffaedfe ||
+      magic === 0xcafebabe
+    ) {
+      return true;
+    }
+  }
+
+  // WebAssembly binary: \0asm (0x00, 0x61, 0x73, 0x6d)
+  if (bytes.length >= 4 && bytes[0] === 0x00 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d) {
+    return true;
+  }
+
+  // ZIP / Jar / DOCX / APK: PK\x03\x04
+  if (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04) {
+    return true;
+  }
+
+  // Check for null bytes in initial sample (first 4096 bytes)
+  const sampleLen = Math.min(bytes.length, 4096);
+  for (let i = 0; i < sampleLen; i++) {
+    if (bytes[i] === 0x00) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 /** File-picker `accept` attribute for the allowlisted categories. */
 export const ACCEPTED_ATTACHMENT_TYPES: string = [
   IMAGE_MIME_TYPES.join(","),
