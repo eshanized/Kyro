@@ -271,7 +271,7 @@ impl GitHubAdapter {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("Kyro-Autonomous-Desktop-Agent/0.1.2"),
+            HeaderValue::from_static("Kyro-Autonomous-Desktop-Agent/0.1.3"),
         );
         headers.insert(
             ACCEPT,

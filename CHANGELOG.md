@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.3] - 2026-10-25
+
+### Modern Application Shell, Live Reasoning Streaming, Hardened File Organizer & Multi-Provider Isolation
+
+#### User Interface & Experience Redesign
+- **Application Shell & Sidebar Navigation**: Redesigned modern, high-density desktop shell with intuitive sidebar navigation, conversation switcher, quick action shortcuts, and active model status.
+- **Welcome Home Experience & Prompt Chips**: Added zero-state welcome screen with interactive quick-prompt suggestion chips for instant onboarding across everyday and developer tasks.
+- **Multiline Auto-Expanding Composer**: Built `TaskComposer` with auto-expanding multiline text input, drag-and-drop file/image attachment previews, Enter-to-send (Shift+Enter for newline), and active agent mention routing.
+- **Reusable Component System**: Implemented modular, accessible design system components in `kyroui/components/ui/` (`Button`, `Dialog`, `CodePanel`, `StatusBadge`, `Surface`, `TextField`) with keyboard focus trapping and ARIA compliance.
+- **Per-Conversation State Preservation**: Preserved active task plans and execution state across conversation switches, preventing state leakage and attachment race conditions.
+
+#### Live Model Reasoning & Typography
+- **SSE Reasoning Stream Extraction**: Enhanced `ModelRouter` to extract streaming provider-exposed reasoning tokens (`<think>` blocks and reasoning deltas) in real-time while keeping thinking traces strictly separate from assistant response content and tool call definitions.
+- **Thinking Indicator & Panel**: Implemented `ThinkingIndicator` component featuring dark-theme wave and shimmer animations, smooth auto-scrolling reasoning disclosures, honest waiting fallbacks, and `prefers-reduced-motion` compliance.
+- **12px Fira Code Typography**: Adopted `@fontsource/fira-code` at 12px across code blocks, tool calls (`ToolCallCard`), markdown renders, and terminal output.
+
+#### Safe Reversible File Organizer Hardening
+- **Server-Authoritative Anti-Tampering**: Introduced `SharedFileOrganizer` orchestrator with server-authoritative plan validation backed by SQLite `file_organization_plans` table, guaranteeing that only pre-calculated and validated plans can be executed.
+- **Pre/Post Move SHA-256 Freshness Verification**: Verified SHA-256 hashes immediately before moving files; stale plans or externally modified files are automatically aborted to prevent data loss.
+- **Symlink Exclusion & Conflict Detection**: Detected symlinks during scanning, excluded them from destructive moves to prevent symlink traversal attacks, and surfaced them in preview conflict reports.
+- **Authorized Folder Confinement & Directory Traversal Prevention**: Confined all file scanning and moves strictly within user-authorized directories, resolving `~` home directory paths safely and rejecting unauthorized traversal.
+- **Durable File Transactions & Undo Recovery**: Persisted movements to `file_transactions` table with pre/post hash state, enabling complete, atomic one-click undo recovery (`undo_file_transaction`, `get_file_transaction`).
+- **Human-in-the-Loop Governance**: Required explicit human confirmation for all mutating file reorganization actions regardless of persisted permission level.
+
+#### Model Routing & Provider Architecture
+- **Native Anthropic Messages API**: Implemented native Anthropic Messages API client in `ModelRouter` with system prompt parameter handling, streaming support, and provider error classification.
+- **Child Route Isolation**: Isolated sub-routes and delegated tasks to prevent context pollution between parallel agent workflows.
+- **Model-Specific Parameter Scoping**: Scoped provider-specific arguments (such as `chat_template_kwargs.enable_thinking`) strictly to compatible models (e.g. Nemotron).
+
+#### Governance, Storage & Security Hardening
+- **Storage CAS Status Guards**: Enforced Compare-And-Swap (CAS) guards on agent run status updates in SQLite, making terminal outcomes (`succeeded`, `failed`, `cancelled`, `interrupted`) immutable against late-arriving completion race conditions.
+- **Grant Provenance & Negation Handling**: Enforced task grant provenance, binding grants to their originating task and preventing cross-session privilege escalation. Handled permission negation policies correctly.
+- **Connector Dynamic Policy Hardening**: Prevented external dynamic tools from self-authorizing through naming heuristics alone; required explicit local user policy configuration.
+- **Strict Attachment UTF-8 & Binary Magic Byte Validation**: Validated text attachments for strict UTF-8 compliance and detected binary magic byte signatures (ELF, Mach-O, PE, ZIP, GZIP) to prevent binary smuggling.
+- **Bounded OAuth Polling**: Bounded background OAuth authentication polling attempts with automatic timer cancellation and cleanup on component unmount.
+
+#### Quality Assurance & Verification
+- **Rust Verification Suite**: 317 passing tests across unit, integration, and security suites with 0 warnings (`cargo clippy --all-targets --all-features -- -D warnings`).
+- **Frontend Test Suite**: 318 passing tests across 39 Vitest suites with &ge;95% code coverage.
+
+---
+
 ## [0.1.2] - 2026-10-24
 
 ### Critical Agent Runtime, Security, Worktree Isolation & Registry Remediation

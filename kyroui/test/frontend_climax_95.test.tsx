@@ -119,7 +119,7 @@ describe("Frontend Climax to >= 95% Coverage", () => {
         return {
           status: "healthy",
           components: { db: "ok", vault: "ok" },
-          version: "0.1.2",
+          version: "0.1.3",
         };
       }
       return {};

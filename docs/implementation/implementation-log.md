@@ -308,3 +308,59 @@ This log chronicles the engineering remediation, feature completion, and verific
 
 ### 7. Version Bump to `0.1.2`
 - Bumped `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs to `0.1.2`.
+
+---
+
+## 2026-10-25: Kyro v0.1.3 Release — Modern Shell Redesign, Live Reasoning Streaming, Hardened File Organizer & Multi-Provider Isolation
+
+### 1. Application Shell Redesign & Reusable UI Component System
+- **Modern Desktop Shell (`App.tsx`)**:
+  - Rebuilt workspace shell with high-density sidebar navigation, conversation list, quick action buttons, and active model status.
+  - Added zero-state welcome experience with prompt suggestion chips for rapid workflow initiation.
+  - Implemented `TaskComposer` featuring multiline auto-expanding textarea, drag-and-drop file/image attachment previews, Enter-to-send (Shift+Enter for newline), and `@mention` agent selector.
+  - Built modular UI components in `kyroui/components/ui/`: `Button`, `Dialog`, `CodePanel`, `StatusBadge`, `Surface`, and `TextField` with keyboard focus management and accessible ARIA attributes.
+- **Per-Conversation Isolation**:
+  - Preserved active task plans and execution state scoped by conversation ID, preventing cross-conversation state bleed and attachment race conditions.
+  - Bounded OAuth polling with automatic cleanup on unmount in `ConnectionsModal.tsx`.
+
+### 2. Live Model Reasoning Streaming & Typography
+- **SSE Stream Extraction in `ModelRouter`**:
+  - Enhanced SSE parser to capture real-time reasoning deltas and `<think>` blocks, strictly isolating reasoning tokens from user-facing assistant content and structured tool calls.
+  - Scoped provider-specific parameters like `chat_template_kwargs.enable_thinking` strictly to compatible models (Nemotron).
+  - Emitted `AgentReasoningEvent` with run, conversation, and delegated agent attribution.
+- **Thinking Indicator & Monospace Typography**:
+  - Replaced static indicator with `ThinkingIndicator` component featuring smooth dark-theme animations, auto-scrolling reasoning disclosures, honest waiting fallbacks, and `prefers-reduced-motion` compliance.
+  - Adopted 12px `@fontsource/fira-code` across code panels, `ToolCallCard`, terminal views, and markdown code blocks.
+
+### 3. Hardened Safe Reversible File Organizer
+- **Server-Authoritative Anti-Tampering & Freshness**:
+  - Introduced unified `SharedFileOrganizer` orchestrator backing both UI commands and agent tools.
+  - Persisted candidate plans to `file_organization_plans` table; execution strictly requires an existing, unexecuted plan record.
+  - Performed pre-move SHA-256 freshness verification; stale plans or modified source files trigger immediate abort.
+  - Excluded symlinks during scanning to defend against traversal attacks, reporting symlinks as conflicts.
+  - Enforced authorized folder boundary confinement, resolving `~` paths safely and failing closed on unauthorized paths.
+- **Durable File Transactions & Undo Recovery**:
+  - Journaled multi-file movements into `file_transactions` table with pre/post hash state.
+  - Registered `undo_file_transaction` and `get_file_transaction` Tauri commands, enabling reliable one-click undo recovery.
+  - Enforced human-in-the-loop governance: mutating filesystem operations require explicit user authorization regardless of persisted permission level.
+
+### 4. Native Anthropic Messages API & Router Hardening
+- Implemented native Anthropic Messages API client with system prompt handling, streaming event handling, and provider classification in `ModelRouter`.
+- Isolated sub-routes and child tasks to prevent context pollution between parallel workflows.
+
+### 5. Storage CAS Guards & Governance Provenance
+- Enforced Compare-And-Swap (CAS) guards on agent run status updates in SQLite, making terminal outcomes (`succeeded`, `failed`, `cancelled`, `interrupted`) immutable against late-arriving completion race conditions.
+- Preserved task grant provenance to prevent privilege hijacking; enforced negation handling in governance engine.
+- Hardened dynamic connector policy: prevented dynamic tools from self-authorizing through naming heuristics, requiring explicit local policy configuration.
+- Enforced strict UTF-8 validation and binary magic byte detection (ELF, Mach-O, PE, ZIP, GZIP) on text attachments.
+
+### 6. Test Suite & Verification Results
+- **Automated Tests**:
+  - Added new regression test suites for task-plan truthfulness, attachment policy, run lifecycle ownership, and OAuth polling lifecycle.
+  - **317 backend Rust tests** passed with zero warnings under `cargo clippy --all-targets --all-features -- -D warnings`.
+  - **318 frontend Vitest tests** passed across 39 test files (&ge;95% coverage).
+  - Clean `cargo fmt --manifest-path libkyro/Cargo.toml --all -- --check`.
+  - Clean production frontend build with `npm run build`.
+
+### 7. Version Bump to `0.1.3`
+- Bumped `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs to `0.1.3`.

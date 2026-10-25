@@ -1,6 +1,6 @@
 [package]
 name = "kyro"
-version = "0.1.2"
+version = "0.1.3"
 description = "Kyro - Local-First Autonomous Desktop AI Agent"
 authors = ["Eshan Roy <m.eshanized@gmail.com>", "Kyro Contributors"]
 edition = "2021"

@@ -53,17 +53,20 @@ graph TD
 ## 2. Component Inventory
 
 ### 2.1 Frontend Modules (`kyroui/`)
-- `App.tsx`: Main workspace view displaying dual-mode experiences (Everyday vs Dev), conversation threads, live step timeline, tool execution cards, screen preview, model status, voice dictation, file attachments, and prompt dispatch.
+- `App.tsx`: Modern high-density desktop shell with collapsible sidebar navigation, conversation list, welcome screen with quick-prompt suggestion chips, active model status, and per-conversation execution state preservation.
+- `components/TaskComposer.tsx`: Multi-line auto-expanding composer with drag-and-drop file/image attachment previews, Enter-to-send, and active agent mention routing.
+- `components/ThinkingIndicator.tsx`: Real-time streaming model reasoning panel with smooth wave/shimmer animations, auto-scrolling reasoning disclosures, honest waiting fallbacks, and 12px Fira Code typography.
+- `components/ui/`: Modular, accessible UI component system (`Button`, `Dialog`, `CodePanel`, `StatusBadge`, `Surface`, `TextField`) with keyboard focus trapping and ARIA compliance.
 - `hud/HudPanel.tsx`: Compact floating HUD window (`label: hud`) for autonomous task execution and quick snipping.
 - `hud/Snipper.tsx`: Interactive screenshot region selector for visual grounding.
 - `components/CommandPalette.tsx`: Global instant command palette (`Ctrl+K`) with multi-category universal search across conversations, messages, memories, skills, routines, and artifacts.
-- `components/FileOrganizerModal.tsx`: Safe reversible file organizer UI with extension categorization, SHA-256 duplicate detection, operation plan preview, and one-click rollback.
+- `components/FileOrganizerModal.tsx`: Safe reversible file organizer UI with authorized folder picker, extension categorization, SHA-256 duplicate detection, operation plan preview with auto-invalidation, and one-click rollback.
 - `components/DocumentAssistantModal.tsx`: Local-first document assistant with plain-text and PDF parser, date/action item extraction, side-by-side document diff comparison, and privacy disclosure.
 - `components/ScreenExplainerModal.tsx`: Multimodal visual explainer modal with screenshot capture, structured facts vs inferred causes breakdown, and 1-click grounded action triggering.
 - `components/DevWorkbenchModal.tsx`: Developer Workbench with 5 specialist tabs: Projects & Dev Servers, Code Checkpoints & Diffs, Build Doctor diagnostics, UI Audit & Visual Baselines, and Multi-Agent Workspace with isolated Git worktrees.
 - `components/ArtifactsModal.tsx`: Local artifact registry drawer for previewing code, markdown, logs, json, and exporting generated files.
-- `components/SettingsModal.tsx`: Configuration for NVIDIA API keys, Telegram credentials, governance matrix policy, model selections, extensible template packs, and system diagnostics.
-- `components/ConnectionsModal.tsx`: Connections and app integrations modal: Discover Catalog, Connected Accounts, Custom Local MCP, and per-action governance policy manager.
+- `components/SettingsModal.tsx`: Configuration for NVIDIA/Anthropic API keys, Telegram credentials, governance matrix policy, model selections, extensible template packs, and system diagnostics.
+- `components/ConnectionsModal.tsx`: Connections and app integrations modal: Discover Catalog, Connected Accounts, Custom Local MCP, bounded OAuth polling, and per-action governance policy manager.
 - `components/TeammateRosterModal.tsx`: Agent team inspector (Apex, Forge, Scout) showing roles, capabilities, status, and task assignments.
 - `components/TeachTaskModal.tsx`: Teach-a-Task recorder, skill catalog, and routine scheduler.
 - `components/TimelineDrawer.tsx`: Historical timeline drawer visualizing step actions, coordinates, and pixel differences.
@@ -72,7 +75,7 @@ graph TD
 - `types/agent.ts`: Type definitions for domain entities, IPC payloads, and events.
 
 ### 2.2 Backend Modules (`libkyro/src/`)
-- `main.rs`: Application entry point, config directory resolution, subsystem initialization, and Tauri command registration (69 registered commands).
+- `main.rs`: Application entry point, config directory resolution, subsystem initialization, and Tauri command registration (over 150 registered commands).
 - `commands.rs`: Typed Tauri IPC command handlers covering execution, governance, memory, artifacts, search, diagnostics, file organization, document analysis, vision explanation, code checkpoints, build doctor, visual baselines, and multi-agent workspace.
 - `agent/`:
   - `loop_engine.rs`: Multi-step agent execution loop, tool definitions, tool dispatch, step events, per-run cancellation, artifact generation.

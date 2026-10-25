@@ -103,3 +103,16 @@ This document records the implemented remediation phases that evolved the Kyro d
 - [x] Reconcile frontend teammate roster origin badges ("Built-in", "Override", "Custom"), auto-fallback to Apex on active agent deletion/disablement, and preserve form drafts on validation failure.
 - [x] Expand automated test coverage to 313 Rust tests and 268 Vitest tests across 33 test files with zero compiler or linter warnings (`cargo clippy --all-targets -- -D warnings`).
 - [x] Bump version to `0.1.2` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs.
+
+### Phase 17: v0.1.3 Release — Modern Shell Redesign, Live Reasoning Streaming, Hardened File Organizer & Multi-Provider Isolation
+- [x] Redesign modern desktop application shell (`App.tsx`) with high-density sidebar navigation, welcome experience, quick-prompt suggestion chips, and per-conversation state isolation.
+- [x] Implement multi-line auto-expanding `TaskComposer` with drag-and-drop attachment previews, keyboard shortcuts, and `@mention` agent selector.
+- [x] Build modular accessible UI component system in `kyroui/components/ui/` (`Button`, `Dialog`, `CodePanel`, `StatusBadge`, `Surface`, `TextField`).
+- [x] Implement live model reasoning streaming in `ModelRouter` and build `ThinkingIndicator` component with dark-theme wave/shimmer animations, auto-scrolling reasoning disclosures, and 12px Fira Code typography.
+- [x] Harden safe reversible file organizer with server-authoritative anti-tampering via SQLite `file_organization_plans`, pre-move SHA-256 freshness verification, symlink exclusion, authorized folder confinement, durable transactions, and one-click undo recovery (`undo_file_transaction`).
+- [x] Integrate native Anthropic Messages API support with system prompt handling, streaming event handling, and sub-route isolation.
+- [x] Enforce Compare-And-Swap (CAS) guards on agent run status updates in SQLite, making terminal outcomes immutable.
+- [x] Enforce task grant provenance tracking, negation handling, and local policy enforcement on dynamic external connector tools.
+- [x] Enforce strict UTF-8 validation and binary magic byte detection on text attachments.
+- [x] Expand automated test coverage to 317 Rust tests and 318 Vitest tests across 39 test files with zero compiler or linter warnings (`cargo clippy --all-targets --all-features -- -D warnings`).
+- [x] Bump version to `0.1.3` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs.

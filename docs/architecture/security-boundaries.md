@@ -107,3 +107,28 @@ The policy engine automatically halts automation, records a high-risk approval/t
 - **Single-Flight Refresh Mutex**: Concurrent tool invocations requiring refreshed OAuth tokens share an asynchronous mutex with a 15-second grace re-check, preventing duplicate token refresh requests against upstream providers.
 - **Error Classification**: Distinguishes permanent authentication failures (`invalid_grant`, `invalid_client`, HTTP 4xx -> transitioning account status to `needs_reauth`) from transient network failures (DNS, timeout, HTTP 5xx -> transitioning account status to `error`).
 - **Secret Scrubbing**: Client secrets and refresh tokens are scrubbed from user-facing error messages, application logs, and database records.
+
+---
+
+## 12. File Organization Anti-Tampering & Human Governance
+
+- **Server-Authoritative Anti-Tampering**: Reversible file organization commands require an existing, pre-computed plan record in the SQLite `file_organization_plans` table. Ad-hoc or unsanctioned operations cannot execute.
+- **Pre-Move Freshness & Hash Verification**: Before executing moves, source files undergo immediate SHA-256 hash checks. Any detected external modification or missing file invalidates the plan and halts execution.
+- **Symlink Exclusion**: Symlinks are identified and excluded during scanning to avoid symlink traversal vulnerabilities and are reported as conflicts.
+- **Mandatory Approval**: Mutating file reorganizations require explicit human-in-the-loop confirmation regardless of persisted permission level.
+- **Durable Transactions**: Move operations are logged into `file_transactions` with pre- and post-hash states, enabling atomic one-click rollback (`undo_file_transaction`).
+
+---
+
+## 13. Attachment Policy & Binary Magic Byte Defense
+
+- **Strict UTF-8 Validation**: Text attachments undergo character boundary validation to prevent broken encodings, truncation exploits, and prompt injection smuggling.
+- **Binary Magic Byte Detection**: Attachments are inspected against known binary magic byte signatures (ELF `\x7fELF`, Mach-O, Windows PE `MZ`, ZIP `PK\x03\x04`, GZIP `\x1f\x8b`). Disguised executable files are rejected unconditionally.
+
+---
+
+## 14. Grant Provenance & Storage Lifecycle CAS Guards
+
+- **Task Grant Provenance**: Granted permissions track originating task IDs and cannot be reused across sessions or hijacked by child processes.
+- **Negation Priority**: Deny and negation directives always take priority over affirmative allowances.
+- **Compare-And-Swap (CAS) Status Guards**: Agent run terminal states (`succeeded`, `failed`, `cancelled`, `interrupted`) are immutable and protected against race conditions or late-arriving completion interleave.
