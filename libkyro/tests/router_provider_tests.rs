@@ -1,7 +1,7 @@
 use kyro_lib::agent::cancellation::CancellationToken;
 use kyro_lib::agent::router::{
-    ChatMessage, MessageContent, ModelRouter, ProviderProtocol, ToolCall, ToolDefinition,
-    determine_provider_protocol,
+    determine_provider_protocol, ChatMessage, MessageContent, ModelRouter, ProviderProtocol,
+    ToolCall, ToolDefinition,
 };
 use kyro_lib::storage::ApiKeys;
 use std::collections::VecDeque;
@@ -27,7 +27,9 @@ type MockResponse = (u16, Vec<(&'static str, &'static str)>, String);
 
 impl MockProviderServer {
     async fn start(responses: VecDeque<MockResponse>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind free port");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind free port");
         let local_addr = listener.local_addr().expect("local addr");
         let base_url = format!("http://{}", local_addr);
 
@@ -327,11 +329,7 @@ async fn test_bug_15_anthropic_streaming_sse_with_thinking_and_tools() {
     .concat();
 
     let mut responses = VecDeque::new();
-    responses.push_back((
-        200,
-        vec![("Content-Type", "text/event-stream")],
-        sse_body,
-    ));
+    responses.push_back((200, vec![("Content-Type", "text/event-stream")], sse_body));
 
     let server = MockProviderServer::start(responses).await;
 
@@ -446,7 +444,10 @@ fn test_bug_15_protocol_determination() {
         ProviderProtocol::OpenAiCompatible
     );
     assert_eq!(
-        determine_provider_protocol("https://integrate.api.nvidia.com/v1", "nvidia/nemotron-3-ultra-550b-a55b"),
+        determine_provider_protocol(
+            "https://integrate.api.nvidia.com/v1",
+            "nvidia/nemotron-3-ultra-550b-a55b"
+        ),
         ProviderProtocol::OpenAiCompatible
     );
 }

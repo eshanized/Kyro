@@ -207,7 +207,8 @@ impl TaskAuthorizationGrant {
 
             let is_negated = has_negation_indicator(clause_trimmed);
 
-            let has_verification_terms = contains_standalone_word(clause_trimmed, VERIFICATION_TERMS);
+            let has_verification_terms =
+                contains_standalone_word(clause_trimmed, VERIFICATION_TERMS);
             let has_write_terms = contains_standalone_word(clause_trimmed, WRITE_TERMS);
             let has_organize_terms = contains_standalone_word(clause_trimmed, ORGANIZE_TERMS);
 
@@ -1065,9 +1066,8 @@ impl AuthorizationEngine {
                 )
             })?;
 
-            file.write_all(content).map_err(|e| {
-                format!("Failed to write file '{}': {}", safe_path.display(), e)
-            })?;
+            file.write_all(content)
+                .map_err(|e| format!("Failed to write file '{}': {}", safe_path.display(), e))?;
         }
 
         #[cfg(not(unix))]
@@ -1182,10 +1182,7 @@ impl AuthorizationEngine {
 
     /// Resolves and validates the task-scoped authorization grant, distinguishing
     /// active, expired/revoked, failed validation, and none-issued states (Bug 9).
-    pub fn resolve_task_grant(
-        db: &Database,
-        ctx: &ExecutionContext,
-    ) -> TaskGrantResolution {
+    pub fn resolve_task_grant(db: &Database, ctx: &ExecutionContext) -> TaskGrantResolution {
         let maybe_ctx_grant = ctx.task_grant.clone();
 
         // 1. Read durable run record. If database fails, fail closed!

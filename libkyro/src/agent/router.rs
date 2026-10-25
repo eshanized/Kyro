@@ -1184,16 +1184,18 @@ impl ModelRouter {
                 }
             }
         } else {
-            req.json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request error to Anthropic provider at {}: {}", url, e))?
+            req.json(&payload).send().await.map_err(|e| {
+                format!("HTTP request error to Anthropic provider at {}: {}", url, e)
+            })?
         };
 
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
-            return Err(format!("Anthropic provider API error ({}): {}", status, text));
+            return Err(format!(
+                "Anthropic provider API error ({}): {}",
+                status, text
+            ));
         }
 
         let data: serde_json::Value = res
@@ -1206,15 +1208,29 @@ impl ModelRouter {
 
         if let Some(blocks) = data["content"].as_array() {
             for block in blocks {
-                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                let block_type = block
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
                 if block_type == "text" {
                     if let Some(txt) = block.get("text").and_then(|t| t.as_str()) {
                         content.push_str(txt);
                     }
                 } else if block_type == "tool_use" {
-                    let id = block.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
-                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
-                    let args = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    let id = block
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
                     tool_calls.push(ToolCall {
                         id,
                         name,
@@ -1300,16 +1316,18 @@ impl ModelRouter {
                 }
             }
         } else {
-            req.json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request error to Anthropic provider at {}: {}", url, e))?
+            req.json(&payload).send().await.map_err(|e| {
+                format!("HTTP request error to Anthropic provider at {}: {}", url, e)
+            })?
         };
 
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
-            return Err(format!("Anthropic provider API error ({}): {}", status, text));
+            return Err(format!(
+                "Anthropic provider API error ({}): {}",
+                status, text
+            ));
         }
 
         use futures_util::StreamExt;
@@ -1860,8 +1878,16 @@ impl AnthropicStreamAccumulator {
                 if let Some(cb) = val.get("content_block") {
                     let cb_type = cb.get("type").and_then(|t| t.as_str()).unwrap_or_default();
                     if cb_type == "tool_use" {
-                        let id = cb.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
-                        let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                        let id = cb
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = cb
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or_default()
+                            .to_string();
                         let entry = self.tool_calls.entry(index).or_default();
                         entry.id = id;
                         entry.name = name;
@@ -1871,7 +1897,10 @@ impl AnthropicStreamAccumulator {
             "content_block_delta" => {
                 let index = val.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 if let Some(delta) = val.get("delta") {
-                    let d_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                    let d_type = delta
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
                     match d_type {
                         "text_delta" => {
                             if let Some(txt) = delta.get("text").and_then(|t| t.as_str()) {

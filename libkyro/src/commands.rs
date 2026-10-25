@@ -2340,7 +2340,10 @@ pub async fn extract_attachment_text(
                 || &bytes[0..4] == b"\0asm"
                 || &bytes[0..4] == b"PK\x03\x04")
         {
-            return Err("Attachment contains binary executable/archive data and cannot be inserted as text".to_string());
+            return Err(
+                "Attachment contains binary executable/archive data and cannot be inserted as text"
+                    .to_string(),
+            );
         }
         let decoded = String::from_utf8(bytes).map_err(|_| {
             "Attachment is not valid UTF-8 text; binary content cannot be attached as text"

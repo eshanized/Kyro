@@ -1868,17 +1868,23 @@ fn run_status_transitions_cannot_overwrite_a_terminal_outcome() {
         .unwrap());
 
     // Bug 3: Invalid or misspelled status strings must be strictly rejected
-    assert!(db
-        .update_run_status("run_cas_c", "finished_ok", None, None, None)
-        .is_err(), "misspelled status must be rejected");
-    assert!(db
-        .update_run_status("run_cas_c", "random_string", None, None, None)
-        .is_err(), "unknown status string must be rejected");
+    assert!(
+        db.update_run_status("run_cas_c", "finished_ok", None, None, None)
+            .is_err(),
+        "misspelled status must be rejected"
+    );
+    assert!(
+        db.update_run_status("run_cas_c", "random_string", None, None, None)
+            .is_err(),
+        "unknown status string must be rejected"
+    );
 
     // Bug 3: Missing run ID must return an error rather than 0-row success
-    assert!(db
-        .update_run_status("run_totally_missing", "running", None, None, None)
-        .is_err(), "missing run ID must return an error");
+    assert!(
+        db.update_run_status("run_totally_missing", "running", None, None, None)
+            .is_err(),
+        "missing run ID must return an error"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2033,18 +2039,28 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
         TaskAutonomyMode::Autonomous,
     );
     grant1.scope_operations_to_task("Do not edit anything; inspect the project only.");
-    assert!(grant1.allowed_operations.contains(&RoutineOpClass::FileRead));
-    assert!(grant1.allowed_operations.contains(&RoutineOpClass::SafeCommand));
+    assert!(grant1
+        .allowed_operations
+        .contains(&RoutineOpClass::FileRead));
+    assert!(grant1
+        .allowed_operations
+        .contains(&RoutineOpClass::SafeCommand));
     assert!(
-        !grant1.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        !grant1
+            .allowed_operations
+            .contains(&RoutineOpClass::FileWrite),
         "Explicit prohibition 'do not edit anything' must prevent FileWrite"
     );
     assert!(
-        !grant1.allowed_operations.contains(&RoutineOpClass::FileOrganize),
+        !grant1
+            .allowed_operations
+            .contains(&RoutineOpClass::FileOrganize),
         "Read-only prompt must not grant FileOrganize"
     );
     assert!(
-        !grant1.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        !grant1
+            .allowed_operations
+            .contains(&RoutineOpClass::LocalVerification),
         "Read-only prompt must not grant LocalVerification"
     );
 
@@ -2057,7 +2073,9 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
     );
     grant2.scope_operations_to_task("Do not run tests.");
     assert!(
-        !grant2.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        !grant2
+            .allowed_operations
+            .contains(&RoutineOpClass::LocalVerification),
         "'Do not run tests' must not grant LocalVerification"
     );
 
@@ -2069,9 +2087,13 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
         TaskAutonomyMode::Autonomous,
     );
     grant3.scope_operations_to_task("Read the configuration but do not modify it.");
-    assert!(grant3.allowed_operations.contains(&RoutineOpClass::FileRead));
+    assert!(grant3
+        .allowed_operations
+        .contains(&RoutineOpClass::FileRead));
     assert!(
-        !grant3.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        !grant3
+            .allowed_operations
+            .contains(&RoutineOpClass::FileWrite),
         "'do not modify it' must prohibit FileWrite"
     );
 
@@ -2082,12 +2104,22 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
         Vec::new(),
         TaskAutonomyMode::Autonomous,
     );
-    grant4.scope_operations_to_task("Organize files in Downloads, detect duplicates, and report what changed.");
-    assert!(grant4.allowed_operations.contains(&RoutineOpClass::FileOrganize));
-    assert!(grant4.allowed_operations.contains(&RoutineOpClass::FileWrite));
-    assert!(grant4.allowed_operations.contains(&RoutineOpClass::FileRead));
+    grant4.scope_operations_to_task(
+        "Organize files in Downloads, detect duplicates, and report what changed.",
+    );
+    assert!(grant4
+        .allowed_operations
+        .contains(&RoutineOpClass::FileOrganize));
+    assert!(grant4
+        .allowed_operations
+        .contains(&RoutineOpClass::FileWrite));
+    assert!(grant4
+        .allowed_operations
+        .contains(&RoutineOpClass::FileRead));
     assert!(
-        !grant4.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        !grant4
+            .allowed_operations
+            .contains(&RoutineOpClass::LocalVerification),
         "Organization task does not need LocalVerification"
     );
 
@@ -2098,10 +2130,18 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
         Vec::new(),
         TaskAutonomyMode::Autonomous,
     );
-    grant5.scope_operations_to_task("Implement the fix, run the relevant tests, and summarize the outcome.");
-    assert!(grant5.allowed_operations.contains(&RoutineOpClass::FileWrite));
-    assert!(grant5.allowed_operations.contains(&RoutineOpClass::LocalVerification));
-    assert!(grant5.allowed_operations.contains(&RoutineOpClass::FileRead));
+    grant5.scope_operations_to_task(
+        "Implement the fix, run the relevant tests, and summarize the outcome.",
+    );
+    assert!(grant5
+        .allowed_operations
+        .contains(&RoutineOpClass::FileWrite));
+    assert!(grant5
+        .allowed_operations
+        .contains(&RoutineOpClass::LocalVerification));
+    assert!(grant5
+        .allowed_operations
+        .contains(&RoutineOpClass::FileRead));
 
     // 6. Quoted verbs must never expand scope
     let mut grant6 = TaskAuthorizationGrant::new(
@@ -2110,13 +2150,19 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
         Vec::new(),
         TaskAutonomyMode::Autonomous,
     );
-    grant6.scope_operations_to_task("Search the codebase for occurrences of \"write_file\" and 'cargo test'");
+    grant6.scope_operations_to_task(
+        "Search the codebase for occurrences of \"write_file\" and 'cargo test'",
+    );
     assert!(
-        !grant6.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        !grant6
+            .allowed_operations
+            .contains(&RoutineOpClass::FileWrite),
         "Quoted 'write_file' must not grant write authority"
     );
     assert!(
-        !grant6.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        !grant6
+            .allowed_operations
+            .contains(&RoutineOpClass::LocalVerification),
         "Quoted 'cargo test' must not grant verification authority"
     );
 
@@ -2127,9 +2173,13 @@ fn bug_7_task_scope_negation_and_bounded_authority() {
         Vec::new(),
         TaskAutonomyMode::Autonomous,
     );
-    grant7.scope_operations_to_task("Update the README file but do not write or modify any files on disk");
+    grant7.scope_operations_to_task(
+        "Update the README file but do not write or modify any files on disk",
+    );
     assert!(
-        !grant7.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        !grant7
+            .allowed_operations
+            .contains(&RoutineOpClass::FileWrite),
         "Prohibition trumps contradictory permission"
     );
 }
@@ -3114,7 +3164,10 @@ fn test_bug_14_symlink_substitution_and_race_safety() {
         &valid_write.to_string_lossy(),
         b"valid data",
     );
-    assert!(sec_write_res.is_ok(), "Writing inside secondary root must succeed");
+    assert!(
+        sec_write_res.is_ok(),
+        "Writing inside secondary root must succeed"
+    );
     assert_eq!(std::fs::read_to_string(&valid_write).unwrap(), "valid data");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -3159,7 +3212,10 @@ fn test_bug_10_browser_locators_and_takeover_rules() {
                 reason
             );
         }
-        other => panic!("Expected RequireApproval with Destructive risk, got {:?}", other),
+        other => panic!(
+            "Expected RequireApproval with Destructive risk, got {:?}",
+            other
+        ),
     }
 
     // 3. Credential field terms in browser_fill -> RequireTakeover
@@ -3170,11 +3226,7 @@ fn test_bug_10_browser_locators_and_takeover_rules() {
     let dec = AuthorizationEngine::evaluate_browser_fill(&policy, &credential_fill);
     match dec {
         AuthDecision::RequireTakeover { reason } => {
-            assert!(
-                reason.contains("credential"),
-                "Reason: {}",
-                reason
-            );
+            assert!(reason.contains("credential"), "Reason: {}", reason);
         }
         other => panic!("Expected RequireTakeover, got {:?}", other),
     }

@@ -2791,32 +2791,41 @@ The program is started as an explicit executable plus argument vector; free-form
                     .unwrap_or_default();
 
                 // Resolve the child's own model route, credentials, and endpoint (Bug 15)
-                let child_route = match crate::agent::router::ModelRouter::resolve_model_route(&child_model) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return (
-                            format!("Delegation failed: unsupported child model '{}': {}", child_model, e),
-                            true,
-                            None,
-                        );
-                    }
-                };
+                let child_route =
+                    match crate::agent::router::ModelRouter::resolve_model_route(&child_model) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return (
+                                format!(
+                                    "Delegation failed: unsupported child model '{}': {}",
+                                    child_model, e
+                                ),
+                                true,
+                                None,
+                            );
+                        }
+                    };
 
-                let child_api_key = match crate::agent::router::ModelRouter::select_api_key_for_route(&child_route, &keys) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        return (
+                let child_api_key =
+                    match crate::agent::router::ModelRouter::select_api_key_for_route(
+                        &child_route,
+                        &keys,
+                    ) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            return (
                             format!("Delegation failed: missing credential for child agent model '{}': {}", child_model, e),
                             true,
                             None,
                         );
-                    }
-                };
+                        }
+                    };
 
                 // Explicit test mock endpoints are preserved across delegated children;
                 // otherwise the child model resolves to its own provider route endpoint (Bug 15)
                 let child_base_url = if let Some(parent_ep) = base_url {
-                    let parent_is_test_mock = parent_ep.contains("127.0.0.1") || parent_ep.contains("localhost");
+                    let parent_is_test_mock =
+                        parent_ep.contains("127.0.0.1") || parent_ep.contains("localhost");
                     if parent_is_test_mock || parent_ep == child_route.base_url {
                         Some(parent_ep.to_string())
                     } else {
