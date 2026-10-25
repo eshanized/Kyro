@@ -42,6 +42,8 @@ import { InlineNotice } from "./components/InlineNotice";
 import { classifyTaskIntent, suggestedResourcesForIntent } from "./lib/taskIntent";
 import {
   classifyAttachment,
+  validateStrictUtf8,
+  detectBinaryMagicBytes,
   ACCEPTED_ATTACHMENT_TYPES,
 } from "./lib/attachments";
 import { KyroLogo } from "./components/Logo";
@@ -135,6 +137,10 @@ export const App: React.FC = () => {
   /** Synchronously readable mirror of activePlan for outcome wording. */
   const activePlanRef = useRef<TaskPlan | null>(null);
   activePlanRef.current = activePlan;
+  /** Persisted plans per conversation so conversation switches do not discard live plan state (Bugs 2 & 6). */
+  const plansByConvRef = useRef<Map<string, TaskPlan>>(new Map());
+  /** Monotonic selection generation token preventing out-of-order attachment races (Bug 19). */
+  const attachmentSelectionGenRef = useRef<number>(0);
 
   const handleSelectModel = async (model: string) => {
     setSelectedModel(model);
@@ -546,9 +552,9 @@ export const App: React.FC = () => {
           setActiveRunId(payload.run_id);
         }
       }
-      // Clear transient reasoning when step executes tools or completes
+      // Clear transient reasoning when step executes tools or completes (only for the owning run, Bug 2)
       if ((payload.tool_calls && payload.tool_calls.length > 0) || payload.is_finished) {
-        setActiveReasoning(null);
+        setActiveReasoning((prev) => (prev && prev.runId === payload.run_id ? null : prev));
       }
     });
 
@@ -631,7 +637,7 @@ export const App: React.FC = () => {
     // unresolved run, or nothing when it has none.
     setActiveReasoning(null);
     syncAgentBusy();
-    setActivePlan((prev) => (prev && prev.conversationId === activeConvId ? prev : null));
+    setActivePlan((prev) => (prev && prev.conversationId === activeConvId ? prev : (activeConvId ? plansByConvRef.current.get(activeConvId) || null : null)));
   }, [activeConvId]);
 
   useEffect(() => {
@@ -836,6 +842,7 @@ export const App: React.FC = () => {
         if (activePlan && activePlan.conversationId === targetId) {
           setActivePlan(null);
         }
+        plansByConvRef.current.delete(targetId);
         if (!updatedList.some((c) => c.id === activeConvIdRef.current)) {
           if (updatedList.length > 0) {
             const nextId = updatedList[0].id;
@@ -979,6 +986,8 @@ export const App: React.FC = () => {
   const handleFileSelect = async (file: File) => {
     if (!file) return;
 
+    const selectionGen = ++attachmentSelectionGenRef.current;
+
     const classification = classifyAttachment(file);
     if (classification.error || !classification.kind) {
       setNotice({ tone: "error", message: classification.error || "Unsupported attachment." });
@@ -992,17 +1001,22 @@ export const App: React.FC = () => {
         reader.onerror = () => reject(reader.error || new Error("File read failed"));
         reader.readAsDataURL(file);
       });
-    const readAsText = () =>
-      new Promise<string>((resolve, reject) => {
+    const readAsArrayBuffer = () =>
+      new Promise<ArrayBuffer>((resolve, reject) => {
+        if (typeof file.arrayBuffer === "function") {
+          file.arrayBuffer().then(resolve, reject);
+          return;
+        }
         const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
         reader.onerror = () => reject(reader.error || new Error("File read failed"));
-        reader.readAsText(file);
+        (reader as any).readAsArrayBuffer(file);
       });
 
     try {
       if (classification.kind === "image") {
         const dataUrl = await readAsDataURL();
+        if (attachmentSelectionGenRef.current !== selectionGen) return;
         setAttachedFile({
           name: file.name,
           content: `[Attached image file: ${file.name}]`,
@@ -1026,6 +1040,7 @@ export const App: React.FC = () => {
           character_count: number;
           truncated: boolean;
         }>("extract_attachment_text", { fileName: file.name, base64Bytes: base64 });
+        if (attachmentSelectionGenRef.current !== selectionGen) return;
         const pageNote = extracted.page_count ? ` (extracted from ${extracted.page_count} PDF pages)` : "";
         setAttachedFile({
           name: file.name,
@@ -1035,9 +1050,27 @@ export const App: React.FC = () => {
         return;
       }
 
-      // Text/code: read as text, then verify it is actually text before it
-      // can enter the prompt.
-      const text = await readAsText();
+      // Text/code: read as ArrayBuffer, verify binary magic bytes and strict UTF-8
+      const buffer = await readAsArrayBuffer();
+      if (detectBinaryMagicBytes(buffer)) {
+        setNotice({
+          tone: "error",
+          message: `"${file.name}" contains binary data and cannot be attached as text.`,
+        });
+        return;
+      }
+
+      let text: string;
+      try {
+        text = validateStrictUtf8(buffer);
+      } catch (decodeErr: any) {
+        setNotice({
+          tone: "error",
+          message: `"${file.name}" is not valid UTF-8 text and cannot be attached: ${decodeErr?.message || decodeErr}`,
+        });
+        return;
+      }
+
       if (text.includes("\0")) {
         setNotice({
           tone: "error",
@@ -1045,12 +1078,15 @@ export const App: React.FC = () => {
         });
         return;
       }
+
+      if (attachmentSelectionGenRef.current !== selectionGen) return;
       setAttachedFile({
         name: file.name,
         content: text,
         mimeType: file.type || "text/plain",
       });
     } catch (err: any) {
+      if (attachmentSelectionGenRef.current !== selectionGen) return;
       const message = typeof err === "string" ? err : (err?.message ?? "Attachment could not be processed");
       setNotice({ tone: "error", message: `Attachment rejected: ${message}` });
     }
