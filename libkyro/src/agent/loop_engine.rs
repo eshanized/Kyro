@@ -2813,11 +2813,18 @@ The program is started as an explicit executable plus argument vector; free-form
                     ) {
                         Ok(k) => k,
                         Err(e) => {
-                            return (
-                            format!("Delegation failed: missing credential for child agent model '{}': {}", child_model, e),
-                            true,
-                            None,
-                        );
+                            if !api_key.trim().is_empty() {
+                                api_key.to_string()
+                            } else {
+                                return (
+                                    format!(
+                                        "Delegation failed: missing credential for child agent model '{}': {}",
+                                        child_model, e
+                                    ),
+                                    true,
+                                    None,
+                                );
+                            }
                         }
                     };
 
