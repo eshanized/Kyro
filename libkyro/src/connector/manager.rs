@@ -202,13 +202,13 @@ pub fn classify_external_tool(
         .unwrap_or(false);
 
     if is_read_only_name {
-        // Trusted name heuristics say read-only: report Safe + read-only.
-        // Auto-approval remains off — a malicious schema and a malicious
-        // description travel together, so heuristics are only a hint.
+        // Trusted name heuristics say read-only and no suspicious schema properties:
+        // report Safe + read-only. However, external dynamic tools cannot auto-approve
+        // based on naming heuristics alone (Bug 11); an explicit local policy decision is required.
         (RiskLevel::Safe, true, false)
     } else if annotation_read_only {
-        // Annotation without a read-only name: keep it behind approval and
-        // only record the metadata hint.
+        // Untrusted annotation without a trusted read-only name:
+        // metadata hint only, not eligible for auto-approval (Bug 11)
         (RiskLevel::Moderate, true, false)
     } else {
         // Unknown/unclassified external tool: fail closed!
@@ -1687,19 +1687,20 @@ impl ConnectorManager {
                         });
                     }
                     "allow" => {
-                        // Cannot auto-approve if can_auto_approve is false or destructive!
-                        if !entry.can_auto_approve || entry.risk_level == RiskLevel::Destructive {
+                        // Stored local policy explicitly configured as "allow" by user:
+                        // Destructive operations still require approval, but modifying operations configured as allow are permitted.
+                        if entry.risk_level == RiskLevel::Destructive {
                             return Some(AuthDecision::RequireApproval {
-                            reason: format!(
-                                "Action '{}' cannot be auto-approved and requires explicit user authorization",
-                                entry.original_tool_name
-                            ),
-                            risk: entry.risk_level,
-                            summary: format!(
-                                "Execute [{}] action '{}' with args: {}",
-                                entry.connector_id, entry.original_tool_name, args
-                            ),
-                        });
+                                reason: format!(
+                                    "Action '{}' is destructive; security policy requires explicit user authorization regardless of 'allow' setting",
+                                    entry.original_tool_name
+                                ),
+                                risk: entry.risk_level,
+                                summary: format!(
+                                    "Execute [{}] action '{}' with args: {}",
+                                    entry.connector_id, entry.original_tool_name, args
+                                ),
+                            });
                         }
                         return Some(AuthDecision::Allow);
                     }
