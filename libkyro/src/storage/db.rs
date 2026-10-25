@@ -1316,6 +1316,25 @@ impl Database {
         completed_at: Option<i64>,
         error: Option<&str>,
     ) -> Result<()> {
+        const VALID_RUN_STATUSES: &[&str] = &[
+            "queued",
+            "running",
+            "waiting_approval",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "completed",
+        ];
+        if !VALID_RUN_STATUSES.contains(&status) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(format!(
+                    "Invalid run status '{}': not a recognized run lifecycle status",
+                    status
+                )),
+            )));
+        }
+
         let conn = self.conn.lock().unwrap();
 
         // Lifecycle guard: reject transitioning to active state if parent conversation was deleted
@@ -1339,7 +1358,15 @@ impl Database {
         }
 
         // Compare-and-set guards
-        let current = Self::run_status_for_update(&conn, id)?.unwrap_or_default();
+        let current_opt = Self::run_status_for_update(&conn, id)?;
+        let current = match current_opt {
+            Some(s) => s,
+            None => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(format!("Run '{}' not found in database", id)),
+                )));
+            }
+        };
 
         let allowed_from: &[&str] = match status {
             // Long-running states can only be entered from active/queued states.
@@ -1347,11 +1374,11 @@ impl Database {
             "waiting_approval" => &["running", "queued"],
             // Finalization is only legal from an active state; it can never
             // overwrite another terminal outcome.
-            "succeeded" => &["queued", "running"],
+            "succeeded" | "completed" => &["queued", "running"],
             "failed" => &["queued", "running", "waiting_approval"],
             "cancelled" => &["queued", "running", "waiting_approval"],
             "interrupted" => &["queued", "running", "waiting_approval"],
-            _ => &["queued", "running", ("waiting_approval")],
+            _ => &[],
         };
         if !allowed_from.contains(&current.as_str()) {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -1363,7 +1390,7 @@ impl Database {
             )));
         }
 
-        conn.execute(
+        let rows = conn.execute(
             "UPDATE agent_runs
              SET status = ?1,
                  started_at = COALESCE(?2, started_at),
@@ -1372,6 +1399,23 @@ impl Database {
              WHERE id = ?5 AND status = ?6",
             params![status, started_at, completed_at, error, id, current],
         )?;
+        if rows == 0 {
+            let fresh = Self::run_status_for_update(&conn, id)?;
+            return match fresh {
+                Some(fresh_status) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(format!(
+                        "Compare-and-set lost race updating run '{}' from '{}' to '{}': actual current status is '{}'",
+                        id, current, status, fresh_status
+                    )),
+                ))),
+                None => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(format!(
+                        "Compare-and-set update failed: run '{}' was deleted concurrently",
+                        id
+                    )),
+                ))),
+            };
+        }
         Ok(())
     }
 
