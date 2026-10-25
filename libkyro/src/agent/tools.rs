@@ -308,12 +308,12 @@ Use the element references and names to drive the other browser tools.".to_strin
         },
         ToolDefinition {
             name: "organize_files_preview".to_string(),
-            description: "Inspect a target directory, analyze file types and content-hash duplicates, and generate a safe, reviewable reorganization plan before executing any moves.".to_string(),
+            description: "Inspect a target directory, analyze file types and content-hash duplicates, and generate a safe, reviewable reorganization plan before executing any moves. Always use this dedicated organizer tool rather than manually opening and reading every file to determine its category. Recursive scanning defaults to false (organizing only files directly in the selected folder); only enable recursive scanning when the user explicitly requests organizing subdirectories or the task clearly requires it. Even in recursive mode, excluded dependency, generated, cache, virtual-environment, and build directories (such as node_modules, target, dist, build, out, .venv, .git, Pods, vendor, etc.) are never descended into, inspected, or hashed.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "directory": { "type": "string", "description": "Absolute directory to scan and organize" },
-                    "recursive": { "type": "boolean", "description": "Whether to scan subdirectories recursively" }
+                    "recursive": { "type": "boolean", "description": "Whether to scan subdirectories recursively. Defaults to false. Only set to true when the user explicitly asks to organize subdirectories. Excluded dependency, generated, cache, virtual-environment, and build directories are always excluded regardless of this flag." }
                 },
                 "required": ["directory"]
             }),

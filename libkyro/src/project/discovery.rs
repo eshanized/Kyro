@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Directories that are never descended into during discovery.
+/// Directories that are never descended into during discovery and recursive file organization.
 pub const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -28,6 +28,7 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     ".parcel-cache",
     ".yarn",
     ".pnpm-store",
+    "bower_components",
     ".venv",
     "venv",
     "env",
@@ -45,6 +46,20 @@ pub const EXCLUDED_DIRS: &[&str] = &[
     "DerivedData",
     ".terraform",
 ];
+
+/// Returns whether a directory name matches canonical exclusion rules
+/// (dependency directories, build artifacts, virtual environments, cache, and VCS metadata).
+/// Matching is ASCII case-insensitive and robust to platform path separators.
+pub fn is_excluded_directory(dir_name: &str) -> bool {
+    let trimmed = dir_name.trim_matches(|c| c == '/' || c == '\\');
+    let name = match Path::new(trimmed).file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => trimmed,
+    };
+    EXCLUDED_DIRS
+        .iter()
+        .any(|excluded| excluded.eq_ignore_ascii_case(name))
+}
 
 /// Files that identify a directory as a project root.
 pub const PROJECT_MARKER_FILES: &[&str] = &[
@@ -291,7 +306,7 @@ pub fn discover_projects(
             if !meta.is_dir() {
                 continue;
             }
-            if EXCLUDED_DIRS.contains(&file_name.as_str()) {
+            if is_excluded_directory(&file_name) {
                 continue;
             }
             if file_name.starts_with('.') && file_name != ".github" {

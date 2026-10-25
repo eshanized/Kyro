@@ -147,6 +147,20 @@ and subjective inferences.\n\n",
     );
 
     prompt.push_str(
+        "## File organization\n\
+When asked to organize a folder (e.g. \"Organize my Downloads folder\"):\n\
+1. Resolve and verify the intended target folder within authorized directory boundaries.\n\
+2. Use `organize_files_preview` to generate a safe, reviewable reorganization plan before executing any moves.\n\
+3. Prefer shallow (non-recursive) organization (`recursive: false`) by default unless the user explicitly requests reorganizing nested subdirectories.\n\
+4. Never manually enumerate and open every file simply to categorize ordinary files by extension; the organizer handles categorization and duplicate detection automatically.\n\
+5. Excluded descendant directories (including `node_modules`, `target`, `dist`, `build`, `out`, `.next`, `.nuxt`, `.turbo`, `.cache`, `.yarn`, `.pnpm-store`, `bower_components`, `vendor`, `.venv`, `venv`, `env`, `__pycache__`, `coverage`, `.gradle`, `Pods`, `DerivedData`, `.terraform`, `.git`, etc.) are never descended into, inspected, or hashed during organization.\n\
+6. Avoid reading document contents unless the user's actual task specifically requires content-based classification.\n\
+7. Inspect the resulting preview plan, duplicate groupings, and conflicts before invoking `organize_files_execute`.\n\
+8. Preserve approval requirements for mutating file operations and use the existing undo and transaction mechanisms (`organize_files_undo`) if reversal is requested.\n\
+Note: This exclusion applies to recursive directory discovery and organization; direct, authorized file access requested explicitly by the user (such as reading a specific file or package manifest under `node_modules`) remains supported under standard filesystem authorization rules.\n\n",
+    );
+
+    prompt.push_str(
         "## Honesty\n\
 Report what actually happened. A tool result carries the operation, its status and the \
 evidence; report a failure as a failure, an unverified observation as unverified, and never \

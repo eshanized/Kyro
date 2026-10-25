@@ -1,6 +1,7 @@
 //! Safe file organization subsystem with preview, content-hash duplicate detection,
 //! transaction manifests, path containment, and reversible undo.
 
+use crate::project::discovery::{is_excluded_directory, EXCLUDED_DIRS};
 use crate::storage::db::{check_path_authorized_in_folders, Database};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,6 +55,8 @@ pub struct OrganizationPlan {
     #[serde(default)]
     pub eligible_files: usize,
     #[serde(default)]
+    pub skipped_directories: usize,
+    #[serde(default)]
     pub unmodified_count: usize,
     #[serde(default)]
     pub planned_count: usize,
@@ -71,6 +74,7 @@ impl Default for OrganizationPlan {
             target_directory: PathBuf::new(),
             total_scanned: 0,
             eligible_files: 0,
+            skipped_directories: 0,
             unmodified_count: 0,
             planned_count: 0,
             duplicates_count: 0,
@@ -105,6 +109,8 @@ pub struct OrganizationTransaction {
 pub struct FileOrganizer;
 
 impl FileOrganizer {
+    /// Canonical list of directories that are never descended into during recursive file organization.
+    pub const EXCLUDED_DIRS: &[&str] = EXCLUDED_DIRS;
     /// Categorizes a filename extension into standard user-facing categories.
     pub fn categorize_extension(ext: &str, custom: &HashMap<String, String>) -> String {
         let ext_lower = ext.to_lowercase();
@@ -171,11 +177,31 @@ impl FileOrganizer {
         }
     }
 
+    /// Checks whether a directory name matches canonical exclusion rules
+    /// (e.g. node_modules, target, dist, build, out, .venv, .git, Pods, vendor, etc.).
+    pub fn is_excluded_directory(dir_name: &str) -> bool {
+        is_excluded_directory(dir_name)
+    }
+
     /// Generates an inspection plan previewing all proposed moves and identifying conflicts.
     pub fn preview(
         root_dir: &Path,
         rule_opt: Option<OrganizationRule>,
     ) -> Result<OrganizationPlan, String> {
+        Self::preview_with_hasher(root_dir, rule_opt, Self::compute_sha256)
+    }
+
+    /// Generates an inspection plan previewing all proposed moves using an injectable file hasher.
+    /// Excluded directories (such as node_modules, target, dist, .venv, etc.) are filtered during
+    /// file collection before any file is read or hashed.
+    pub fn preview_with_hasher<F>(
+        root_dir: &Path,
+        rule_opt: Option<OrganizationRule>,
+        hasher: F,
+    ) -> Result<OrganizationPlan, String>
+    where
+        F: Fn(&Path) -> Result<String, String>,
+    {
         if !root_dir.exists() {
             return Err(format!(
                 "Target directory '{}' does not exist.",
@@ -197,6 +223,7 @@ impl FileOrganizer {
         let mut symlinks = Vec::new();
         let mut scan_warnings = Vec::new();
         let mut total_scanned = 0;
+        let mut skipped_directories = 0;
 
         Self::collect_files(
             &canonical_root,
@@ -205,6 +232,7 @@ impl FileOrganizer {
             &mut symlinks,
             &mut scan_warnings,
             &mut total_scanned,
+            &mut skipped_directories,
         )?;
 
         eligible_files.sort();
@@ -261,7 +289,7 @@ impl FileOrganizer {
             };
 
             let file_size = metadata.len();
-            let file_hash = match Self::compute_sha256(source_path) {
+            let file_hash = match hasher(source_path) {
                 Ok(h) => Some(h),
                 Err(e) => {
                     conflicts_count += 1;
@@ -359,6 +387,7 @@ impl FileOrganizer {
             target_directory: canonical_root,
             total_scanned,
             eligible_files: eligible_files.len(),
+            skipped_directories,
             unmodified_count,
             planned_count,
             duplicates_count,
@@ -369,6 +398,15 @@ impl FileOrganizer {
     }
 
     /// Helper to recursively or flatly collect eligible regular files and symlinks with error capture.
+    ///
+    /// Excluded child directories (e.g. node_modules, target, dist, build, out, .venv, .git, etc.)
+    /// and hidden directories (starting with '.') are evaluated on the actual child directory name
+    /// and skipped before any recursive descent. When a directory is excluded, its subtree is neither
+    /// descended into nor enumerated, and its contents are never hashed or planned for organization.
+    ///
+    /// Note: The root directory explicitly selected by the user is not rejected simply because its
+    /// own name happens to match an excluded name (e.g., if the user explicitly asks to organize
+    /// a folder named 'build' or 'target'). Exclusions are applied to child entries encountered during traversal.
     fn collect_files(
         dir: &Path,
         rule: &OrganizationRule,
@@ -376,6 +414,7 @@ impl FileOrganizer {
         symlinks: &mut Vec<PathBuf>,
         warnings: &mut Vec<String>,
         total_scanned: &mut usize,
+        skipped_directories: &mut usize,
     ) -> Result<(), String> {
         let read_dir = match fs::read_dir(dir) {
             Ok(d) => d,
@@ -416,16 +455,30 @@ impl FileOrganizer {
                 }
             };
 
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+
             if metadata.file_type().is_symlink() {
-                // Symlink: exclude from organization, do not recurse or follow
-                symlinks.push(path);
-            } else if metadata.is_dir() {
-                // Skip hidden dirs (e.g. .git, .kyro)
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with('.') {
-                        continue;
-                    }
+                if Self::is_excluded_directory(&name_str) {
+                    *skipped_directories += 1;
+                    warnings.push(format!(
+                        "Skipped excluded directory symlink: '{}'",
+                        path.display()
+                    ));
+                } else {
+                    // Symlink: exclude from organization, do not recurse or follow
+                    symlinks.push(path);
                 }
+            } else if metadata.is_dir() {
+                let is_excluded = Self::is_excluded_directory(&name_str);
+                let is_hidden = name_str.starts_with('.');
+
+                if is_excluded || is_hidden {
+                    *skipped_directories += 1;
+                    warnings.push(format!("Skipped excluded directory: '{}'", path.display()));
+                    continue;
+                }
+
                 if rule.recursive {
                     let _ = Self::collect_files(
                         &path,
@@ -434,14 +487,11 @@ impl FileOrganizer {
                         symlinks,
                         warnings,
                         total_scanned,
+                        skipped_directories,
                     );
                 }
-            } else if metadata.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !name.starts_with('.') {
-                        eligible_files.push(path);
-                    }
-                }
+            } else if metadata.is_file() && !name_str.starts_with('.') {
+                eligible_files.push(path);
             }
         }
         Ok(())
@@ -1350,5 +1400,427 @@ mod tests {
         assert_eq!(op_record.status, "copied_source_remains");
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recursive_preview_excludes_node_modules() {
+        let temp = create_test_dir("nm_rule_check");
+        let downloads = temp.join("Downloads");
+        fs::create_dir_all(
+            downloads
+                .join("project")
+                .join("node_modules")
+                .join("pkg")
+                .join("nested"),
+        )
+        .unwrap();
+
+        let report = downloads.join("report.pdf");
+        let photo = downloads.join("photo.jpg");
+        let pkg_json = downloads.join("project").join("package.json");
+        let nm_index = downloads
+            .join("project")
+            .join("node_modules")
+            .join("pkg")
+            .join("index.js");
+        let nm_deep = downloads
+            .join("project")
+            .join("node_modules")
+            .join("pkg")
+            .join("nested")
+            .join("deep.js");
+
+        fs::write(&report, b"PDF report content").unwrap();
+        fs::write(&photo, b"JPEG photo data").unwrap();
+        fs::write(&pkg_json, b"{\"name\": \"my-project\"}").unwrap();
+        fs::write(&nm_index, b"console.log('in node_modules');").unwrap();
+        fs::write(&nm_deep, b"console.log('deep node_modules');").unwrap();
+
+        let rule = OrganizationRule {
+            recursive: true,
+            ..Default::default()
+        };
+
+        let plan = FileOrganizer::preview(&downloads, Some(rule)).expect("Preview should succeed");
+
+        // Assert files under node_modules NEVER appear in eligible_files or operations
+        for op in &plan.operations {
+            assert!(
+                !op.source_path
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules"),
+                "Operations must not contain node_modules source path: {:?}",
+                op.source_path
+            );
+            assert!(
+                !op.destination_path
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules"),
+                "Proposed destination must not contain node_modules: {:?}",
+                op.destination_path
+            );
+        }
+
+        // Assert eligible files count matches only normal files
+        assert_eq!(
+            plan.eligible_files, 3,
+            "Only normal eligible files should be eligible"
+        );
+        assert_eq!(plan.planned_count, 3);
+        assert!(plan.operations.iter().any(|o| o.source_path == report));
+        assert!(plan.operations.iter().any(|o| o.source_path == photo));
+        assert!(plan.operations.iter().any(|o| o.source_path == pkg_json));
+
+        // Verify skipped directory count and diagnostics
+        assert!(plan.skipped_directories >= 1);
+        assert!(plan
+            .scan_warnings
+            .iter()
+            .any(|w| w.contains("node_modules")));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_exclusion_applies_at_every_nesting_level() {
+        let temp = create_test_dir("deep_exclusion");
+        let deep_nm = temp
+            .join("level1")
+            .join("level2")
+            .join("level3")
+            .join("node_modules")
+            .join("deep_pkg");
+        let deep_target = temp
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d")
+            .join("target")
+            .join("debug");
+        fs::create_dir_all(&deep_nm).unwrap();
+        fs::create_dir_all(&deep_target).unwrap();
+
+        let valid_nested = temp
+            .join("level1")
+            .join("level2")
+            .join("level3")
+            .join("valid.txt");
+        let deep_nm_file = deep_nm.join("module.js");
+        let deep_target_file = deep_target.join("artifact.bin");
+
+        fs::write(&valid_nested, b"valid nested content").unwrap();
+        fs::write(&deep_nm_file, b"module content").unwrap();
+        fs::write(&deep_target_file, b"target artifact").unwrap();
+
+        let rule = OrganizationRule {
+            recursive: true,
+            ..Default::default()
+        };
+        let plan = FileOrganizer::preview(&temp, Some(rule)).expect("Preview should succeed");
+
+        assert_eq!(plan.eligible_files, 1);
+        assert_eq!(plan.operations.len(), 1);
+        assert_eq!(plan.operations[0].source_path, valid_nested);
+        assert!(plan.skipped_directories >= 2);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_all_canonical_dependency_and_generated_directories_excluded() {
+        let temp = create_test_dir("all_exclusions");
+
+        let test_dirs = [
+            "node_modules",
+            ".git",
+            ".hg",
+            ".svn",
+            "target",
+            "dist",
+            "build",
+            "out",
+            ".next",
+            ".nuxt",
+            ".svelte-kit",
+            ".turbo",
+            ".cache",
+            ".parcel-cache",
+            ".yarn",
+            ".pnpm-store",
+            "bower_components",
+            "vendor",
+            ".venv",
+            "venv",
+            "env",
+            "__pycache__",
+            "coverage",
+            ".gradle",
+            "Pods",
+            "DerivedData",
+            ".terraform",
+        ];
+
+        for dir_name in &test_dirs {
+            let dir_path = temp.join("subfolder").join(dir_name);
+            fs::create_dir_all(&dir_path).unwrap();
+            fs::write(dir_path.join("file_inside.txt"), b"do not scan me").unwrap();
+        }
+
+        let regular_file = temp.join("subfolder").join("legitimate.txt");
+        fs::write(&regular_file, b"keep this file").unwrap();
+
+        let rule = OrganizationRule {
+            recursive: true,
+            ..Default::default()
+        };
+        let plan = FileOrganizer::preview(&temp, Some(rule)).expect("Preview should succeed");
+
+        assert_eq!(
+            plan.eligible_files, 1,
+            "Only legitimate.txt should be eligible"
+        );
+        assert_eq!(plan.operations[0].source_path, regular_file);
+        assert_eq!(plan.skipped_directories, test_dirs.len());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_non_recursive_behavior_is_preserved() {
+        let temp = create_test_dir("non_recursive");
+        let nested_dir = temp.join("nested_folder");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let root_doc = temp.join("root_doc.pdf");
+        let root_img = temp.join("root_img.png");
+        let nested_doc = nested_dir.join("nested_doc.pdf");
+
+        fs::write(&root_doc, b"root pdf").unwrap();
+        fs::write(&root_img, b"root img").unwrap();
+        fs::write(&nested_doc, b"nested pdf").unwrap();
+
+        let rule = OrganizationRule {
+            recursive: false,
+            ..Default::default()
+        };
+        let plan = FileOrganizer::preview(&temp, Some(rule)).expect("Preview should succeed");
+
+        assert_eq!(plan.eligible_files, 2);
+        assert_eq!(plan.operations.len(), 2);
+        assert!(plan.operations.iter().any(|o| o.source_path == root_doc));
+        assert!(plan.operations.iter().any(|o| o.source_path == root_img));
+        assert!(!plan.operations.iter().any(|o| o.source_path == nested_doc));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_recursive_mode_still_scans_ordinary_subdirectories() {
+        let temp = create_test_dir("recursive_ordinary");
+        let work_docs = temp.join("work").join("documents");
+        let vacation_photos = temp.join("photos").join("vacation");
+        fs::create_dir_all(&work_docs).unwrap();
+        fs::create_dir_all(&vacation_photos).unwrap();
+
+        let root_file = temp.join("summary.txt");
+        let invoice = work_docs.join("invoice.pdf");
+        let photo = vacation_photos.join("sunset.png");
+
+        fs::write(&root_file, b"summary text").unwrap();
+        fs::write(&invoice, b"invoice pdf").unwrap();
+        fs::write(&photo, b"sunset png").unwrap();
+
+        let rule = OrganizationRule {
+            recursive: true,
+            ..Default::default()
+        };
+        let plan = FileOrganizer::preview(&temp, Some(rule)).expect("Preview should succeed");
+
+        assert_eq!(plan.eligible_files, 3);
+        assert_eq!(plan.planned_count, 3);
+        assert!(plan.operations.iter().any(|o| o.source_path == root_file));
+        assert!(plan.operations.iter().any(|o| o.source_path == invoice));
+        assert!(plan.operations.iter().any(|o| o.source_path == photo));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_excluded_files_are_never_hashed_or_read() {
+        let temp = create_test_dir("hasher_seam");
+        let nm_dir = temp.join("project").join("node_modules").join("pkg");
+        let target_dir = temp.join("project").join("target").join("debug");
+        fs::create_dir_all(&nm_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let regular_file = temp.join("project").join("notes.txt");
+        let nm_file = nm_dir.join("library.js");
+        let target_file = target_dir.join("build.log");
+
+        fs::write(&regular_file, b"notes to hash").unwrap();
+        fs::write(&nm_file, b"in node_modules").unwrap();
+        fs::write(&target_file, b"in target").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = nm_dir.join("unreadable.js");
+            fs::write(&unreadable, b"forbidden bytes").unwrap();
+            let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(&unreadable, perms).unwrap();
+        }
+
+        let hashed_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hashed_paths_clone = hashed_paths.clone();
+
+        let rule = OrganizationRule {
+            recursive: true,
+            ..Default::default()
+        };
+
+        let plan = FileOrganizer::preview_with_hasher(&temp, Some(rule), move |path| {
+            hashed_paths_clone.lock().unwrap().push(path.to_path_buf());
+            FileOrganizer::compute_sha256(path)
+        })
+        .expect("Preview should succeed without reading unreadable excluded files");
+
+        let paths = hashed_paths.lock().unwrap().clone();
+        assert_eq!(paths.len(), 1, "Only regular_file should be hashed");
+        assert_eq!(paths[0], regular_file);
+
+        for p in &paths {
+            assert!(
+                !p.components().any(|c| c.as_os_str() == "node_modules"),
+                "node_modules file was hashed: {:?}",
+                p
+            );
+            assert!(
+                !p.components().any(|c| c.as_os_str() == "target"),
+                "target file was hashed: {:?}",
+                p
+            );
+        }
+
+        assert_eq!(plan.eligible_files, 1);
+        assert_eq!(
+            plan.conflicts_count, 0,
+            "No permission errors on unreadable excluded files"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = nm_dir.join("unreadable.js");
+            if unreadable.exists() {
+                let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+                perms.set_mode(0o644);
+                let _ = fs::set_permissions(&unreadable, perms);
+            }
+        }
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_exclusion_enforced_regardless_of_caller() {
+        let temp = create_test_dir("caller_enforcement");
+        let target_dir = temp.join("organize_target");
+        let nm_dir = target_dir.join("project").join("node_modules").join("dep");
+        fs::create_dir_all(&nm_dir).unwrap();
+
+        let normal_file = target_dir.join("normal.md");
+        let nm_file = nm_dir.join("index.js");
+
+        fs::write(&normal_file, b"# Normal Markdown").unwrap();
+        fs::write(&nm_file, b"console.log(1);").unwrap();
+
+        let db_dir = create_test_dir("caller_db");
+        let db = Database::init(db_dir.clone()).unwrap();
+        db.add_authorized_folder(&crate::storage::AuthorizedFolderRecord {
+            id: "auth_test".to_string(),
+            path: target_dir.to_string_lossy().to_string(),
+            display_name: "Test Auth".to_string(),
+            added_at: 1000,
+        })
+        .unwrap();
+
+        // Even when caller/model explicitly sets recursive: true via preview_authorized
+        let rule = OrganizationRule {
+            recursive: true,
+            ..Default::default()
+        };
+        let plan =
+            FileOrganizer::preview_authorized(&db, &target_dir.to_string_lossy(), Some(rule))
+                .expect("Authorized preview must succeed");
+
+        assert_eq!(plan.eligible_files, 1);
+        assert_eq!(plan.operations[0].source_path, normal_file);
+        assert!(!plan.operations.iter().any(|o| o.source_path == nm_file));
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    #[test]
+    fn test_explicit_file_access_under_excluded_directory_remains_possible() {
+        let temp = create_test_dir("explicit_access");
+        let nm_pkg = temp.join("my_project").join("node_modules").join("express");
+        fs::create_dir_all(&nm_pkg).unwrap();
+
+        let pkg_json = nm_pkg.join("package.json");
+        fs::write(
+            &pkg_json,
+            b"{\"name\": \"express\", \"version\": \"4.18.2\"}",
+        )
+        .unwrap();
+
+        // 1. Direct filesystem access works
+        let content = fs::read_to_string(&pkg_json).expect("Direct read should succeed");
+        assert!(content.contains("\"express\""));
+
+        // 2. Direct read through AuthorizationEngine secure_read_contained_roots works
+        let roots = vec![temp.clone()];
+        let auth_read_result =
+            crate::governance::auth::AuthorizationEngine::secure_read_contained_roots(
+                &roots,
+                &pkg_json.to_string_lossy(),
+            );
+        assert!(
+            auth_read_result.is_ok(),
+            "Explicit authorized read under node_modules must succeed: {:?}",
+            auth_read_result.err()
+        );
+        assert!(auth_read_result.unwrap().contains("\"express\""));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_excluded_directory_case_insensitivity() {
+        assert!(FileOrganizer::is_excluded_directory("node_modules"));
+        assert!(FileOrganizer::is_excluded_directory("NODE_MODULES"));
+        assert!(FileOrganizer::is_excluded_directory("Node_Modules"));
+        assert!(FileOrganizer::is_excluded_directory("target"));
+        assert!(FileOrganizer::is_excluded_directory("TARGET"));
+        assert!(FileOrganizer::is_excluded_directory("Target"));
+        assert!(FileOrganizer::is_excluded_directory("Pods"));
+        assert!(FileOrganizer::is_excluded_directory("pods"));
+        assert!(FileOrganizer::is_excluded_directory("DerivedData"));
+        assert!(FileOrganizer::is_excluded_directory("deriveddata"));
+        assert!(FileOrganizer::is_excluded_directory("dist"));
+        assert!(FileOrganizer::is_excluded_directory("DIST"));
+        assert!(FileOrganizer::is_excluded_directory("build"));
+        assert!(FileOrganizer::is_excluded_directory("BUILD"));
+        assert!(FileOrganizer::is_excluded_directory(".venv"));
+        assert!(FileOrganizer::is_excluded_directory(".VENV"));
+        assert!(FileOrganizer::is_excluded_directory(".git"));
+        assert!(FileOrganizer::is_excluded_directory("bower_components"));
+        assert!(FileOrganizer::is_excluded_directory("BOWER_COMPONENTS"));
+
+        assert!(!FileOrganizer::is_excluded_directory("Downloads"));
+        assert!(!FileOrganizer::is_excluded_directory("Documents"));
+        assert!(!FileOrganizer::is_excluded_directory("my_project"));
+        assert!(!FileOrganizer::is_excluded_directory("node_modules_backup"));
     }
 }

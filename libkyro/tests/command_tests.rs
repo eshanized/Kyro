@@ -77,6 +77,8 @@ async fn test_system_prompt_builder() {
     assert!(prompt.contains("Kyro"));
     assert!(prompt.contains("UI audit"));
     assert!(prompt.contains("Web Research"));
+    assert!(prompt.contains("File organization"));
+    assert!(prompt.contains("organize_files_preview"));
 }
 
 #[tokio::test]
@@ -1751,7 +1753,7 @@ async fn test_workspace_list_and_cancel_commands() {
     )
     .await
     .unwrap();
-    assert_eq!(ws.tasks.len(), 4);
+    assert_eq!(ws.tasks.len(), 5);
 
     let listed = list_multi_agent_workspaces(state.clone()).await.unwrap();
     assert!(listed.iter().any(|w| w.workspace_id == ws.workspace_id));
