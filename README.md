@@ -10,7 +10,13 @@
 </p>
 
 <p align="center">
+</p>
+
+<p align="center">
   <a href="https://launchbuff.com/products/kyro-npnc71" target="_blank" rel="noopener noreferrer" title="Featured on LaunchBuff"><img src="https://launchbuff.com/badge-featured-dark.svg" alt="Featured on LaunchBuff" width="256" height="80" /></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/eshanized/Kyro/actions/workflows/ci.yml"><img src="https://github.com/eshanized/Kyro/actions/workflows/ci.yml/badge.svg" alt="Continuous Integration" /></a>
   <a href="https://github.com/eshanized/Kyro/discussions"><img src="https://img.shields.io/badge/Discussions-Join-purple?logo=github&logoColor=white" alt="GitHub Discussions" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
