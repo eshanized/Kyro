@@ -856,6 +856,7 @@ fn organize_files_governance_requires_human_approval_regardless_of_persisted_per
 
     // 4. An in-scope organizer execution IS allowed autonomously when the active run has a valid bounded authorization
     let run_id = "run_autonomous_1";
+    lifecycle_run(&db, run_id, "running");
     let grant = TaskAuthorizationGrant::new(
         run_id.to_string(),
         Some(canonical_target.clone()),
@@ -1138,6 +1139,7 @@ fn task_grant_path_confinement_and_scope_limits() {
     db.add_authorized_folder(&folder_rec).unwrap();
 
     let run_id = "run_confined_task";
+    lifecycle_run(&db, run_id, "running");
     let grant = TaskAuthorizationGrant::new(
         run_id.to_string(),
         Some(canonical_workspace.clone()),
@@ -1242,6 +1244,7 @@ fn organize_files_tampered_and_stale_plans_rejected_under_task_grant() {
 
     // Even with an autonomous task grant, FileOrganizer security boundary is inviolate
     let run_id = "run_integrity_check";
+    lifecycle_run(&db, run_id, "running");
     let grant = TaskAuthorizationGrant::new(
         run_id.to_string(),
         Some(canonical_target.clone()),
@@ -1466,6 +1469,7 @@ fn task_grant_multi_step_autonomous_operations() {
     db.add_authorized_folder(&folder_rec).unwrap();
 
     let run_id = "run_multistep_1";
+    lifecycle_run(&db, run_id, "running");
     let grant = TaskAuthorizationGrant::new(
         run_id.to_string(),
         Some(canonical_workspace.clone()),
@@ -1863,6 +1867,19 @@ fn run_status_transitions_cannot_overwrite_a_terminal_outcome() {
         .cancel_run_if_active("run_cas_missing", "no run")
         .unwrap());
 
+    // Bug 3: Invalid or misspelled status strings must be strictly rejected
+    assert!(db
+        .update_run_status("run_cas_c", "finished_ok", None, None, None)
+        .is_err(), "misspelled status must be rejected");
+    assert!(db
+        .update_run_status("run_cas_c", "random_string", None, None, None)
+        .is_err(), "unknown status string must be rejected");
+
+    // Bug 3: Missing run ID must return an error rather than 0-row success
+    assert!(db
+        .update_run_status("run_totally_missing", "running", None, None, None)
+        .is_err(), "missing run ID must return an error");
+
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2004,6 +2021,119 @@ fn task_scope_narrows_grant_capabilities_to_what_the_prompt_needs() {
         .contains(&RoutineOpClass::LocalVerification));
 }
 
+#[test]
+fn bug_7_task_scope_negation_and_bounded_authority() {
+    use kyro_lib::governance::RoutineOpClass;
+
+    // 1. "Do not edit anything; inspect the project only."
+    let mut grant1 = TaskAuthorizationGrant::new(
+        "run_b7_1".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant1.scope_operations_to_task("Do not edit anything; inspect the project only.");
+    assert!(grant1.allowed_operations.contains(&RoutineOpClass::FileRead));
+    assert!(grant1.allowed_operations.contains(&RoutineOpClass::SafeCommand));
+    assert!(
+        !grant1.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        "Explicit prohibition 'do not edit anything' must prevent FileWrite"
+    );
+    assert!(
+        !grant1.allowed_operations.contains(&RoutineOpClass::FileOrganize),
+        "Read-only prompt must not grant FileOrganize"
+    );
+    assert!(
+        !grant1.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        "Read-only prompt must not grant LocalVerification"
+    );
+
+    // 2. "Do not run tests."
+    let mut grant2 = TaskAuthorizationGrant::new(
+        "run_b7_2".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant2.scope_operations_to_task("Do not run tests.");
+    assert!(
+        !grant2.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        "'Do not run tests' must not grant LocalVerification"
+    );
+
+    // 3. "Read the configuration but do not modify it."
+    let mut grant3 = TaskAuthorizationGrant::new(
+        "run_b7_3".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant3.scope_operations_to_task("Read the configuration but do not modify it.");
+    assert!(grant3.allowed_operations.contains(&RoutineOpClass::FileRead));
+    assert!(
+        !grant3.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        "'do not modify it' must prohibit FileWrite"
+    );
+
+    // 4. "Organize files in Downloads, detect duplicates, and report what changed."
+    let mut grant4 = TaskAuthorizationGrant::new(
+        "run_b7_4".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant4.scope_operations_to_task("Organize files in Downloads, detect duplicates, and report what changed.");
+    assert!(grant4.allowed_operations.contains(&RoutineOpClass::FileOrganize));
+    assert!(grant4.allowed_operations.contains(&RoutineOpClass::FileWrite));
+    assert!(grant4.allowed_operations.contains(&RoutineOpClass::FileRead));
+    assert!(
+        !grant4.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        "Organization task does not need LocalVerification"
+    );
+
+    // 5. "Implement the fix, run the relevant tests, and summarize the outcome."
+    let mut grant5 = TaskAuthorizationGrant::new(
+        "run_b7_5".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant5.scope_operations_to_task("Implement the fix, run the relevant tests, and summarize the outcome.");
+    assert!(grant5.allowed_operations.contains(&RoutineOpClass::FileWrite));
+    assert!(grant5.allowed_operations.contains(&RoutineOpClass::LocalVerification));
+    assert!(grant5.allowed_operations.contains(&RoutineOpClass::FileRead));
+
+    // 6. Quoted verbs must never expand scope
+    let mut grant6 = TaskAuthorizationGrant::new(
+        "run_b7_6".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant6.scope_operations_to_task("Search the codebase for occurrences of \"write_file\" and 'cargo test'");
+    assert!(
+        !grant6.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        "Quoted 'write_file' must not grant write authority"
+    );
+    assert!(
+        !grant6.allowed_operations.contains(&RoutineOpClass::LocalVerification),
+        "Quoted 'cargo test' must not grant verification authority"
+    );
+
+    // 7. Contradictory instruction: prohibition trumps permission
+    let mut grant7 = TaskAuthorizationGrant::new(
+        "run_b7_7".to_string(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+    grant7.scope_operations_to_task("Update the README file but do not write or modify any files on disk");
+    assert!(
+        !grant7.allowed_operations.contains(&RoutineOpClass::FileWrite),
+        "Prohibition trumps contradictory permission"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Bugs 8 & 9: repository-controlled verification is sandboxed or fails
 // closed, and only a lifecycle-valid grant can enter that branch.
@@ -2020,6 +2150,7 @@ fn repo_controlled_verification_requires_sandbox_or_checkpoint() {
     let canonical_workspace = workspace.canonicalize().unwrap();
 
     let run_id = "run_verify_1";
+    lifecycle_run(&db, run_id, "running");
     let grant = TaskAuthorizationGrant::new(
         run_id.to_string(),
         Some(canonical_workspace.clone()),
@@ -2617,6 +2748,7 @@ fn secure_file_operations_confine_to_every_authorized_root() {
     .unwrap();
 
     let run_id = "run_multi_root";
+    lifecycle_run(&db, run_id, "running");
     let grant = TaskAuthorizationGrant::new(
         run_id.to_string(),
         Some(canonical_workspace.clone()),
@@ -2757,4 +2889,305 @@ fn secure_file_operations_confine_to_every_authorized_root() {
     let _ = symlink_result;
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Bug 9: Authorization grant provenance and fail closed
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_bug_9_grant_provenance_and_fail_closed_lifecycle() {
+    use kyro_lib::governance::TaskGrantResolution;
+
+    let (dir, db) = temp_db("bug_9_provenance");
+
+    // 1. No grant issued -> NoneIssued
+    let ctx_no_grant = ExecutionContext {
+        run_id: "run_9_no_grant".to_string(),
+        agent_id: "apex".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: None,
+        task_grant: None,
+    };
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_no_grant);
+    assert!(matches!(res, TaskGrantResolution::NoneIssued));
+
+    // 2. Active grant with active run in DB -> Active(grant)
+    let run_id = "run_9_active".to_string();
+    lifecycle_run(&db, &run_id, "running");
+
+    let grant = TaskAuthorizationGrant::new(
+        run_id.clone(),
+        None,
+        Vec::new(),
+        TaskAutonomyMode::Autonomous,
+    );
+
+    let ctx_active = ExecutionContext {
+        run_id: run_id.clone(),
+        agent_id: "apex".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: None,
+        task_grant: Some(grant.clone()),
+    };
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_active);
+    assert!(matches!(res, TaskGrantResolution::Active(_)));
+
+    // 3. Grant has expired -> InvalidOrExpired
+    let mut expired_grant = grant.clone();
+    expired_grant.expires_at = chrono::Utc::now().timestamp_millis() - 10_000;
+    let ctx_expired = ExecutionContext {
+        run_id: run_id.clone(),
+        agent_id: "apex".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: None,
+        task_grant: Some(expired_grant.clone()),
+    };
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_expired);
+    match res {
+        TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+            assert!(reason.contains("expired"));
+        }
+        other => panic!("Expected InvalidOrExpired, got {:?}", other),
+    }
+
+    // 4. Mismatched run ID (e.g. child run borrowing parent's grant) -> InvalidOrExpired
+    lifecycle_run(&db, "child_run_9", "running");
+    let ctx_mismatched = ExecutionContext {
+        run_id: "child_run_9".to_string(),
+        agent_id: "coder".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: None,
+        task_grant: Some(grant.clone()),
+    };
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_mismatched);
+    match res {
+        TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+            assert!(reason.contains("mismatch"));
+        }
+        other => panic!("Expected InvalidOrExpired, got {:?}", other),
+    }
+
+    // 5. Run is terminal in DB ("completed") -> InvalidOrExpired
+    db.update_run_status(&run_id, "completed", None, None, None)
+        .expect("update status");
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_active);
+    match res {
+        TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+            assert!(reason.contains("terminal status 'completed'"));
+        }
+        other => panic!("Expected InvalidOrExpired, got {:?}", other),
+    }
+
+    // 6. Run is interrupted ("interrupted") -> InvalidOrExpired
+    let run_interrupted = "run_9_interrupted".to_string();
+    lifecycle_run(&db, &run_interrupted, "running");
+    db.update_run_status(&run_interrupted, "interrupted", None, None, None)
+        .expect("update status");
+    let mut grant_interrupted = grant.clone();
+    grant_interrupted.run_id = run_interrupted.clone();
+    let ctx_interrupted = ExecutionContext {
+        run_id: run_interrupted,
+        agent_id: "apex".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: None,
+        task_grant: Some(grant_interrupted),
+    };
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_interrupted);
+    match res {
+        TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+            assert!(reason.contains("interrupted"));
+        }
+        other => panic!("Expected InvalidOrExpired, got {:?}", other),
+    }
+
+    // 7. Run record missing from DB entirely -> InvalidOrExpired
+    let run_missing = "run_9_missing".to_string();
+    let mut grant_missing = grant.clone();
+    grant_missing.run_id = run_missing.clone();
+    let ctx_missing = ExecutionContext {
+        run_id: run_missing.clone(),
+        agent_id: "apex".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: None,
+        task_grant: Some(grant_missing),
+    };
+    let res = AuthorizationEngine::resolve_task_grant(&db, &ctx_missing);
+    match res {
+        TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+            assert!(reason.contains("does not exist in database"));
+        }
+        other => panic!("Expected InvalidOrExpired, got {:?}", other),
+    }
+
+    // 8. Evaluation with InvalidOrExpired grant MUST NOT fall back to broader workspace roots!
+    let ws_dir = dir.join("workspace");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    let target_file = ws_dir.join("test.txt");
+    std::fs::write(&target_file, "hello").unwrap();
+
+    let ctx_ws_expired = ExecutionContext {
+        run_id: run_missing,
+        agent_id: "apex".to_string(),
+        conversation_id: Some("conv_9".to_string()),
+        workspace_root: Some(ws_dir),
+        task_grant: Some(expired_grant),
+    };
+    let decision = AuthorizationEngine::evaluate(
+        &db,
+        &ctx_ws_expired,
+        "write_file",
+        &serde_json::json!({ "path": target_file.to_string_lossy(), "content": "world" }),
+    );
+    assert!(
+        is_approval(&decision),
+        "Expired grant must require explicit user approval and NOT silently fall back to workspace root: {:?}",
+        decision
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Bug 14: Filesystem symlink substitution and race safety
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_bug_14_symlink_substitution_and_race_safety() {
+    let dir = std::env::temp_dir().join(format!("kyro_bug14_{}", uuid::Uuid::new_v4()));
+    let root = dir.join("root");
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let outside_victim = outside.join("secret.txt");
+    std::fs::write(&outside_victim, "super secret content").unwrap();
+
+    let roots = vec![root.clone()];
+
+    // 1. Writing directly through an existing symlink pointing outside MUST fail and not modify outside file
+    let symlink_dest = root.join("link_outside.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_victim, &symlink_dest).unwrap();
+    #[cfg(not(unix))]
+    std::fs::write(&symlink_dest, "mock").unwrap();
+
+    let write_res = AuthorizationEngine::secure_write_contained_roots(
+        &roots,
+        &symlink_dest.to_string_lossy(),
+        b"attacker payload",
+    );
+
+    #[cfg(unix)]
+    {
+        assert!(
+            write_res.is_err(),
+            "Writing to an existing symlink must be strictly rejected"
+        );
+        // Verify outside victim was NOT overwritten
+        let outside_content = std::fs::read_to_string(&outside_victim).unwrap();
+        assert_eq!(
+            outside_content, "super secret content",
+            "Outside file must not be modified!"
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = write_res;
+
+    // 2. Traversal path escaping root
+    let traversal_dest = root.join("../outside/escaped.txt");
+    let trav_res = AuthorizationEngine::secure_write_contained_roots(
+        &roots,
+        &traversal_dest.to_string_lossy(),
+        b"payload",
+    );
+    assert!(trav_res.is_err(), "Traversal escape must be rejected");
+
+    // 3. Multi-root containment
+    let secondary = dir.join("secondary");
+    std::fs::create_dir_all(&secondary).unwrap();
+    let multi_roots = vec![root.clone(), secondary.clone()];
+
+    let valid_write = secondary.join("file.txt");
+    let sec_write_res = AuthorizationEngine::secure_write_contained_roots(
+        &multi_roots,
+        &valid_write.to_string_lossy(),
+        b"valid data",
+    );
+    assert!(sec_write_res.is_ok(), "Writing inside secondary root must succeed");
+    assert_eq!(std::fs::read_to_string(&valid_write).unwrap(), "valid data");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// Bug 10: Browser locator authorization and credential field protection
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_bug_10_browser_locators_and_takeover_rules() {
+    use kyro_lib::governance::RiskLevel;
+
+    let mut policy = GovernancePolicy {
+        computer_use_mode: "AskAlways".to_string(),
+        ..Default::default()
+    };
+
+    // 1. Computer use mode AskAlways forces RequireApproval for all clicks/fills
+    let dec = AuthorizationEngine::evaluate_browser_click(
+        &policy,
+        &serde_json::json!({ "selector": "#btn" }),
+    );
+    assert!(is_approval(&dec), "AskAlways mode must require approval");
+
+    // Restore to normal mode
+    policy.computer_use_mode = "Balanced".to_string();
+
+    // 2. Benign label + destructive selector: e.g. text "Next Step", but selector is "#delete-account-btn"
+    let deceptive_click = serde_json::json!({
+        "text": "View Information",
+        "css": "button#delete-account-button",
+    });
+    let dec = AuthorizationEngine::evaluate_browser_click(&policy, &deceptive_click);
+    match dec {
+        AuthDecision::RequireApproval { risk, reason, .. } => {
+            assert_eq!(risk, RiskLevel::Destructive);
+            assert!(
+                reason.contains("Deceptive or conflicting locator")
+                    || reason.contains("potentially consequential target"),
+                "Reason: {}",
+                reason
+            );
+        }
+        other => panic!("Expected RequireApproval with Destructive risk, got {:?}", other),
+    }
+
+    // 3. Credential field terms in browser_fill -> RequireTakeover
+    let credential_fill = serde_json::json!({
+        "name": "user_password",
+        "value": "secretpass123"
+    });
+    let dec = AuthorizationEngine::evaluate_browser_fill(&policy, &credential_fill);
+    match dec {
+        AuthDecision::RequireTakeover { reason } => {
+            assert!(
+                reason.contains("credential"),
+                "Reason: {}",
+                reason
+            );
+        }
+        other => panic!("Expected RequireTakeover, got {:?}", other),
+    }
+
+    // Credential terms in css selector -> RequireTakeover
+    let cred_css_fill = serde_json::json!({
+        "css": "input[name='api_key']",
+        "value": "sk-123456"
+    });
+    let dec = AuthorizationEngine::evaluate_browser_fill(&policy, &cred_css_fill);
+    assert!(
+        matches!(dec, AuthDecision::RequireTakeover { .. }),
+        "Credential selector must require takeover: {:?}",
+        dec
+    );
 }

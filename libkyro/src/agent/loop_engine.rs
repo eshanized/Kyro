@@ -1274,16 +1274,8 @@ The program is started as an explicit executable plus argument vector; free-form
             task_grant: persisted_task_grant,
         };
 
-        // Bug 9: every authorization branch must see one validated grant.
-        // Resolve the active grant through the single resolver (run binding,
-        // expiry, terminal-state revocation) immediately before any tool
-        // analysis or authorization, and evaluate with exactly that grant.
-        let active_grant =
-            crate::governance::AuthorizationEngine::resolve_active_task_grant(db, &ctx);
-        let ctx = ExecutionContext {
-            task_grant: active_grant.clone(),
-            ..ctx
-        };
+        // Bug 9: preserve original grant provenance on context so AuthorizationEngine
+        // can distinguish between none issued, active, invalid/expired, and failed validation.
 
         // The shell analysis is computed once, before authorisation, so that the
         // exact argument vector that was inspected is also the argument vector
@@ -1572,6 +1564,49 @@ The program is started as an explicit executable plus argument vector; free-form
         let file_operation_roots: Vec<PathBuf> = authorized_roots
             .or_else(|| workspace_root.map(|ws| vec![ws.to_path_buf()]))
             .unwrap_or_default();
+
+        // Bug 9: Revalidate task grant immediately prior to executing privileged operations
+        if matches!(
+            tc.name.as_str(),
+            "execute_shell"
+                | "bash"
+                | "terminal"
+                | "read_file"
+                | "write_file"
+                | "organize_files_execute"
+        ) && auth_proof.is_none()
+        {
+            let check_ctx = ExecutionContext {
+                run_id: run_id.to_string(),
+                agent_id: profile.id.clone(),
+                conversation_id: None,
+                workspace_root: workspace_root.map(|p| p.to_path_buf()),
+                task_grant: None,
+            };
+            match AuthorizationEngine::resolve_task_grant(db, &check_ctx) {
+                crate::governance::TaskGrantResolution::ValidationFailed { reason, .. } => {
+                    return (
+                        format!(
+                            "Privileged operation denied: task grant validation failed: {}",
+                            reason
+                        ),
+                        true,
+                        None,
+                    );
+                }
+                crate::governance::TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+                    return (
+                        format!(
+                            "Privileged operation denied: task grant expired or revoked immediately prior to execution: {}",
+                            reason
+                        ),
+                        true,
+                        None,
+                    );
+                }
+                _ => {}
+            }
+        }
         match tc.name.as_str() {
             "execute_shell" => {
                 let cmd = tc.arguments["command"].as_str().unwrap_or_default();

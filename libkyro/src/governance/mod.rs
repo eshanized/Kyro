@@ -6,7 +6,7 @@ pub mod takeover;
 
 pub use auth::{
     is_consequential_control_text, AuthDecision, AuthorizationEngine, ExecutionContext, FileOp,
-    RoutineOpClass, TaskAuthorizationGrant, TaskAutonomyMode,
+    RiskLevel, RoutineOpClass, TaskAuthorizationGrant, TaskAutonomyMode, TaskGrantResolution,
 };
 pub use policy::{GovernancePolicy, PolicyEngine};
 pub use shell_lexer::{lex, LexedCommand, ShellConstruct};

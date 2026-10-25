@@ -1,4 +1,4 @@
-use crate::execution::permissions::RiskLevel;
+pub use crate::execution::permissions::RiskLevel;
 use crate::governance::policy::{GovernancePolicy, PolicyEngine};
 use crate::governance::shell_lexer::lex;
 use crate::governance::shell_policy::{is_protected_path, policy_for, PathArgPolicy};
@@ -156,17 +156,114 @@ impl TaskAuthorizationGrant {
             "move",
         ];
 
-        let lower = task_prompt.to_lowercase();
+        // 1. Strip quoted text so string literals in search/grep prompts do not grant capabilities (Bug 7)
+        let unquoted = strip_quoted_text(task_prompt);
+        let lower = unquoted.to_lowercase();
+
+        // 2. Intent classification with negation & exclusion tracking
+        let mut allow_verification = false;
+        let mut allow_write = false;
+        let mut allow_organize = false;
+
+        let mut prohibit_verification = false;
+        let mut prohibit_write = false;
+        let mut prohibit_organize = false;
+
+        // Check global read-only / inspect-only phrases that prohibit modifications
+        let read_only_markers = [
+            "read only",
+            "read-only",
+            "inspect only",
+            "inspect-only",
+            "view only",
+            "view-only",
+            "only inspect",
+            "just inspect",
+            "only read",
+            "just read",
+            "no changes",
+            "don't change anything",
+            "do not change anything",
+            "do not edit anything",
+            "don't edit anything",
+            "do not modify anything",
+            "don't modify anything",
+        ];
+        for marker in read_only_markers {
+            if lower.contains(marker) {
+                prohibit_write = true;
+                prohibit_organize = true;
+            }
+        }
+
+        // Split prompt into clauses separated by punctuation or conjunctions
+        let clauses = split_into_clauses(&lower);
+
+        for clause in clauses {
+            let clause_trimmed = clause.trim();
+            if clause_trimmed.is_empty() {
+                continue;
+            }
+
+            let is_negated = has_negation_indicator(clause_trimmed);
+
+            let has_verification_terms = contains_standalone_word(clause_trimmed, VERIFICATION_TERMS);
+            let has_write_terms = contains_standalone_word(clause_trimmed, WRITE_TERMS);
+            let has_organize_terms = contains_standalone_word(clause_trimmed, ORGANIZE_TERMS);
+
+            if is_negated {
+                // If a clause is negated, any capabilities appearing in it are PROHIBITED
+                // and cannot grant capability (Bug 7)
+                if has_verification_terms
+                    || clause_trimmed.contains("test")
+                    || clause_trimmed.contains("run")
+                    || clause_trimmed.contains("verify")
+                {
+                    prohibit_verification = true;
+                }
+                if has_write_terms
+                    || clause_trimmed.contains("edit")
+                    || clause_trimmed.contains("modify")
+                    || clause_trimmed.contains("write")
+                    || clause_trimmed.contains("change")
+                    || clause_trimmed.contains("update")
+                    || clause_trimmed.contains("touch")
+                {
+                    prohibit_write = true;
+                }
+                if has_organize_terms
+                    || clause_trimmed.contains("organize")
+                    || clause_trimmed.contains("organise")
+                    || clause_trimmed.contains("move")
+                {
+                    prohibit_organize = true;
+                }
+            } else {
+                if has_verification_terms {
+                    allow_verification = true;
+                }
+                if has_write_terms || has_organize_terms {
+                    allow_write = true;
+                }
+                if has_organize_terms {
+                    allow_organize = true;
+                }
+            }
+        }
+
+        // Deterministic policy: explicit prohibition trumps capability request
+        let can_write = allow_write && !prohibit_write;
+        let can_verify = allow_verification && !prohibit_verification;
+        let can_organize = allow_organize && !prohibit_organize && !prohibit_write;
+
         let mut ops = vec![RoutineOpClass::FileRead, RoutineOpClass::SafeCommand];
-        if contains_standalone_word(&lower, VERIFICATION_TERMS) {
+        if can_verify {
             ops.push(RoutineOpClass::LocalVerification);
         }
-        if contains_standalone_word(&lower, WRITE_TERMS)
-            || contains_standalone_word(&lower, ORGANIZE_TERMS)
-        {
+        if can_write || can_organize {
             ops.push(RoutineOpClass::FileWrite);
         }
-        if contains_standalone_word(&lower, ORGANIZE_TERMS) {
+        if can_organize {
             ops.push(RoutineOpClass::FileOrganize);
         }
         self.allowed_operations = ops;
@@ -252,6 +349,34 @@ impl TaskAuthorizationGrant {
         }
 
         false
+    }
+}
+
+/// Distinguishes the possible resolution states of a task-scoped authorization grant (Bug 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskGrantResolution {
+    /// No grant was ever issued for this run. Normal authorization policy applies.
+    NoneIssued,
+    /// A valid grant is active and within its lifespan.
+    Active(TaskAuthorizationGrant),
+    /// A grant existed for this run or was attempted, but has expired, been revoked, or belongs to another run.
+    InvalidOrExpired {
+        reason: String,
+        original_grant: TaskAuthorizationGrant,
+    },
+    /// Required state (e.g. database lookup) could not be read or validated. Fail closed.
+    ValidationFailed {
+        reason: String,
+        original_grant: Option<TaskAuthorizationGrant>,
+    },
+}
+
+impl TaskGrantResolution {
+    pub fn is_active(&self) -> Option<&TaskAuthorizationGrant> {
+        match self {
+            Self::Active(g) => Some(g),
+            _ => None,
+        }
     }
 }
 
@@ -353,6 +478,96 @@ fn contains_standalone_word(haystack_lower: &str, terms: &[&str]) -> bool {
     false
 }
 
+/// Strips quoted text (double quotes, single quotes, backticks) so that string literals
+/// in search or grep commands do not expand task authorization capabilities (Bug 7).
+fn strip_quoted_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+
+    for ch in input.chars() {
+        match ch {
+            '"' if !in_single && !in_backtick => {
+                in_double = !in_double;
+                out.push(' ');
+            }
+            '\'' if !in_double && !in_backtick => {
+                in_single = !in_single;
+                out.push(' ');
+            }
+            '`' if !in_single && !in_double => {
+                in_backtick = !in_backtick;
+                out.push(' ');
+            }
+            _ if in_single || in_double || in_backtick => {
+                out.push(' ');
+            }
+            _ => {
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// Splits a prompt into logical clauses separated by punctuation or conjunctions.
+fn split_into_clauses(text: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let separators = ['.', ';', '!', '?', '\n', ','];
+    for sentence in text.split(|c: char| separators.contains(&c)) {
+        let mut remaining = sentence;
+        let conjunctions = [
+            " but ",
+            " however ",
+            " although ",
+            " yet ",
+            " except ",
+            " without ",
+            " instead of ",
+        ];
+        for conj in conjunctions {
+            if let Some(idx) = remaining.find(conj) {
+                let first = &remaining[..idx];
+                let second = &remaining[idx + conj.len()..];
+                clauses.push(first.trim().to_string());
+                remaining = second;
+            }
+        }
+        if !remaining.trim().is_empty() {
+            clauses.push(remaining.trim().to_string());
+        }
+    }
+    clauses
+}
+
+/// Checks if a clause contains a negation keyword (Bug 7).
+fn has_negation_indicator(clause_lower: &str) -> bool {
+    const NEGATION_INDICATORS: &[&str] = &[
+        "do not",
+        "don't",
+        "dont",
+        "never",
+        "cannot",
+        "can't",
+        "cant",
+        "must not",
+        "mustn't",
+        "should not",
+        "shouldn't",
+        "without",
+        "no",
+        "not",
+        "skip",
+        "avoid",
+        "refrain",
+        "prevent",
+        "neither",
+        "nor",
+    ];
+    contains_standalone_word(clause_lower, NEGATION_INDICATORS)
+}
+
 /// Credential-bearing field vocabulary for browser fill checkpoints (Bug 10):
 /// a target resolved to a credential field is a human takeover checkpoint no
 /// matter what value the model claims it is typing.
@@ -376,6 +591,19 @@ const CREDENTIAL_FIELD_TERMS: &[&str] = &[
     "access token",
     "secret",
 ];
+
+fn contains_credential_term(text: &str) -> bool {
+    let normalized = text
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>();
+    contains_standalone_word(&normalized, CREDENTIAL_FIELD_TERMS)
+        || text.to_lowercase().contains("api_key")
+        || text.to_lowercase().contains("apikey")
+        || text.to_lowercase().contains("password")
+        || text.to_lowercase().contains("passwd")
+}
 
 /// Renders every locator the browser target argument shape can carry into a
 /// single classification surface.
@@ -808,27 +1036,45 @@ impl AuthorizationEngine {
         // 3. Inspect existing destination to prevent symlink hijack attacks
         if let Ok(meta) = std::fs::symlink_metadata(&safe_path) {
             if meta.file_type().is_symlink() {
-                // If the target is a symlink, verify its target canonicalizes strictly inside a root
-                let canonical_target = safe_path.canonicalize().map_err(|e| {
-                    format!(
-                        "Security denial: destination symlink '{}' cannot be resolved: {}",
-                        safe_path.display(),
-                        e
-                    )
-                })?;
-                if !Self::path_within_roots(&canonical_target, &canonical_roots) {
-                    return Err(format!(
-                        "Security denial: destination symlink '{}' points outside the approved roots '{}'",
-                        safe_path.display(),
-                        canonical_roots[0].display()
-                    ));
-                }
+                return Err(format!(
+                    "Security denial: refusing to write through destination symlink '{}'",
+                    safe_path.display()
+                ));
             }
         }
 
-        // 4. Perform the write
-        std::fs::write(&safe_path, content)
-            .map_err(|e| format!("Failed to write file '{}': {}", safe_path.display(), e))?;
+        // 4. Perform the write using O_NOFOLLOW on Unix to eliminate symlink substitution race
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file_opts = OpenOptions::new();
+            file_opts
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW);
+
+            let mut file = file_opts.open(&safe_path).map_err(|e| {
+                format!(
+                    "Failed to securely open destination file '{}' (O_NOFOLLOW): {}",
+                    safe_path.display(),
+                    e
+                )
+            })?;
+
+            file.write_all(content).map_err(|e| {
+                format!("Failed to write file '{}': {}", safe_path.display(), e)
+            })?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&safe_path, content)
+                .map_err(|e| format!("Failed to write file '{}': {}", safe_path.display(), e))?;
+        }
 
         // 5. Post-write verification: ensure the written file is genuinely within an approved root
         let written_canon = safe_path.canonicalize().map_err(|e| {
@@ -839,8 +1085,8 @@ impl AuthorizationEngine {
             )
         })?;
         if !Self::path_within_roots(&written_canon, &canonical_roots) {
-            // Rollback the escaped file immediately
-            let _ = std::fs::remove_file(&written_canon);
+            // NEVER rollback/delete files outside the approved roots (Bug 14)!
+            // Doing remove_file(&written_canon) would delete an attacker-targeted external file!
             return Err(format!(
                 "Security violation: written file escaped the approved roots '{}'",
                 canonical_roots[0].display()
@@ -897,9 +1143,34 @@ impl AuthorizationEngine {
             }
         }
 
-        let mut content = std::fs::read_to_string(&canon)
+        #[cfg(unix)]
+        let content = {
+            use std::fs::OpenOptions;
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file_opts = OpenOptions::new();
+            file_opts.read(true).custom_flags(libc::O_NOFOLLOW);
+
+            let mut file = file_opts.open(&canon).map_err(|e| {
+                format!(
+                    "Failed to open file '{}' (O_NOFOLLOW): {}",
+                    canon.display(),
+                    e
+                )
+            })?;
+
+            let mut s = String::new();
+            file.read_to_string(&mut s)
+                .map_err(|e| format!("Failed to read file '{}': {}", path_str, e))?;
+            s
+        };
+
+        #[cfg(not(unix))]
+        let content = std::fs::read_to_string(&canon)
             .map_err(|e| format!("Failed to read file '{}': {}", path_str, e))?;
 
+        let mut content = content;
         const MAX_READ_BYTES: usize = 512 * 1024;
         if content.len() > MAX_READ_BYTES {
             content.truncate(MAX_READ_BYTES);
@@ -909,39 +1180,83 @@ impl AuthorizationEngine {
         Ok(content)
     }
 
-    /// Resolves and validates the active task-scoped authorization grant.
-    /// Checks:
-    /// 1. Run ID match (strictly bounded to ctx.run_id, non-inheritable)
-    /// 2. Lifetime expiry (now < expires_at)
-    /// 3. Terminal state revocation (run status not terminal in DB)
-    pub fn resolve_active_task_grant(
+    /// Resolves and validates the task-scoped authorization grant, distinguishing
+    /// active, expired/revoked, failed validation, and none-issued states (Bug 9).
+    pub fn resolve_task_grant(
         db: &Database,
         ctx: &ExecutionContext,
-    ) -> Option<TaskAuthorizationGrant> {
-        let grant = ctx.task_grant.clone().or_else(|| {
-            if let Ok(Some(r)) = db.get_run(&ctx.run_id) {
-                if let Some(ref cfg_str) = r.config_json {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cfg_str) {
-                        return v
-                            .get("task_grant")
-                            .and_then(|g| serde_json::from_value(g.clone()).ok());
-                    }
+    ) -> TaskGrantResolution {
+        let maybe_ctx_grant = ctx.task_grant.clone();
+
+        // 1. Read durable run record. If database fails, fail closed!
+        let run_record = match db.get_run(&ctx.run_id) {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!(
+                    "[Security] Database error checking run '{}': {}",
+                    ctx.run_id,
+                    e
+                );
+                return TaskGrantResolution::ValidationFailed {
+                    reason: format!("Failed to read run record from database: {}", e),
+                    original_grant: maybe_ctx_grant,
+                };
+            }
+        };
+
+        // 2. Validate existence of durable run record
+        let run_record = match run_record {
+            Some(r) => r,
+            None => {
+                if let Some(grant) = maybe_ctx_grant {
+                    return TaskGrantResolution::InvalidOrExpired {
+                        reason: format!(
+                            "Run record for run '{}' does not exist in database",
+                            ctx.run_id
+                        ),
+                        original_grant: grant,
+                    };
+                } else {
+                    return TaskGrantResolution::NoneIssued;
                 }
             }
-            None
-        })?;
+        };
 
-        // 1. Strict run_id binding: grant cannot be inherited across runs or by delegated sub-agents
+        // 3. Resolve original grant from context or run config
+        let original_grant = maybe_ctx_grant.or_else(|| {
+            run_record.config_json.as_ref().and_then(|cfg_str| {
+                serde_json::from_str::<serde_json::Value>(cfg_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("task_grant")
+                            .and_then(|g| serde_json::from_value(g.clone()).ok())
+                    })
+            })
+        });
+
+        let grant = match original_grant {
+            Some(g) => g,
+            None => return TaskGrantResolution::NoneIssued,
+        };
+
+        // 4. Strict run_id binding: grant cannot be inherited across runs or by delegated sub-agents
         if grant.run_id != ctx.run_id {
             log::warn!(
                 "[Security] Task grant run ID mismatch: approved for run '{}', attempted in run '{}'",
                 grant.run_id,
                 ctx.run_id
             );
-            return None;
+            return TaskGrantResolution::InvalidOrExpired {
+                reason: format!(
+                    "Task grant run ID mismatch: approved for run '{}', attempted in run '{}'",
+                    grant.run_id, ctx.run_id
+                ),
+                original_grant: grant,
+            };
         }
 
-        // 2. Lifetime expiry check
+        // 5. Lifetime expiry check
         let now = chrono::Utc::now().timestamp_millis();
         if now >= grant.expires_at {
             log::warn!(
@@ -949,25 +1264,43 @@ impl AuthorizationEngine {
                 grant.run_id,
                 grant.expires_at
             );
-            return None;
+            return TaskGrantResolution::InvalidOrExpired {
+                reason: format!(
+                    "Task grant for run '{}' expired at {}",
+                    grant.run_id, grant.expires_at
+                ),
+                original_grant: grant,
+            };
         }
 
-        // 3. Durable lifecycle revocation: terminal status in database invalidates grant
-        if let Ok(Some(r)) = db.get_run(&ctx.run_id) {
-            if matches!(
-                r.status.as_str(),
-                "completed" | "succeeded" | "failed" | "cancelled" | "interrupted"
-            ) {
-                log::warn!(
-                    "[Security] Task grant for run '{}' is revoked because run is in terminal status '{}'",
-                    grant.run_id,
-                    r.status
-                );
-                return None;
-            }
+        // 6. Durable lifecycle revocation: terminal status in database invalidates grant
+        if matches!(
+            run_record.status.as_str(),
+            "completed" | "succeeded" | "failed" | "cancelled" | "interrupted"
+        ) {
+            log::warn!(
+                "[Security] Task grant for run '{}' is revoked because run is in terminal status '{}'",
+                grant.run_id,
+                run_record.status
+            );
+            return TaskGrantResolution::InvalidOrExpired {
+                reason: format!(
+                    "Task grant for run '{}' is revoked because run is in terminal status '{}'",
+                    grant.run_id, run_record.status
+                ),
+                original_grant: grant,
+            };
         }
 
-        Some(grant)
+        TaskGrantResolution::Active(grant)
+    }
+
+    /// Backwards-compatible helper returning Some(grant) only when active.
+    pub fn resolve_active_task_grant(
+        db: &Database,
+        ctx: &ExecutionContext,
+    ) -> Option<TaskAuthorizationGrant> {
+        Self::resolve_task_grant(db, ctx).is_active().cloned()
     }
 
     fn evaluate_organize_execute(
@@ -1144,24 +1477,39 @@ impl AuthorizationEngine {
             }
         }
 
+        let grant_res = match &ctx.task_grant {
+            Some(g) => {
+                let now = chrono::Utc::now().timestamp_millis();
+                if g.run_id != ctx.run_id || now >= g.expires_at {
+                    TaskGrantResolution::InvalidOrExpired {
+                        reason: "Task grant has expired or belongs to another run".to_string(),
+                        original_grant: g.clone(),
+                    }
+                } else {
+                    TaskGrantResolution::Active(g.clone())
+                }
+            }
+            None => TaskGrantResolution::NoneIssued,
+        };
+
         match tool_name {
             "execute_shell" | "bash" | "terminal" => {
-                Self::evaluate_shell_in_context(policy, ctx, args)
+                match &grant_res {
+                    TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+                        AuthDecision::RequireApproval {
+                            reason: format!(
+                                "Task authorization grant has expired, been revoked, or is invalid for this run ({}); shell execution requires manual approval",
+                                reason
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: format!("Execute shell command '{}'", args["command"].as_str().unwrap_or("")),
+                        }
+                    }
+                    _ => Self::evaluate_shell_in_context(policy, ctx, args),
+                }
             }
-            "read_file" => {
-                let active = ctx
-                    .task_grant
-                    .as_ref()
-                    .filter(|g| g.is_active(&ctx.run_id, chrono::Utc::now().timestamp_millis()));
-                Self::evaluate_file_read(ctx, args, active)
-            }
-            "write_file" => {
-                let active = ctx
-                    .task_grant
-                    .as_ref()
-                    .filter(|g| g.is_active(&ctx.run_id, chrono::Utc::now().timestamp_millis()));
-                Self::evaluate_file_write(ctx, args, active)
-            }
+            "read_file" => Self::evaluate_file_read(ctx, args, &grant_res),
+            "write_file" => Self::evaluate_file_write(ctx, args, &grant_res),
             "create_artifact" => Self::evaluate_create_artifact(ctx, args),
             "computer_action" => Self::evaluate_computer_action(policy, args),
             "click_mark" => Self::evaluate_click_mark(policy, args),
@@ -1185,7 +1533,7 @@ impl AuthorizationEngine {
                 }
             }
             "organize_files_execute" => {
-                if let Some(ref grant) = ctx.task_grant {
+                if let TaskGrantResolution::Active(ref grant) = grant_res {
                     if grant.mode == TaskAutonomyMode::Autonomous
                         && grant
                             .allowed_operations
@@ -1210,7 +1558,7 @@ impl AuthorizationEngine {
                 }
             }
             "organize_files_undo" => {
-                if let Some(ref grant) = ctx.task_grant {
+                if let TaskGrantResolution::Active(ref grant) = grant_res {
                     if grant.mode == TaskAutonomyMode::Autonomous
                         && grant
                             .allowed_operations
@@ -1278,8 +1626,8 @@ impl AuthorizationEngine {
                 }
                 AuthDecision::Allow
             }
-            "browser_click" => Self::evaluate_browser_click(args),
-            "browser_fill" => Self::evaluate_browser_fill(args),
+            "browser_click" => Self::evaluate_browser_click(policy, args),
+            "browser_fill" => Self::evaluate_browser_fill(policy, args),
             "browser_open" | "stop_dev_server" | "browser_close" => AuthDecision::Allow,
             _ => AuthDecision::RequireApproval {
                 reason: format!("Tool '{}' requires explicit authorization", tool_name),
@@ -1344,22 +1692,45 @@ impl AuthorizationEngine {
             }
         }
 
-        // 4. Resolve active bounded authorization grant
-        let active_grant = Self::resolve_active_task_grant(db, ctx);
+        // 4. Resolve active bounded authorization grant (Bug 9)
+        let grant_res = Self::resolve_task_grant(db, ctx);
 
         match tool_name {
             "execute_shell" | "bash" | "terminal" => {
-                // The shell analysis sees exactly the lifecycle-validated
-                // grant (Bug 9): an expired, revoked, or cross-run grant is
-                // stripped here so no shell branch can act on it.
-                let shell_ctx = ExecutionContext {
-                    task_grant: active_grant.clone(),
-                    ..ctx.clone()
-                };
-                Self::evaluate_shell_in_context(&policy, &shell_ctx, args)
+                match &grant_res {
+                    TaskGrantResolution::ValidationFailed { reason, .. } => {
+                        AuthDecision::Deny {
+                            reason: format!("Task grant validation failed (fail closed): {}", reason),
+                        }
+                    }
+                    TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+                        AuthDecision::RequireApproval {
+                            reason: format!(
+                                "Task authorization grant has expired, been revoked, or is invalid for this run ({}); shell execution requires manual approval",
+                                reason
+                            ),
+                            risk: RiskLevel::Moderate,
+                            summary: format!("Execute shell command '{}'", args["command"].as_str().unwrap_or("")),
+                        }
+                    }
+                    TaskGrantResolution::Active(grant) => {
+                        let shell_ctx = ExecutionContext {
+                            task_grant: Some(grant.clone()),
+                            ..ctx.clone()
+                        };
+                        Self::evaluate_shell_in_context(&policy, &shell_ctx, args)
+                    }
+                    TaskGrantResolution::NoneIssued => {
+                        let shell_ctx = ExecutionContext {
+                            task_grant: None,
+                            ..ctx.clone()
+                        };
+                        Self::evaluate_shell_in_context(&policy, &shell_ctx, args)
+                    }
+                }
             }
-            "read_file" => Self::evaluate_file_read(ctx, args, active_grant.as_ref()),
-            "write_file" => Self::evaluate_file_write(ctx, args, active_grant.as_ref()),
+            "read_file" => Self::evaluate_file_read(ctx, args, &grant_res),
+            "write_file" => Self::evaluate_file_write(ctx, args, &grant_res),
             "create_artifact" => Self::evaluate_create_artifact(ctx, args),
             "computer_action" => Self::evaluate_computer_action(&policy, args),
             "click_mark" => Self::evaluate_click_mark(&policy, args),
@@ -1442,7 +1813,7 @@ impl AuthorizationEngine {
                     }
                     Ok(None) => {}
                 }
-                Self::evaluate_organize_execute(db, ctx, active_grant.as_ref(), args)
+                Self::evaluate_organize_execute(db, ctx, grant_res.is_active(), args)
             }
             "organize_files_undo" => {
                 let perm_key = "mcp_perm:organize_files_undo";
@@ -1468,7 +1839,7 @@ impl AuthorizationEngine {
                     }
                     Ok(None) => {}
                 }
-                Self::evaluate_organize_undo(db, ctx, active_grant.as_ref(), args)
+                Self::evaluate_organize_undo(db, ctx, grant_res.is_active(), args)
             }
             "rollback_code_checkpoint" => AuthDecision::RequireApproval {
                 reason: "Rolling back a code checkpoint restores previous file states.".to_string(),
@@ -1509,8 +1880,8 @@ impl AuthorizationEngine {
                 }
                 AuthDecision::Allow
             }
-            "browser_click" => Self::evaluate_browser_click(args),
-            "browser_fill" => Self::evaluate_browser_fill(args),
+            "browser_click" => Self::evaluate_browser_click(&policy, args),
+            "browser_fill" => Self::evaluate_browser_fill(&policy, args),
             "browser_open" | "stop_dev_server" | "browser_close" => AuthDecision::Allow,
             _ => {
                 // MCP or custom external tool
@@ -2095,16 +2466,16 @@ impl AuthorizationEngine {
 
     /// Evaluates filesystem reads: canonical workspace / authorized folders confinement validation
     ///
-    /// `active_grant` is the grant resolved through
-    /// [`AuthorizationEngine::resolve_active_task_grant`]: run-bound, unexpired
-    /// and revoked on terminal lifecycle states. When the run *was* issued a
+    /// `grant_res` is the grant resolved through
+    /// [`AuthorizationEngine::resolve_task_grant`]: run-bound, unexpired
+    /// and revoked on terminal lifecycle states. When the run was issued a
     /// grant but that grant is no longer active, the decision is a targeted
     /// approval (a stale grant must never silently re-authorize an action
-    /// under a different scope definition).
+    /// under a broader workspace definition).
     pub fn evaluate_file_read(
         ctx: &ExecutionContext,
         args: &serde_json::Value,
-        active_grant: Option<&TaskAuthorizationGrant>,
+        grant_res: &TaskGrantResolution,
     ) -> AuthDecision {
         let path_str = match args["path"].as_str() {
             Some(p) if !p.trim().is_empty() => p.trim(),
@@ -2135,61 +2506,61 @@ impl AuthorizationEngine {
             };
         }
 
-        // 3. Task grant evaluation if present
-        if ctx.task_grant.is_some() {
-            let grant = match active_grant {
-                Some(g) => g,
-                None => {
-                    // A grant existed for this run but is no longer valid:
-                    // expired, revoked by a terminal run status, or bound to
-                    // another run. Fail to the targeted approval path.
+        // 3. Task grant resolution check (Bug 9)
+        match grant_res {
+            TaskGrantResolution::ValidationFailed { reason, .. } => {
+                AuthDecision::Deny {
+                    reason: format!("Task grant validation failed (fail closed): {}", reason),
+                }
+            }
+            TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+                AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Active task authorization grant has expired, been revoked, or is invalid for this run ({}); manual approval required",
+                        reason
+                    ),
+                    risk: RiskLevel::Safe,
+                    summary: format!("Read file '{}'", path_str),
+                }
+            }
+            TaskGrantResolution::Active(grant) => {
+                if grant.mode == TaskAutonomyMode::Supervised {
                     return AuthDecision::RequireApproval {
-                        reason: "Active task authorization grant has expired, been revoked, or is invalid for this run"
-                            .to_string(),
+                        reason: "Supervised mode requires approval for file reads".to_string(),
                         risk: RiskLevel::Safe,
                         summary: format!("Read file '{}'", path_str),
                     };
                 }
-            };
-            if grant.mode == TaskAutonomyMode::Supervised {
-                return AuthDecision::RequireApproval {
-                    reason: "Supervised mode requires approval for file reads".to_string(),
-                    risk: RiskLevel::Safe,
-                    summary: format!("Read file '{}'", path_str),
-                };
-            }
-            if !grant.allowed_operations.contains(&RoutineOpClass::FileRead) {
-                return AuthDecision::RequireApproval {
-                    reason: "Task grant does not permit autonomous file reads".to_string(),
-                    risk: RiskLevel::Safe,
-                    summary: format!("Read file '{}'", path_str),
-                };
-            }
-            // The SAME canonical path-scope mechanism used by the actual
-            // secure read operation (Bug 14 invariant): one list of approved
-            // roots, one resolution rule, one canonicalization.
-            let roots = TaskAuthorizationGrant::execution_roots(ctx);
-            return match Self::validate_path_confinement_roots(&roots, path_str, FileOp::Read) {
-                Ok(_) => AuthDecision::Allow,
-                Err(reason) => {
-                    if reason.starts_with("File does not exist") {
-                        AuthDecision::Deny { reason }
-                    } else {
-                        AuthDecision::Deny {
-                            reason: format!(
-                                "Path '{}' is outside task authorized scope: {}",
-                                path_str, reason
-                            ),
+                if !grant.allowed_operations.contains(&RoutineOpClass::FileRead) {
+                    return AuthDecision::RequireApproval {
+                        reason: "Task grant does not permit autonomous file reads".to_string(),
+                        risk: RiskLevel::Safe,
+                        summary: format!("Read file '{}'", path_str),
+                    };
+                }
+                let roots = TaskAuthorizationGrant::execution_roots(ctx);
+                match Self::validate_path_confinement_roots(&roots, path_str, FileOp::Read) {
+                    Ok(_) => AuthDecision::Allow,
+                    Err(reason) => {
+                        if reason.starts_with("File does not exist") {
+                            AuthDecision::Deny { reason }
+                        } else {
+                            AuthDecision::Deny {
+                                reason: format!(
+                                    "Path '{}' is outside task authorized scope: {}",
+                                    path_str, reason
+                                ),
+                            }
                         }
                     }
                 }
-            };
-        }
-
-        match Self::validate_path_confinement(ctx.workspace_root.as_deref(), path_str, FileOp::Read)
-        {
-            Ok(_) => AuthDecision::Allow,
-            Err(reason) => AuthDecision::Deny { reason },
+            }
+            TaskGrantResolution::NoneIssued => {
+                match Self::validate_path_confinement(ctx.workspace_root.as_deref(), path_str, FileOp::Read) {
+                    Ok(_) => AuthDecision::Allow,
+                    Err(reason) => AuthDecision::Deny { reason },
+                }
+            }
         }
     }
 
@@ -2197,7 +2568,7 @@ impl AuthorizationEngine {
     pub fn evaluate_file_write(
         ctx: &ExecutionContext,
         args: &serde_json::Value,
-        active_grant: Option<&TaskAuthorizationGrant>,
+        grant_res: &TaskGrantResolution,
     ) -> AuthDecision {
         let path_str = match args["path"].as_str() {
             Some(p) if !p.trim().is_empty() => p.trim(),
@@ -2228,55 +2599,62 @@ impl AuthorizationEngine {
             };
         }
 
-        // 3. Task grant evaluation if present
-        if ctx.task_grant.is_some() {
-            let grant = match active_grant {
-                Some(g) => g,
-                None => {
+        // 3. Task grant resolution check (Bug 9)
+        match grant_res {
+            TaskGrantResolution::ValidationFailed { reason, .. } => {
+                AuthDecision::Deny {
+                    reason: format!("Task grant validation failed (fail closed): {}", reason),
+                }
+            }
+            TaskGrantResolution::InvalidOrExpired { reason, .. } => {
+                AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Active task authorization grant has expired, been revoked, or is invalid for this run ({}); manual approval required",
+                        reason
+                    ),
+                    risk: RiskLevel::Safe,
+                    summary: format!("Write file '{}'", path_str),
+                }
+            }
+            TaskGrantResolution::Active(grant) => {
+                if grant.mode == TaskAutonomyMode::Supervised {
                     return AuthDecision::RequireApproval {
-                        reason: "Active task authorization grant has expired, been revoked, or is invalid for this run"
-                            .to_string(),
+                        reason: "Supervised mode requires approval for file writes".to_string(),
                         risk: RiskLevel::Safe,
                         summary: format!("Write file '{}'", path_str),
                     };
                 }
-            };
-            if grant.mode == TaskAutonomyMode::Supervised {
-                return AuthDecision::RequireApproval {
-                    reason: "Supervised mode requires approval for file writes".to_string(),
-                    risk: RiskLevel::Safe,
-                    summary: format!("Write file '{}'", path_str),
-                };
+                if !grant
+                    .allowed_operations
+                    .contains(&RoutineOpClass::FileWrite)
+                {
+                    return AuthDecision::RequireApproval {
+                        reason: "Task grant does not permit autonomous file writes".to_string(),
+                        risk: RiskLevel::Safe,
+                        summary: format!("Write file '{}'", path_str),
+                    };
+                }
+                let roots = TaskAuthorizationGrant::execution_roots(ctx);
+                match Self::validate_path_confinement_roots(&roots, path_str, FileOp::Write) {
+                    Ok(_) => AuthDecision::Allow,
+                    Err(reason) => AuthDecision::Deny {
+                        reason: format!(
+                            "Path '{}' is outside task authorized scope: {}",
+                            path_str, reason
+                        ),
+                    },
+                }
             }
-            if !grant
-                .allowed_operations
-                .contains(&RoutineOpClass::FileWrite)
-            {
-                return AuthDecision::RequireApproval {
-                    reason: "Task grant does not permit autonomous file writes".to_string(),
-                    risk: RiskLevel::Safe,
-                    summary: format!("Write file '{}'", path_str),
-                };
+            TaskGrantResolution::NoneIssued => {
+                match Self::validate_path_confinement(
+                    ctx.workspace_root.as_deref(),
+                    path_str,
+                    FileOp::Write,
+                ) {
+                    Ok(_) => AuthDecision::Allow,
+                    Err(reason) => AuthDecision::Deny { reason },
+                }
             }
-            let roots = TaskAuthorizationGrant::execution_roots(ctx);
-            return match Self::validate_path_confinement_roots(&roots, path_str, FileOp::Write) {
-                Ok(_) => AuthDecision::Allow,
-                Err(reason) => AuthDecision::Deny {
-                    reason: format!(
-                        "Path '{}' is outside task authorized scope: {}",
-                        path_str, reason
-                    ),
-                },
-            };
-        }
-
-        match Self::validate_path_confinement(
-            ctx.workspace_root.as_deref(),
-            path_str,
-            FileOp::Write,
-        ) {
-            Ok(_) => AuthDecision::Allow,
-            Err(reason) => AuthDecision::Deny { reason },
         }
     }
 
@@ -2474,7 +2852,19 @@ impl AuthorizationEngine {
     /// classified (coordinates only, or a bare element reference with no
     /// semantic locator) is treated as potentially consequential, because
     /// ambiguity must never default to benign (Bug 10).
-    pub fn evaluate_browser_click(args: &serde_json::Value) -> AuthDecision {
+    pub fn evaluate_browser_click(
+        policy: &GovernancePolicy,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        if policy.computer_use_mode == "AskAlways" {
+            return AuthDecision::RequireApproval {
+                reason: "Policy 'AskAlways' requires confirmation before interacting with browser elements"
+                    .to_string(),
+                risk: RiskLevel::Safe,
+                summary: "Activate browser element (AskAlways)".to_string(),
+            };
+        }
+
         let descriptor = browser_target_descriptor(args);
         let has_semantics = has_resolvable_semantics(args);
         let has_coordinates = ["x", "y"]
@@ -2504,18 +2894,79 @@ impl AuthorizationEngine {
             };
         }
 
-        if contains_standalone_word(&descriptor.to_lowercase(), CONSEQUENTIAL_CONTROL_TERMS) {
-            AuthDecision::RequireApproval {
+        // Check for credential-bearing field interaction (Bug 10)
+        for field in ["name", "text", "css", "test_id", "testId", "role"] {
+            if let Some(val) = args.get(field).and_then(|v| v.as_str()) {
+                if contains_credential_term(val) {
+                    return AuthDecision::RequireTakeover {
+                        reason: format!(
+                            "Interacting with credential-bearing target ('{}={}') requires human takeover",
+                            field, val
+                        ),
+                    };
+                }
+            }
+        }
+
+        // Check for consequential control terms in locators independently (Bug 10)
+        let mut has_consequential_selector = false;
+        let mut consequential_locators = Vec::new();
+        for field in ["css", "test_id", "testId", "ref", "element_ref", "tag"] {
+            if let Some(val) = args.get(field).and_then(|v| v.as_str()) {
+                if contains_standalone_word(&val.to_lowercase(), CONSEQUENTIAL_CONTROL_TERMS) {
+                    has_consequential_selector = true;
+                    consequential_locators.push(format!("{}={}", field, val));
+                }
+            }
+        }
+
+        let mut has_consequential_label = false;
+        for field in ["name", "text", "role"] {
+            if let Some(val) = args.get(field).and_then(|v| v.as_str()) {
+                if contains_standalone_word(&val.to_lowercase(), CONSEQUENTIAL_CONTROL_TERMS) {
+                    has_consequential_label = true;
+                    consequential_locators.push(format!("{}={}", field, val));
+                }
+            }
+        }
+
+        // Detect deceptive / conflicting locators (e.g. benign label like 'Save' paired with destructive css '#delete-btn')
+        let label_text = format!(
+            "{} {}",
+            args.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            args.get("text").and_then(|v| v.as_str()).unwrap_or("")
+        )
+        .to_lowercase();
+        let is_benign_label = !label_text.trim().is_empty() && !has_consequential_label;
+
+        if has_consequential_selector && is_benign_label {
+            return AuthDecision::RequireApproval {
                 reason: format!(
-                    "Activating the control '{}' may perform a consequential action",
-                    descriptor.trim()
+                    "Deceptive or conflicting locator: element has benign label '{}' but consequential selector '{}'",
+                    label_text.trim(),
+                    consequential_locators.join(", ")
+                ),
+                risk: RiskLevel::Destructive,
+                summary: format!(
+                    "Activate potentially deceptive control with selector {}",
+                    consequential_locators.join(", ")
+                ),
+            };
+        }
+
+        if has_consequential_selector || has_consequential_label {
+            return AuthDecision::RequireApproval {
+                reason: format!(
+                    "Activating the control '{}' may perform a consequential action ({})",
+                    descriptor.trim(),
+                    consequential_locators.join(", ")
                 ),
                 risk: RiskLevel::Moderate,
                 summary: format!("Activate the control: {}", descriptor.trim()),
-            }
-        } else {
-            AuthDecision::Allow
+            };
         }
+
+        AuthDecision::Allow
     }
 
     /// Shared browser fill classification used by both authorization paths.
@@ -2523,25 +2974,40 @@ impl AuthorizationEngine {
     /// The typed value is checked for credentials and then the *target field
     /// semantics* are checked: filling a resolved credential-bearing field
     /// forces a human takeover regardless of the claimed value (Bug 10).
-    pub fn evaluate_browser_fill(args: &serde_json::Value) -> AuthDecision {
+    pub fn evaluate_browser_fill(
+        policy: &GovernancePolicy,
+        args: &serde_json::Value,
+    ) -> AuthDecision {
+        if policy.computer_use_mode == "AskAlways" {
+            return AuthDecision::RequireApproval {
+                reason: "Policy 'AskAlways' requires confirmation before interacting with browser elements"
+                    .to_string(),
+                risk: RiskLevel::Safe,
+                summary: "Fill browser form field (AskAlways)".to_string(),
+            };
+        }
+
         if let Some(reason) =
             TakeoverController::detect_sensitive_checkpoint(args["value"].as_str().unwrap_or(""))
         {
             return AuthDecision::RequireTakeover { reason };
         }
 
-        let descriptor = browser_target_descriptor(args).to_lowercase();
-        if has_resolvable_semantics(args)
-            && contains_standalone_word(&descriptor, CREDENTIAL_FIELD_TERMS)
-        {
-            return AuthDecision::RequireTakeover {
-                reason: format!(
-                    "Filling a credential-bearing field ('{}') requires the human user to enter the credentials",
-                    descriptor.trim()
-                ),
-            };
+        // Check if any locator field matches CREDENTIAL_FIELD_TERMS (Bug 10)
+        for field in ["name", "text", "css", "test_id", "testId", "role", "tag"] {
+            if let Some(val) = args.get(field).and_then(|v| v.as_str()) {
+                if contains_credential_term(val) {
+                    return AuthDecision::RequireTakeover {
+                        reason: format!(
+                            "Filling a credential-bearing field ('{}={}') requires the human user to enter the credentials",
+                            field, val
+                        ),
+                    };
+                }
+            }
         }
 
+        let descriptor = browser_target_descriptor(args).to_lowercase();
         if !has_resolvable_semantics(args) || descriptor.trim().is_empty() {
             return AuthDecision::RequireApproval {
                 reason: "The fill target carries no resolvable locator, so its field semantics cannot be verified; approval is required"
