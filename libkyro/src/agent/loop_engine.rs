@@ -1430,6 +1430,30 @@ The program is started as an explicit executable plus argument vector; free-form
 
                     if let Ok(Some(status)) = db.get_approval_request(&req_id) {
                         if status.status == "approved" {
+                            let consume_res = db.consume_approval_request_bound(
+                                &req_id,
+                                run_id,
+                                &[tc.name.as_str(), canonical_name.as_str()],
+                                &tc.arguments,
+                                now,
+                            );
+                            if let Err(err) = consume_res {
+                                log::warn!(
+                                    "[Security] Approval consumption rejected for req '{}': {}",
+                                    req_id,
+                                    err
+                                );
+                                let _ = db.update_run_status(run_id, "running", None, None, None);
+                                return (
+                                    format!(
+                                        "Action '{}' rejected: authorization proof could not be consumed: {}",
+                                        tc.name, err
+                                    ),
+                                    true,
+                                    None,
+                                );
+                            }
+
                             let _ = db.update_run_status(run_id, "running", None, None, None);
                             let proof = crate::connector::InvocationAuthProof {
                                 approval_id: req_id.clone(),
@@ -1754,6 +1778,26 @@ The program is started as an explicit executable plus argument vector; free-form
                     Ok(p) => p,
                     Err(e) => return (format!("Filesystem access denied: {}", e), true, None),
                 };
+
+                // Independent postcondition verification: confirm file exists and content matches on disk
+                let ver_res = crate::execution::verify_file_postcondition(
+                    &safe_path,
+                    Some(content.as_bytes()),
+                    None,
+                );
+                if ver_res.status != crate::execution::OutcomeStatus::Succeeded {
+                    return (
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": format!("File postcondition verification failed: {}", ver_res.evidence),
+                            "verification": ver_res,
+                            "path": safe_path.to_string_lossy(),
+                        })
+                        .to_string(),
+                        true,
+                        None,
+                    );
+                }
 
                 // Register write_file into artifacts registry
                 let file_name = safe_path
@@ -2311,19 +2355,17 @@ The program is started as an explicit executable plus argument vector; free-form
                                 let _ = db.save_timeline_step(&step_rec);
                             }
 
-                            // The action was dispatched successfully.  Whether
-                            // the *intended* transition happened is reported
-                            // separately so the model does not mistake a
-                            // successful dispatch for a confirmed effect.
-                            let status = if x.is_some() && y.is_some() {
-                                if diff_percent > 0.05 {
-                                    "success"
-                                } else {
-                                    "uncertain"
-                                }
-                            } else {
-                                "success"
-                            };
+                            // The action was dispatched successfully. Whether
+                            // the *intended* transition happened is verified
+                            // separately so the model and frontend never mistake a
+                            // successful dispatch for a confirmed outcome.
+                            let ver_res = crate::execution::verify_computer_action_postcondition(
+                                action_str,
+                                x,
+                                y,
+                                diff_percent as f64,
+                            );
+                            let status = ver_res.status.as_str();
                             (
                                 serde_json::json!({
                                     "status": status,
@@ -2333,6 +2375,7 @@ The program is started as an explicit executable plus argument vector; free-form
                                     "x": x,
                                     "y": y,
                                     "visual_change_percent": diff_percent,
+                                    "verification": ver_res,
                                     "note": if status == "uncertain" {
                                         "The input was delivered but no visual change was detected; the target may not have changed state."
                                     } else {

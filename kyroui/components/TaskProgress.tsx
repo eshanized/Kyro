@@ -5,7 +5,7 @@ import { ToolResult } from "../types/agent";
 export interface TaskStep {
   id: string;
   text: string;
-  status: "pending" | "running" | "completed" | "failed" | "unverified";
+  status: "pending" | "running" | "completed" | "failed" | "unverified" | "uncertain";
   done?: boolean;
   evidence?: string;
   toolName?: string;
@@ -20,7 +20,7 @@ export interface TaskPlan {
   understanding: string;
   resources: string[];
   steps: TaskStep[];
-  status: "planning" | "approved" | "executing" | "completed" | "failed" | "cancelled" | "unverified";
+  status: "planning" | "approved" | "executing" | "completed" | "failed" | "cancelled" | "unverified" | "uncertain";
   accomplished: string[];
   remaining: string[];
 }
@@ -29,7 +29,11 @@ export interface VerificationEvidence {
   verified: boolean;
   attempted: boolean;
   failed: boolean;
+  uncertain?: boolean;
   reason: string;
+  conditionChecked?: string;
+  resource?: string;
+  humanInterventionRequired?: boolean;
   toolName?: string;
 }
 
@@ -37,9 +41,73 @@ export interface VerificationEvidence {
  * Truthfully evaluates verification evidence from a tool result.
  * Inspection tools (e.g. `inspect_project`) do NOT constitute verification.
  * A failed test MUST NEVER be counted as successful verification.
+ * Generic tool name prefixes (e.g. `verify_*`, `validate_*`) are never accepted as proof.
  */
 export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?: string): VerificationEvidence {
   const toolName = (toolResult.name || "").toLowerCase();
+
+  // 1. Structured backend verification metadata is authoritative
+  if (toolResult.output && typeof toolResult.output === "string") {
+    try {
+      const parsed = JSON.parse(toolResult.output);
+      if (parsed && typeof parsed === "object") {
+        if (parsed.verification && typeof parsed.verification === "object") {
+          const v = parsed.verification;
+          const status = (v.status || "").toLowerCase();
+          if (status === "succeeded" || status === "success") {
+            return {
+              verified: true,
+              attempted: true,
+              failed: false,
+              uncertain: false,
+              reason: v.evidence || "Postcondition verified on system",
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: false,
+              toolName: toolResult.name,
+            };
+          } else if (status === "uncertain") {
+            return {
+              verified: false,
+              attempted: true,
+              failed: false,
+              uncertain: true,
+              reason: v.evidence || parsed.note || "Postcondition check inconclusive (uncertain outcome)",
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: v.human_intervention_required ?? true,
+              toolName: toolResult.name,
+            };
+          } else if (status === "failed") {
+            return {
+              verified: false,
+              attempted: true,
+              failed: true,
+              uncertain: false,
+              reason: v.evidence || "Postcondition verification check failed",
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: true,
+              toolName: toolResult.name,
+            };
+          }
+        }
+
+        if (parsed.status === "uncertain") {
+          return {
+            verified: false,
+            attempted: true,
+            failed: false,
+            uncertain: true,
+            reason: parsed.note || "Action executed with inconclusive postcondition (uncertain outcome)",
+            toolName: toolResult.name,
+          };
+        }
+      }
+    } catch {
+      // not json
+    }
+  }
 
   // Inspection/diagnostic tools are never task verification
   const isInspectionOnly =
@@ -87,7 +155,7 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?:
     };
   }
 
-  // The tool was a test / verification tool
+  // The tool was an explicit test tool
   if (toolResult.is_error) {
     return {
       verified: false,
@@ -129,12 +197,17 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?:
 }
 
 /**
- * Name/command-based detection of test-or-verification tools. Mirrors the
- * tool namespace rules of `evaluateVerificationOutcome` so the plan reducer
- * can classify results BEFORE asking the evaluator for truthful evidence
- * (Bug 6). `execute_shell` counts only when its command actually runs tests.
+ * Structured or explicit verification tool detection.
+ * Name prefixes such as `verify_*` or `validate_*` are never trusted as verification.
  */
-export function isVerificationToolName(name: string, commandArg?: string): boolean {
+export function isVerificationToolName(name: string, commandArg?: string, output?: string): boolean {
+  if (output && typeof output === "string") {
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed?.verification) return true;
+    } catch {}
+  }
+
   const toolName = (name || "").toLowerCase();
   return (
     toolName === "run_tests" ||
@@ -210,6 +283,7 @@ export const TaskProgress: React.FC<TaskProgressProps> = ({
       case "failed":
         return "bg-red-950/40 text-red-300 border border-red-800/60";
       case "unverified":
+      case "uncertain":
         return "bg-amber-950/40 text-amber-300 border border-amber-800/60";
       case "executing":
         return "bg-neutral-800 text-neutral-200 border border-neutral-700 animate-pulse";

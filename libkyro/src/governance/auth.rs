@@ -694,6 +694,292 @@ pub struct ShellAnalysis {
     pub lexed_words: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalizedComputerAction {
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    LeftClick {
+        x: Option<i32>,
+        y: Option<i32>,
+        mark_id: Option<u64>,
+    },
+    RightClick {
+        x: Option<i32>,
+        y: Option<i32>,
+        mark_id: Option<u64>,
+    },
+    DoubleClick {
+        x: Option<i32>,
+        y: Option<i32>,
+        mark_id: Option<u64>,
+    },
+    LeftClickDrag {
+        x: i32,
+        y: i32,
+    },
+    Type {
+        text: String,
+    },
+    Key {
+        text: String,
+    },
+    Hotkey {
+        keys: Vec<String>,
+    },
+    Wait {
+        ms: u64,
+    },
+    Unknown {
+        raw: String,
+    },
+}
+
+impl NormalizedComputerAction {
+    pub fn parse(args: &serde_json::Value) -> Self {
+        let get_field = |k: &str| -> Option<&serde_json::Value> {
+            args.get("params")
+                .and_then(|p| p.get(k))
+                .or_else(|| args.get(k))
+        };
+
+        let action_name = if let Some(a) = args.get("action").and_then(|v| v.as_str()) {
+            a.to_lowercase()
+        } else if let Some(obj) = args.as_object() {
+            obj.keys()
+                .next()
+                .cloned()
+                .unwrap_or_default()
+                .to_lowercase()
+        } else {
+            String::new()
+        };
+
+        let sub_obj = args
+            .as_object()
+            .and_then(|o| o.values().next().filter(|v| v.is_object()));
+
+        let get_num = |k: &str| -> Option<i32> {
+            get_field(k)
+                .and_then(|v| v.as_i64())
+                .or_else(|| sub_obj.and_then(|o| o.get(k)).and_then(|v| v.as_i64()))
+                .map(|v| v as i32)
+        };
+
+        let get_str = |k: &str| -> Option<String> {
+            get_field(k)
+                .and_then(|v| v.as_str())
+                .or_else(|| sub_obj.and_then(|o| o.get(k)).and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+        };
+
+        let get_mark_id = || -> Option<u64> {
+            get_field("mark_id")
+                .or_else(|| get_field("markId"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    sub_obj
+                        .and_then(|o| o.get("mark_id").or_else(|| o.get("markId")))
+                        .and_then(|v| v.as_u64())
+                })
+        };
+
+        match action_name.as_str() {
+            "mouse_move" | "mousemove" => {
+                let x = get_num("x").unwrap_or(0);
+                let y = get_num("y").unwrap_or(0);
+                NormalizedComputerAction::MouseMove { x, y }
+            }
+            "left_click" | "leftclick" | "click" => {
+                let x = get_num("x");
+                let y = get_num("y");
+                let mark_id = get_mark_id();
+                NormalizedComputerAction::LeftClick { x, y, mark_id }
+            }
+            "right_click" | "rightclick" => {
+                let x = get_num("x");
+                let y = get_num("y");
+                let mark_id = get_mark_id();
+                NormalizedComputerAction::RightClick { x, y, mark_id }
+            }
+            "double_click" | "doubleclick" => {
+                let x = get_num("x");
+                let y = get_num("y");
+                let mark_id = get_mark_id();
+                NormalizedComputerAction::DoubleClick { x, y, mark_id }
+            }
+            "left_click_drag" | "leftclickdrag" | "drag" => {
+                let x = get_num("x").unwrap_or(0);
+                let y = get_num("y").unwrap_or(0);
+                NormalizedComputerAction::LeftClickDrag { x, y }
+            }
+            "type" => {
+                let text = get_str("text").unwrap_or_default();
+                NormalizedComputerAction::Type { text }
+            }
+            "key" => {
+                let text = get_str("text")
+                    .or_else(|| get_str("key"))
+                    .unwrap_or_default();
+                NormalizedComputerAction::Key { text }
+            }
+            "hotkey" => {
+                let mut keys = Vec::new();
+                if let Some(arr) = get_field("keys").and_then(|v| v.as_array()).or_else(|| {
+                    sub_obj
+                        .and_then(|o| o.get("keys"))
+                        .and_then(|v| v.as_array())
+                }) {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            keys.push(s.to_string());
+                        }
+                    }
+                } else if let Some(txt) = get_str("text").or_else(|| get_str("keys")) {
+                    for part in txt.split(['+', '-', ' ']) {
+                        let trimmed = part.trim();
+                        if !trimmed.is_empty() {
+                            keys.push(trimmed.to_string());
+                        }
+                    }
+                }
+                NormalizedComputerAction::Hotkey { keys }
+            }
+            "wait" | "delay" => {
+                let ms = get_field("ms")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| sub_obj.and_then(|o| o.get("ms")).and_then(|v| v.as_u64()))
+                    .unwrap_or(500);
+                NormalizedComputerAction::Wait { ms }
+            }
+            _ => NormalizedComputerAction::Unknown {
+                raw: if action_name.is_empty() {
+                    args.to_string()
+                } else {
+                    action_name
+                },
+            },
+        }
+    }
+}
+
+pub fn classify_destructive_hotkey(keys: &[String]) -> Option<&'static str> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut has_ctrl = false;
+    let mut has_alt = false;
+    let mut has_shift = false;
+    let mut has_super = false;
+    let mut base_keys: Vec<String> = Vec::new();
+
+    for key_raw in keys {
+        for part in key_raw.split(['+', '-', ' ']) {
+            let k = part.trim().to_lowercase();
+            if k.is_empty() {
+                continue;
+            }
+            match k.as_str() {
+                "ctrl" | "control" => has_ctrl = true,
+                "alt" | "opt" | "option" => has_alt = true,
+                "shift" => has_shift = true,
+                "super" | "cmd" | "command" | "win" | "windows" | "meta" => has_super = true,
+                other => base_keys.push(other.to_string()),
+            }
+        }
+    }
+
+    // 1. Standalone dangerous keys
+    if !has_ctrl && !has_alt && !has_shift && !has_super {
+        for b in &base_keys {
+            match b.as_str() {
+                "delete" | "del" => return Some("Delete character / selection"),
+                "backspace" => return Some("Backspace deletion"),
+                _ => {}
+            }
+        }
+    }
+
+    // 2. High impact combinations
+    for b in &base_keys {
+        let base = b.as_str();
+
+        // Close window / tab: Alt+F4, Ctrl+W, Cmd+W, Ctrl+Q, Cmd+Q
+        if has_alt && base == "f4" {
+            return Some("Close active application window (Alt+F4)");
+        }
+        if (has_ctrl || has_super) && base == "w" {
+            return Some("Close active tab or window (Ctrl/Cmd+W)");
+        }
+        if (has_ctrl || has_super) && base == "q" {
+            return Some("Quit active application (Ctrl/Cmd+Q)");
+        }
+
+        // Force quit / Task Manager / System Interruption
+        if has_ctrl && has_alt && (base == "delete" || base == "del") {
+            return Some("System security / task manager interrupt (Ctrl+Alt+Del)");
+        }
+        if has_super && has_alt && (base == "escape" || base == "esc") {
+            return Some("Force quit application menu (Cmd+Opt+Esc)");
+        }
+        if has_ctrl && has_shift && (base == "escape" || base == "esc") {
+            return Some("Launch task manager (Ctrl+Shift+Esc)");
+        }
+        if has_ctrl && has_alt && base == "backspace" {
+            return Some("Restart display server / kill session (Ctrl+Alt+Backspace)");
+        }
+
+        // Destructive / permanent file deletion
+        if (has_shift || has_super) && (base == "delete" || base == "del" || base == "backspace") {
+            return Some("Permanent deletion bypassing trash (Shift/Cmd+Delete)");
+        }
+
+        // Terminal interrupts & control signals
+        if has_ctrl {
+            match base {
+                "c" => return Some("Terminal interrupt signal (SIGINT)"),
+                "d" => return Some("Terminal EOF / logout signal"),
+                "z" => return Some("Terminal job suspend signal (SIGTSTP)"),
+                "\\" | "backslash" => return Some("Terminal process quit signal (SIGQUIT)"),
+                "t" if has_alt => return Some("Spawn terminal emulator (Ctrl+Alt+T)"),
+                _ => {}
+            }
+        }
+
+        // Bulk selection
+        if (has_ctrl || has_super) && base == "a" {
+            return Some("Bulk select all content (Ctrl/Cmd+A)");
+        }
+    }
+
+    // 3. Conservative handling of unknown modifier shortcuts in ConfirmDestructive mode
+    if has_ctrl || has_alt || has_super {
+        for b in &base_keys {
+            let is_navigation = matches!(
+                b.as_str(),
+                "up" | "down"
+                    | "left"
+                    | "right"
+                    | "pageup"
+                    | "pagedown"
+                    | "home"
+                    | "end"
+                    | "tab"
+                    | "return"
+                    | "enter"
+                    | "space"
+            );
+            if !is_navigation {
+                return Some("Potentially consequential or destructive keyboard shortcut");
+            }
+        }
+    }
+
+    None
+}
+
 pub struct AuthorizationEngine;
 
 impl AuthorizationEngine {
@@ -2685,161 +2971,184 @@ impl AuthorizationEngine {
         policy: &GovernancePolicy,
         args: &serde_json::Value,
     ) -> AuthDecision {
+        let action = NormalizedComputerAction::parse(args);
+
+        // Unknown computer action types fail closed immediately
+        if let NormalizedComputerAction::Unknown { ref raw } = action {
+            return AuthDecision::Deny {
+                reason: format!("Unrecognized or malformed computer action: '{}'", raw),
+            };
+        }
+
+        // If policy mode is AskAlways, all computer use requires approval
         if policy.computer_use_mode == "AskAlways" {
             return AuthDecision::RequireApproval {
                 reason:
                     "Computer-use policy 'AskAlways' requires confirmation for all UI automation"
                         .to_string(),
                 risk: RiskLevel::Moderate,
-                summary: format!("Perform desktop action: {:?}", args["action"]),
+                summary: match &action {
+                    NormalizedComputerAction::MouseMove { x, y } => {
+                        format!("Move pointer to ({}, {})", x, y)
+                    }
+                    NormalizedComputerAction::LeftClick { x, y, .. } => {
+                        format!("Click at ({:?}, {:?})", x, y)
+                    }
+                    NormalizedComputerAction::RightClick { x, y, .. } => {
+                        format!("Right click at ({:?}, {:?})", x, y)
+                    }
+                    NormalizedComputerAction::DoubleClick { x, y, .. } => {
+                        format!("Double click at ({:?}, {:?})", x, y)
+                    }
+                    NormalizedComputerAction::LeftClickDrag { x, y } => {
+                        format!("Drag to ({}, {})", x, y)
+                    }
+                    NormalizedComputerAction::Type { text } => {
+                        format!("Type text (length: {})", text.len())
+                    }
+                    NormalizedComputerAction::Key { text } => format!("Press key '{}'", text),
+                    NormalizedComputerAction::Hotkey { keys } => {
+                        format!("Press shortcut '{}'", keys.join("+"))
+                    }
+                    NormalizedComputerAction::Wait { ms } => format!("Wait {}ms", ms),
+                    NormalizedComputerAction::Unknown { raw } => {
+                        format!("Perform action '{}'", raw)
+                    }
+                },
             };
         }
 
-        // Normalise the two argument shapes in production:
-        //  * loop-engine tool calls: {"action": "left_click", "x", "y", "text"}
-        //  * perform_computer_action enum: {"LeftClick": {"x", "y"}}
-        // (Bug 10: pointer actions must participate in the risk classification
-        // exactly like keyboard actions do.)
-        let action_str = if let Some(a) = args["action"].as_str() {
-            a.to_string()
-        } else {
-            args.as_object()
-                .and_then(|o| o.keys().next().cloned())
-                .unwrap_or_default()
-                .to_lowercase()
-        };
+        // Password / credential detection for typing
+        if policy.require_takeover_for_credentials {
+            if let NormalizedComputerAction::Type { ref text } = action {
+                if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(text) {
+                    return AuthDecision::RequireTakeover { reason };
+                }
+            }
+        }
 
-        let (x, y, text) = if let Some(body) = args
-            .as_object()
-            .and_then(|o| o.values().next().filter(|v| v.is_object()))
-        {
-            (
-                body.get("x").and_then(|v| v.as_i64()),
-                body.get("y").and_then(|v| v.as_i64()),
-                body.get("text").and_then(|v| v.as_str()).unwrap_or(""),
-            )
-        } else {
-            (
-                args["x"].as_i64(),
-                args["y"].as_i64(),
-                args["text"].as_str().unwrap_or(""),
-            )
-        };
-
-        let pointer_action = matches!(
-            action_str.as_str(),
-            "leftclick"
-                | "left_click"
-                | "rightclick"
-                | "right_click"
-                | "doubleclick"
-                | "double_click"
-                | "mouse_move"
-                | "mousemove"
-                | "leftclickdrag"
-                | "left_click_drag"
-        );
-
+        // ConfirmDestructive mode checks
         if policy.computer_use_mode == "ConfirmDestructive" {
-            let destructive_keys = ["alt+f4", "ctrl+w", "ctrl+q", "delete", "backspace"];
-            if destructive_keys
-                .iter()
-                .any(|k| text.to_lowercase().contains(k))
-            {
-                return AuthDecision::RequireApproval {
-                    reason: format!(
-                        "Destructive keystroke '{}' requires user confirmation",
-                        text
-                    ),
-                    risk: RiskLevel::Moderate,
-                    summary: format!("Send keystroke: '{}'", text),
-                };
+            // Check hotkeys
+            if let NormalizedComputerAction::Hotkey { ref keys } = action {
+                if let Some(impact) = classify_destructive_hotkey(keys) {
+                    let shortcut = keys.join("+");
+                    return AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Destructive shortcut '{}' requires user confirmation ({})",
+                            shortcut, impact
+                        ),
+                        risk: RiskLevel::Destructive,
+                        summary: format!("Execute shortcut: {}", shortcut),
+                    };
+                }
             }
 
-            // Mouse actions target raw screen coordinates; the engine cannot
-            // resolve which control sits under the pointer from the tool
-            // arguments alone, so a pointer action is a potential destructive
-            // action and requires the checkpoint (Bug 10).
-            if pointer_action {
-                if args.get("mark_id").map(|v| !v.is_null()).unwrap_or(false)
-                    || args.get("markId").map(|v| !v.is_null()).unwrap_or(false)
-                {
-                    // Grounded targets: classify with the trusted mark label.
-                    let mark_id = args
-                        .get("mark_id")
-                        .and_then(|v| v.as_u64())
-                        .or_else(|| args.get("markId").and_then(|v| v.as_u64()))
-                        .unwrap_or(0);
-                    let sem = crate::grounding::SetOfMarksEngine::resolve_mark_semantics(
-                        mark_id.try_into().unwrap_or(usize::MAX),
-                    );
-                    match sem {
-                        Some(s) if !s.label.is_empty() => {
-                            if is_consequential_control_text(&s.combined) {
+            // Check single keys
+            if let NormalizedComputerAction::Key { ref text } = action {
+                if let Some(impact) = classify_destructive_hotkey(std::slice::from_ref(text)) {
+                    return AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Destructive key '{}' requires user confirmation ({})",
+                            text, impact
+                        ),
+                        risk: RiskLevel::Destructive,
+                        summary: format!("Press key: '{}'", text),
+                    };
+                }
+            }
+
+            // Pointer actions
+            if crate::ghost::GhostDisplayManager::is_enabled() {
+                return AuthDecision::Allow;
+            }
+
+            match &action {
+                NormalizedComputerAction::LeftClick { x, y, mark_id }
+                | NormalizedComputerAction::RightClick { x, y, mark_id }
+                | NormalizedComputerAction::DoubleClick { x, y, mark_id } => {
+                    if let Some(mid) = mark_id {
+                        let sem = crate::grounding::SetOfMarksEngine::resolve_mark_semantics(
+                            (*mid).try_into().unwrap_or(usize::MAX),
+                        );
+                        match sem {
+                            Some(s) if !s.label.is_empty() => {
+                                if is_consequential_control_text(&s.combined) {
+                                    return AuthDecision::RequireApproval {
+                                        reason: format!(
+                                            "The marked element '{}' may perform a consequential action; a human checkpoint is required",
+                                            s.combined
+                                        ),
+                                        risk: RiskLevel::Moderate,
+                                        summary: format!("Click marked element: {}", s.combined),
+                                    };
+                                }
+                                return AuthDecision::Allow;
+                            }
+                            Some(_) | None => {
                                 return AuthDecision::RequireApproval {
                                     reason: format!(
-                                        "The marked element '{}' may perform a consequential action; a human checkpoint is required",
-                                        s.combined
+                                        "Mark #{} target cannot be classified with a trusted semantic label",
+                                        mid
                                     ),
                                     risk: RiskLevel::Moderate,
-                                    summary: format!("Click marked element: {}", s.combined),
+                                    summary: format!("Click unclassified tag #{}", mid),
                                 };
                             }
-                            return AuthDecision::Allow;
-                        }
-                        // A mark without a readable label is unclassifiable.
-                        Some(_) => {
-                            return AuthDecision::RequireApproval {
-                                reason: format!(
-                                    "Mark #{} has no trusted semantic label in the active grounded session; the click target cannot be classified",
-                                    mark_id
-                                ),
-                                risk: RiskLevel::Moderate,
-                                summary: format!("Click unclassified Set-of-Marks tag #{}", mark_id),
-                            };
-                        }
-                        // No session / unknown mark: coordinates would be
-                        // unverifiable here, so a checkpoint is required.
-                        None => {
-                            return AuthDecision::RequireApproval {
-                                reason: format!(
-                                    "Mark #{} does not exist in the active grounded session; the click target cannot be verified",
-                                    mark_id
-                                ),
-                                risk: RiskLevel::Moderate,
-                                summary: format!("Click unclassified Set-of-Marks tag #{}", mark_id),
-                            };
                         }
                     }
+
+                    // Raw screen coordinates
+                    let act_name = match &action {
+                        NormalizedComputerAction::LeftClick { .. } => "left_click",
+                        NormalizedComputerAction::RightClick { .. } => "right_click",
+                        _ => "double_click",
+                    };
+                    return AuthDecision::RequireApproval {
+                        reason: format!(
+                            "Pointer action '{}' targets raw screen coordinates that cannot be classified, so it may be destructive and requires confirmation",
+                            act_name
+                        ),
+                        risk: RiskLevel::Moderate,
+                        summary: format!(
+                            "Perform pointer action '{}'{}",
+                            act_name,
+                            match (x, y) {
+                                (Some(px), Some(py)) => format!(" at ({},{})", px, py),
+                                _ => String::new(),
+                            }
+                        ),
+                    };
                 }
-
-                return AuthDecision::RequireApproval {
-                    reason: format!(
-                        "Pointer action '{}' targets screen coordinates that cannot be classified, so it may be destructive and requires confirmation",
-                        action_str
-                    ),
-                    risk: RiskLevel::Moderate,
-                    summary: format!(
-                        "Perform pointer action '{}'{}",
-                        action_str,
-                        match (x, y) {
-                            (Some(px), Some(py)) =>
-                                format!(" at ({},{})", px, py),
-                            _ => String::new(),
-                        }
-                    ),
-                };
+                NormalizedComputerAction::LeftClickDrag { x, y } => {
+                    return AuthDecision::RequireApproval {
+                        reason: "Pointer action 'drag' targets raw screen coordinates that cannot be classified, so it may be destructive and requires confirmation"
+                            .to_string(),
+                        risk: RiskLevel::Moderate,
+                        summary: format!("Perform pointer drag to ({},{})", x, y),
+                    };
+                }
+                _ => {}
             }
         }
 
-        // Password detection in typed text
-        if policy.require_takeover_for_credentials && action_str == "type" {
-            if let Some(reason) = TakeoverController::detect_sensitive_checkpoint(text) {
-                return AuthDecision::RequireTakeover { reason };
-            }
+        // FullAutonomous mode: allow safe actions (after credential check above)
+        if policy.computer_use_mode == "FullAutonomous" {
+            return AuthDecision::Allow;
         }
 
-        AuthDecision::Allow
+        // Unrecognized policy mode: fail closed!
+        AuthDecision::RequireApproval {
+            reason: format!(
+                "Unrecognized computer_use_mode '{}' failed closed to require approval",
+                policy.computer_use_mode
+            ),
+            risk: RiskLevel::Moderate,
+            summary: format!(
+                "Perform desktop action gated by unrecognized policy mode '{}'",
+                policy.computer_use_mode
+            ),
+        }
     }
 
     /// Shared browser click classification used by both the production

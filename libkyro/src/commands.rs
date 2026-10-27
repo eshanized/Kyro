@@ -14,7 +14,7 @@ use crate::computer_use::{
 use crate::connector::{
     ConnectedAccountSummary, ConnectorCatalogItem, ConnectorManager, OAuthFlowInit,
 };
-use crate::execution::{PermissionDecision, PermissionGate, PtySession};
+use crate::execution::{PermissionDecision, PermissionGate, PtySession, RiskLevel};
 use crate::ghost::{GhostDisplayManager, GhostStatus};
 use crate::governance::{GovernancePolicy, PolicyEngine, TakeoverController, TakeoverStatus};
 use crate::grounding::{GroundedScreenResult, SetOfMarksEngine};
@@ -263,6 +263,7 @@ pub fn take_region_screenshot(
 pub fn perform_computer_action(
     state: State<'_, AppState>,
     action: ComputerAction,
+    approval_id: Option<String>,
 ) -> Result<(), String> {
     let policy = crate::governance::PolicyEngine::load(&state.db);
     let act_val = serde_json::to_value(&action).unwrap_or_default();
@@ -270,8 +271,51 @@ pub fn perform_computer_action(
         crate::governance::AuthorizationEngine::evaluate_computer_action(&policy, &act_val);
     match decision {
         crate::governance::AuthDecision::Allow => {}
-        crate::governance::AuthDecision::RequireApproval { reason, .. } => {
-            return Err(format!("Computer action requires approval: {}", reason));
+        crate::governance::AuthDecision::RequireApproval {
+            reason,
+            risk,
+            summary,
+        } => {
+            if let Some(ref app_id) = approval_id {
+                let now = chrono::Utc::now().timestamp_millis();
+                state
+                    .db
+                    .consume_approval_request_bound(
+                        app_id,
+                        "direct_ipc",
+                        &["perform_computer_action", "computer_action"],
+                        &act_val,
+                        now,
+                    )
+                    .map_err(|e| format!("Computer action approval verification failed: {}", e))?;
+            } else {
+                let now = chrono::Utc::now().timestamp_millis();
+                let req_id = format!("appr_{}", uuid::Uuid::new_v4());
+                let req = crate::storage::ApprovalRequest {
+                    id: req_id.clone(),
+                    run_id: "direct_ipc".to_string(),
+                    tool_name: "perform_computer_action".to_string(),
+                    summary,
+                    args_json: act_val.to_string(),
+                    risk_level: match risk {
+                        RiskLevel::Safe => "safe",
+                        RiskLevel::Moderate => "moderate",
+                        RiskLevel::Destructive => "destructive",
+                    }
+                    .to_string(),
+                    reason: reason.clone(),
+                    status: "pending".to_string(),
+                    created_at: now,
+                    expires_at: now + 300_000,
+                    resolved_at: None,
+                    resolved_by: None,
+                };
+                let _ = state.db.create_approval_request(&req);
+                return Err(format!(
+                    "Computer action requires approval (request id: {}): {}",
+                    req_id, reason
+                ));
+            }
         }
         crate::governance::AuthDecision::RequireTakeover { reason } => {
             crate::governance::TakeoverController::request(&reason);
@@ -314,8 +358,18 @@ pub fn abort_computer_use() {
 
 // Security, Approvals & Sandboxing
 #[tauri::command]
-pub fn check_command_permission(cmd: String, auto_approve: bool) -> PermissionDecision {
-    PermissionGate::assess_command(&cmd, auto_approve)
+pub fn check_command_permission(
+    state: State<'_, AppState>,
+    cmd: String,
+    auto_approve: bool,
+) -> PermissionDecision {
+    let policy = crate::governance::PolicyEngine::load(&state.db);
+    let effective_auto_approve = if policy.shell_mode == "SafeAutoApprove" {
+        auto_approve
+    } else {
+        false
+    };
+    PermissionGate::assess_command(&cmd, effective_auto_approve)
 }
 
 #[tauri::command]
@@ -1347,9 +1401,18 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
             // overwrite a terminal state that a racing cancellation already
             // confirmed. If the CAS is refused, the run's actual repository
             // state wins and the caller must see the truthful outcome.
+            let final_outcome = state
+                .db
+                .get_run_outcome_from_events(&effective_run_id)
+                .unwrap_or_else(|_| "succeeded".to_string());
+
+            // Compare-and-set finalization: a stale completion can never
+            // overwrite a terminal state that a racing cancellation already
+            // confirmed. If the CAS is refused, the run's actual repository
+            // state wins and the caller must see the truthful outcome.
             if let Err(e) = state.db.update_run_status(
                 &effective_run_id,
-                "succeeded",
+                &final_outcome,
                 None,
                 Some(completed_time),
                 None,
@@ -1400,7 +1463,12 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
                     .unwrap_or_default();
                 if matches!(
                     db_status.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "completed" | "interrupted"
+                    "succeeded"
+                        | "failed"
+                        | "uncertain"
+                        | "cancelled"
+                        | "completed"
+                        | "interrupted"
                 ) {
                     // The run already reached a confirmed terminal state; that
                     // state stays authoritative.

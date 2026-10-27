@@ -105,6 +105,57 @@ export const getModelDisplayInfo = (modelId?: string | null) => {
   return { label: name.slice(0, 20), badge: parts[0]?.slice(0, 8) || "LLM", isNvidia: mid.startsWith("nvidia/") };
 };
 
+export function redactSensitiveFields(val: any): any {
+  if (val === null || val === undefined) return val;
+  if (typeof val === "string") return val;
+  if (Array.isArray(val)) return val.map(redactSensitiveFields);
+  if (typeof val === "object") {
+    const res: Record<string, any> = {};
+    const SENSITIVE_KEY_REGEX = /pass(word)?|token|secret|api[_-]?key|auth|bearer|credential/i;
+    for (const [k, v] of Object.entries(val)) {
+      if (SENSITIVE_KEY_REGEX.test(k) && typeof v === "string") {
+        res[k] = "[REDACTED]";
+      } else {
+        res[k] = redactSensitiveFields(v);
+      }
+    }
+    return res;
+  }
+  return val;
+}
+
+export function parseApprovalArgs(argsJson: string): {
+  parsed: Record<string, any> | null;
+  targetDetail: string | null;
+  formattedRedacted: string;
+} {
+  try {
+    const obj = JSON.parse(argsJson);
+    if (obj && typeof obj === "object") {
+      let target: string | null = null;
+      if (obj.command) target = `Command: ${obj.command}`;
+      else if (obj.path) target = `File: ${obj.path}`;
+      else if (obj.url) target = `URL: ${obj.url}`;
+      else if (obj.action) target = `Action: ${obj.action}${obj.x !== undefined ? ` at (${obj.x}, ${obj.y})` : ""}`;
+      else if (obj.keys) target = `Keys: ${Array.isArray(obj.keys) ? obj.keys.join("+") : obj.keys}`;
+
+      const redacted = redactSensitiveFields(obj);
+      return {
+        parsed: obj,
+        targetDetail: target,
+        formattedRedacted: JSON.stringify(redacted, null, 2),
+      };
+    }
+  } catch {
+    // not valid JSON
+  }
+  return {
+    parsed: null,
+    targetDetail: null,
+    formattedRedacted: argsJson,
+  };
+}
+
 export const App: React.FC = () => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
@@ -228,6 +279,8 @@ export const App: React.FC = () => {
   } | null>(null);
   const [allProfiles, setAllProfiles] = useState<AgentProfileRecord[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequest[]>([]);
+  const [expandedApprovalIds, setExpandedApprovalIds] = useState<Record<string, boolean>>({});
+  const [showRawArgs, setShowRawArgs] = useState<Record<string, boolean>>({});
   /**
    * Live step events, grouped by the run that produced them.
    *
@@ -396,8 +449,10 @@ export const App: React.FC = () => {
         let inspectionFailed = false;
         let actionRan = false;
         let actionFailed = false;
+        let actionUncertain = false;
         let verificationPassed = false;
         let verificationFailed = false;
+        let verificationUncertain = false;
         let verificationEvidence: string | null = null;
 
         // Decisive failure markers in an action's stdout/stderr; coarse words
@@ -409,6 +464,21 @@ export const App: React.FC = () => {
           const commandArg = findCallCommand(res);
           const isVerification = isVerificationToolName(res.name, commandArg);
           const isInspection = !isVerification && isInspectionToolName(res.name);
+
+          const isToolUncertain = (() => {
+            if (!res.output || typeof res.output !== "string") return false;
+            try {
+              const parsed = JSON.parse(res.output);
+              if (parsed.status === "uncertain" || parsed.verification?.status === "uncertain") {
+                return true;
+              }
+            } catch {
+              if (res.output.includes('"status": "uncertain"') || res.output.includes('"status":"uncertain"')) {
+                return true;
+              }
+            }
+            return false;
+          })();
 
           if (isVerification) {
             // Executing a verification tool IS an accomplished, factual
@@ -422,6 +492,9 @@ export const App: React.FC = () => {
             if (res.is_error || outcome.failed) {
               verificationFailed = true;
               verificationEvidence = outcome.reason;
+            } else if (outcome.uncertain || isToolUncertain) {
+              verificationUncertain = true;
+              verificationEvidence = outcome.reason || "Verification outcome inconclusive (uncertain)";
             } else if (outcome.verified) {
               verificationPassed = true;
               verificationEvidence = outcome.reason;
@@ -445,6 +518,15 @@ export const App: React.FC = () => {
               : `${res.name} reported failure: ${res.output.slice(0, 80)}`;
             if (!newRemaining.includes(errSummary)) {
               newRemaining.push(errSummary);
+            }
+            continue;
+          }
+
+          if (isToolUncertain) {
+            actionUncertain = true;
+            const uncSummary = `${res.name} completed with uncertain postcondition`;
+            if (!newRemaining.includes(uncSummary)) {
+              newRemaining.push(uncSummary);
             }
             continue;
           }
@@ -490,6 +572,14 @@ export const App: React.FC = () => {
                   evidence: "Execution failure observed",
                 };
               }
+              if (actionUncertain) {
+                return {
+                  ...st,
+                  status: "uncertain" as const,
+                  done: false,
+                  evidence: "Action completed but outcome is uncertain (inconclusive postcondition)",
+                };
+              }
               if (actionRan) {
                 return {
                   ...st,
@@ -502,20 +592,28 @@ export const App: React.FC = () => {
             }
             if (st.id === "step_verify") {
               if (st.status === "completed" || st.status === "failed") return st;
-              if (verificationPassed) {
-                return {
-                  ...st,
-                  status: "completed" as const,
-                  done: true,
-                  evidence: verificationEvidence || "Verification check passed",
-                };
-              }
               if (verificationFailed) {
                 return {
                   ...st,
                   status: "failed" as const,
                   done: false,
                   evidence: verificationEvidence || "Verification did not pass",
+                };
+              }
+              if (verificationUncertain) {
+                return {
+                  ...st,
+                  status: "uncertain" as const,
+                  done: false,
+                  evidence: verificationEvidence || "Verification check inconclusive (uncertain)",
+                };
+              }
+              if (verificationPassed) {
+                return {
+                  ...st,
+                  status: "completed" as const,
+                  done: true,
+                  evidence: verificationEvidence || "Verification check passed",
                 };
               }
               return st;
@@ -920,6 +1018,29 @@ export const App: React.FC = () => {
       setPendingApprovals((prev) => prev.filter((a) => a.id !== id));
     } catch (err) {
       console.error("Failed to resolve approval:", err);
+    }
+  };
+
+  const handleCancelTaskForApproval = async (approvalId: string, runId: string) => {
+    try {
+      await handleResolveApproval(approvalId, "denied");
+      await invoke("cancel_agent_run", { runId }).catch(console.error);
+      await invoke("abort_computer_use").catch(console.error);
+      setActivePlan((prev) =>
+        prev && prev.runId === runId
+          ? {
+              ...prev,
+              status: "cancelled" as const,
+              steps: prev.steps.map((s) =>
+                s.status === "running" ? { ...s, status: "failed" as const, done: false, evidence: "Cancelled" } : s
+              ),
+              remaining: ["Task cancelled from approval banner"],
+            }
+          : prev
+      );
+      setNotice({ tone: "info", message: "Action denied and task was cancelled." });
+    } catch (err) {
+      console.error("Failed to cancel task from approval:", err);
     }
   };
 
@@ -1330,8 +1451,11 @@ export const App: React.FC = () => {
           const isVerified =
             prev.steps.find((s) => s.id === "step_verify")?.status === "completed";
           const hasFailedStep = prev.steps.some((s) => s.status === "failed");
+          const hasUncertainStep = prev.steps.some((s) => s.status === "uncertain");
           const finalStatus: TaskPlan["status"] = (hasFailedStep || !hasValidReply)
             ? (hasValidReply && !hasFailedStep ? (isVerified ? "completed" : "unverified") : "failed")
+            : hasUncertainStep
+            ? "uncertain"
             : isVerified
             ? "completed"
             : "unverified";
@@ -1340,7 +1464,10 @@ export const App: React.FC = () => {
           if (!hasValidReply && !remainingNotes.some((n) => n.includes("No response generated"))) {
             remainingNotes.push("No response was generated by the model");
           }
-          if (!isVerified && !hasFailedStep && hasValidReply && !remainingNotes.some((n) => n.toLowerCase().includes("verification"))) {
+          if (hasUncertainStep && !remainingNotes.some((n) => n.toLowerCase().includes("uncertain"))) {
+            remainingNotes.push("One or more tool outcomes were inconclusive (uncertain postcondition)");
+          }
+          if (!isVerified && !hasFailedStep && !hasUncertainStep && hasValidReply && !remainingNotes.some((n) => n.toLowerCase().includes("verification"))) {
             remainingNotes.push("Explicit verification check not executed");
           }
 
@@ -2002,56 +2129,171 @@ export const App: React.FC = () => {
 
         {/* Actionable Governance Approval Queue Banner */}
         {pendingApprovals.length > 0 && (
-          <div className="px-6 py-3 bg-[#111111] border-b border-neutral-800 space-y-2">
-            {pendingApprovals.map((req) => (
-              <div
-                key={req.id}
-                className="flex items-center justify-between bg-[#161616] p-3 rounded-xl border border-neutral-700 text-xs"
-              >
-                <div className="flex items-center gap-3 min-w-0 pr-4">
-                  <ShieldAlert className="w-5 h-5 text-neutral-300 flex-shrink-0 animate-pulse" />
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold text-neutral-100">Tool Approval Required:</span>
-                      <span
-                        className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase font-bold ${
-                          req.risk_level === "destructive"
-                            ? "bg-red-950/60 text-red-300 border border-red-800/60"
-                            : req.risk_level === "moderate"
-                            ? "bg-amber-950/60 text-amber-300 border border-amber-800/60"
-                            : "bg-neutral-800 text-neutral-300 border border-neutral-700"
+          <div className="px-6 py-3 bg-[#111111] border-b border-neutral-800 space-y-3" data-testid="approval-queue-banner">
+            <div className="flex items-center justify-between text-xs font-semibold text-neutral-300">
+              <span className="flex items-center gap-1.5">
+                <ShieldAlert className="w-4 h-4 text-amber-400" />
+                Action Authorization Required ({pendingApprovals.length} pending)
+              </span>
+              <span className="text-[10px] text-neutral-400 font-normal">
+                Consequential operations paused until approved or denied
+              </span>
+            </div>
+            {pendingApprovals.map((req) => {
+              const details = parseApprovalArgs(req.args_json);
+              const isExpanded = !!expandedApprovalIds[req.id];
+              const isRaw = !!showRawArgs[req.id];
+              const isDestructive = req.risk_level === "destructive";
+              const nowSec = Math.floor(Date.now() / 1000);
+              const expiresAtSec = req.expires_at > 1e11 ? Math.floor(req.expires_at / 1000) : req.expires_at;
+              const isExpired = expiresAtSec > 0 && nowSec > expiresAtSec;
+
+              return (
+                <div
+                  key={req.id}
+                  data-testid="approval-card"
+                  className="bg-[#161616] p-3.5 rounded-xl border border-neutral-700/80 text-xs shadow-md space-y-2.5"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex items-start gap-3 min-w-0 flex-1">
+                      <ShieldAlert
+                        className={`w-5 h-5 flex-shrink-0 mt-0.5 ${
+                          isDestructive ? "text-red-400 animate-pulse" : "text-amber-400"
                         }`}
-                      >
-                        {req.risk_level} Risk
-                      </span>
-                      <span className="font-mono text-neutral-200 text-[11px]">
-                        {req.tool_name}
-                      </span>
+                      />
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-semibold text-neutral-100">Tool Approval Required:</span>
+                          <span
+                            className={`px-2 py-0.5 rounded font-mono text-[10px] uppercase font-bold ${
+                              isDestructive
+                                ? "bg-red-950/70 text-red-300 border border-red-800/80"
+                                : req.risk_level === "moderate"
+                                ? "bg-amber-950/70 text-amber-300 border border-amber-800/80"
+                                : "bg-neutral-800 text-neutral-300 border border-neutral-700"
+                            }`}
+                          >
+                            {req.risk_level} Risk
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase ${
+                              isDestructive
+                                ? "bg-red-900/30 text-red-400 border border-red-800/40"
+                                : "bg-neutral-800 text-neutral-400 border border-neutral-700"
+                            }`}
+                          >
+                            {isDestructive ? "Irreversible" : "Reversible"}
+                          </span>
+                          <span className="font-mono text-neutral-200 text-[11px] font-semibold bg-black/40 px-2 py-0.5 rounded border border-neutral-800">
+                            {req.tool_name}
+                          </span>
+                          {isExpired && (
+                            <span className="px-2 py-0.5 rounded font-mono text-[10px] bg-red-950 text-red-400 border border-red-800">
+                              EXPIRED
+                            </span>
+                          )}
+                        </div>
+
+                        {details.targetDetail && (
+                          <div className="font-mono text-[11px] text-amber-200 bg-neutral-900/90 px-2 py-1 rounded border border-neutral-800 break-all select-text">
+                            {details.targetDetail}
+                          </div>
+                        )}
+
+                        <p className="text-neutral-300 text-[11px] break-words select-text">
+                          {req.summary}
+                        </p>
+
+                        {req.reason && (
+                          <p className="text-neutral-400 text-[10px] italic">
+                            Policy: {req.reason}
+                          </p>
+                        )}
+                      </div>
                     </div>
-                    <p className="text-neutral-300 text-[11px] truncate mt-0.5">{req.summary}</p>
-                    {req.reason && (
-                      <p className="text-neutral-400 text-[10px] italic mt-0.5">
-                        Policy: {req.reason}
-                      </p>
-                    )}
+
+                    {/* Action buttons */}
+                    <div className="flex flex-col sm:flex-row items-end sm:items-center gap-2 flex-shrink-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedApprovalIds((prev) => ({
+                            ...prev,
+                            [req.id]: !prev[req.id],
+                          }))
+                        }
+                        className="px-2.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 text-[11px] font-medium transition"
+                        aria-label="Inspect arguments"
+                      >
+                        {isExpanded ? "Hide Arguments" : "Inspect Arguments"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleResolveApproval(req.id, "approved")}
+                        disabled={isExpired}
+                        className="px-3 py-1.5 rounded-lg bg-white hover:bg-neutral-100 disabled:opacity-40 text-neutral-950 font-semibold text-xs flex items-center gap-1 shadow-sm transition"
+                      >
+                        <CheckCircle className="w-3.5 h-3.5" /> Approve
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleResolveApproval(req.id, "denied")}
+                        className="px-3 py-1.5 rounded-lg bg-neutral-850 hover:bg-neutral-800 text-neutral-200 border border-neutral-700 font-medium text-xs flex items-center gap-1 transition"
+                      >
+                        <XCircle className="w-3.5 h-3.5" /> Deny
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleCancelTaskForApproval(req.id, req.run_id)}
+                        className="px-3 py-1.5 rounded-lg bg-red-950/40 hover:bg-red-900/60 text-red-300 border border-red-800/50 font-medium text-xs flex items-center gap-1 transition"
+                      >
+                        <X className="w-3.5 h-3.5" /> Cancel Task
+                      </button>
+                    </div>
                   </div>
+
+                  {/* Expanded Inspection view */}
+                  {isExpanded && (
+                    <div className="pt-2 border-t border-neutral-800/80 space-y-2">
+                      <div className="flex items-center justify-between text-[10px] text-neutral-400">
+                        <span>Exact Payload Arguments:</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setShowRawArgs((prev) => ({
+                                ...prev,
+                                [req.id]: !prev[req.id],
+                              }))
+                            }
+                            className="text-neutral-400 hover:text-neutral-200 underline cursor-pointer"
+                          >
+                            {isRaw ? "Show Redacted" : "Show Raw JSON"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(
+                                  isRaw ? req.args_json : details.formattedRedacted
+                                );
+                                setNotice({ tone: "success", message: "Arguments copied to clipboard" });
+                              } catch {}
+                            }}
+                            className="text-neutral-400 hover:text-neutral-200 underline cursor-pointer"
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="p-2.5 bg-black rounded-lg border border-neutral-800 text-neutral-300 overflow-x-auto max-h-48 font-mono text-[11px] leading-relaxed select-text whitespace-pre-wrap break-all m-0">
+                        {isRaw ? req.args_json : details.formattedRedacted}
+                      </pre>
+                    </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-2 flex-shrink-0">
-                  <button
-                    onClick={() => handleResolveApproval(req.id, "approved")}
-                    className="px-3 py-1.5 rounded-lg bg-neutral-100 hover:bg-white text-neutral-950 font-medium text-xs flex items-center gap-1 shadow-sm transition"
-                  >
-                    <CheckCircle className="w-3.5 h-3.5" /> Approve
-                  </button>
-                  <button
-                    onClick={() => handleResolveApproval(req.id, "denied")}
-                    className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 font-medium text-xs flex items-center gap-1 transition"
-                  >
-                    <XCircle className="w-3.5 h-3.5" /> Deny
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 

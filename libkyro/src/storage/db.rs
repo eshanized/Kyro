@@ -111,6 +111,7 @@ pub enum RunStatus {
     WaitingApproval,
     Succeeded,
     Failed,
+    Uncertain,
     Cancelled,
     Interrupted,
 }
@@ -123,6 +124,7 @@ impl RunStatus {
             RunStatus::WaitingApproval => "waiting_approval",
             RunStatus::Succeeded => "succeeded",
             RunStatus::Failed => "failed",
+            RunStatus::Uncertain => "uncertain",
             RunStatus::Cancelled => "cancelled",
             RunStatus::Interrupted => "interrupted",
         }
@@ -139,6 +141,7 @@ impl std::str::FromStr for RunStatus {
             "waiting_approval" => RunStatus::WaitingApproval,
             "succeeded" => RunStatus::Succeeded,
             "failed" => RunStatus::Failed,
+            "uncertain" => RunStatus::Uncertain,
             "cancelled" => RunStatus::Cancelled,
             _ => RunStatus::Interrupted,
         })
@@ -1322,6 +1325,7 @@ impl Database {
             "waiting_approval",
             "succeeded",
             "failed",
+            "uncertain",
             "cancelled",
             "interrupted",
             "completed",
@@ -1374,7 +1378,7 @@ impl Database {
             "waiting_approval" => &["running", "queued"],
             // Finalization is only legal from an active state; it can never
             // overwrite another terminal outcome.
-            "succeeded" | "completed" => &["queued", "running"],
+            "succeeded" | "completed" | "uncertain" => &["queued", "running"],
             "failed" => &["queued", "running", "waiting_approval"],
             "cancelled" => &["queued", "running", "waiting_approval"],
             "interrupted" => &["queued", "running", "waiting_approval"],
@@ -1452,6 +1456,48 @@ impl Database {
             params![id, now, reason],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Evaluates the authoritative execution outcome of a run by inspecting its recorded tool events.
+    /// Distinguishes complete success, verification failure, and inconclusive/uncertain actions.
+    pub fn get_run_outcome_from_events(&self, run_id: &str) -> Result<String> {
+        let events = self.get_run_events(run_id, None)?;
+        let mut has_failure = false;
+        let mut has_uncertain = false;
+
+        for evt in events {
+            if evt.event_type == "error" {
+                has_failure = true;
+            } else if evt.event_type == "tool_result" {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evt.payload_json) {
+                    if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        has_failure = true;
+                    }
+                    if let Some(out_str) = v.get("output").and_then(|s| s.as_str()) {
+                        if let Ok(out_json) = serde_json::from_str::<serde_json::Value>(out_str) {
+                            let status = out_json.get("status").and_then(|s| s.as_str());
+                            let ver_status = out_json
+                                .get("verification")
+                                .and_then(|ver| ver.get("status"))
+                                .and_then(|s| s.as_str());
+                            if status == Some("uncertain") || ver_status == Some("uncertain") {
+                                has_uncertain = true;
+                            } else if status == Some("failed") || ver_status == Some("failed") {
+                                has_failure = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_failure {
+            Ok("failed".to_string())
+        } else if has_uncertain {
+            Ok("uncertain".to_string())
+        } else {
+            Ok("succeeded".to_string())
+        }
     }
 
     pub fn get_run(&self, id: &str) -> Result<Option<AgentRun>> {

@@ -90,6 +90,26 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({
     ? evaluateVerificationOutcome(result, toolCall.arguments?.command)
     : null;
 
+  const isUncertain =
+    verification?.uncertain ||
+    (() => {
+      if (!result?.output) return false;
+      try {
+        const parsed = JSON.parse(result.output);
+        if (parsed.status === "uncertain" || parsed.verification?.status === "uncertain") {
+          return true;
+        }
+      } catch {
+        if (
+          result.output.includes('"status": "uncertain"') ||
+          result.output.includes('"status":"uncertain"')
+        ) {
+          return true;
+        }
+      }
+      return false;
+    })();
+
   const resultPreview = result && typeof result.output === "string"
     ? result.output.replace(/[\r\n]+/g, " ").slice(0, 90)
     : "";
@@ -124,6 +144,10 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({
             result.is_error ? (
               <span className="flex items-center gap-1 text-red-400 text-[11px] font-semibold">
                 <AlertTriangle className="w-3.5 h-3.5" /> Failed
+              </span>
+            ) : isUncertain ? (
+              <span className="flex items-center gap-1 text-amber-400 text-[11px] font-semibold">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400" /> Uncertain
               </span>
             ) : verification?.verified ? (
               <span className="flex items-center gap-1 text-green-400 text-[11px] font-semibold">
@@ -210,11 +234,68 @@ export const ToolCallCard: React.FC<ToolCallCardProps> = ({
                 className={`p-2.5 rounded-lg border overflow-x-auto max-h-72 font-mono text-[12px] leading-relaxed select-text m-0 whitespace-pre-wrap break-all ${
                   result.is_error
                     ? "bg-red-950/20 border-red-900/40 text-red-300"
+                    : isUncertain
+                    ? "bg-amber-950/10 border-amber-800/40 text-amber-200"
                     : "bg-[#000000] border-neutral-800 text-neutral-300"
                 }`}
               >
                 {result.output || ""}
               </pre>
+            </div>
+          )}
+
+          {/* Structured Verification Metadata */}
+          {(verification?.attempted || isUncertain) && (
+            <div
+              className={`p-2.5 rounded-lg border text-[11px] ${
+                isUncertain
+                  ? "bg-amber-950/20 border-amber-800/40 text-amber-300"
+                  : verification?.verified
+                  ? "bg-green-950/20 border-green-800/40 text-green-300"
+                  : "bg-red-950/20 border-red-900/40 text-red-300"
+              }`}
+            >
+              <div className="flex items-center gap-1.5 font-semibold text-[11px] mb-1">
+                {isUncertain ? (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Outcome Inconclusive / Uncertain</span>
+                  </>
+                ) : verification?.verified ? (
+                  <>
+                    <ShieldCheck className="w-3.5 h-3.5 text-green-400" />
+                    <span>Postcondition Verified</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
+                    <span>Verification Failed</span>
+                  </>
+                )}
+              </div>
+              {verification?.conditionChecked && (
+                <div className="text-[10px] text-neutral-300 mt-0.5">
+                  <span className="text-neutral-500">Condition: </span>
+                  {verification.conditionChecked}
+                </div>
+              )}
+              {verification?.resource && (
+                <div className="text-[10px] text-neutral-300 mt-0.5">
+                  <span className="text-neutral-500">Resource: </span>
+                  <span className="font-mono">{verification.resource}</span>
+                </div>
+              )}
+              {verification?.reason && verification.conditionChecked && (
+                <div className="text-[10px] text-neutral-400 mt-0.5">
+                  <span className="text-neutral-500">Evidence: </span>
+                  {verification.reason}
+                </div>
+              )}
+              {isUncertain && (
+                <div className="text-[10px] text-amber-400/90 mt-1 italic">
+                  Note: The tool reported success, but visual or state verification was inconclusive. Kyro does not assume this operation succeeded.
+                </div>
+              )}
             </div>
           )}
         </div>

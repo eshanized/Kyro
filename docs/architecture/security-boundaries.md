@@ -131,4 +131,25 @@ The policy engine automatically halts automation, records a high-risk approval/t
 
 - **Task Grant Provenance**: Granted permissions track originating task IDs and cannot be reused across sessions or hijacked by child processes.
 - **Negation Priority**: Deny and negation directives always take priority over affirmative allowances.
-- **Compare-And-Swap (CAS) Status Guards**: Agent run terminal states (`succeeded`, `failed`, `cancelled`, `interrupted`) are immutable and protected against race conditions or late-arriving completion interleave.
+- **Compare-And-Swap (CAS) Status Guards**: Agent run terminal states (`succeeded`, `failed`, `uncertain`, `cancelled`, `interrupted`) are immutable and protected against race conditions or late-arriving completion interleave.
+
+---
+
+## 15. Execution Trust, Outcome Verification & Direct IPC Normalization
+
+- **Truthful Execution Lifecycle**: Operations distinguish action execution from outcome postcondition verification. Run and task states transition across `pending`, `running`, `awaiting_approval`, `succeeded`, `failed`, `uncertain`, and `cancelled`.
+- **Postcondition Verification**:
+  - File writes read back target bytes and verify SHA-256 cryptographic hashes before confirming success.
+  - Shell commands check exit status and expected output tokens; nonzero exits report explicit failure.
+  - Computer use actions monitor visual difference metrics; actions producing negligible screen delta (e.g., `<= 5%`) report `uncertain` rather than false success.
+- **Safe-by-Default Computer Use**:
+  - New installations default to `ConfirmDestructive` instead of `FullAutonomous`.
+  - Unrecognized or corrupted policy values fail closed to `AskAlways` / `ConfirmDestructive`.
+  - Settings migrations preserve returning users' explicit configurations via `CURRENT_POLICY_SCHEMA_VERSION = 1`.
+- **Canonical Action Normalization & Hotkey Classification**:
+  - Direct IPC calls (`perform_computer_action`) and agent tool calls route through a single canonical `NormalizedComputerAction` parser.
+  - Multi-modifier shortcuts (`Ctrl`, `Alt`, `Shift`, `Super`/`Meta`) across Linux, macOS, and Windows are classified truthfully against destructive impact tables.
+- **Single-Use Approval Consumption**:
+  - Pending approval requests are consumed atomically inside a single SQLite transaction with strict parameter and run binding (`consume_approval_request_bound`). Replay attacks and parameter alterations fail closed.
+  - User-facing approval dialogs provide transparent inspections with automatic redaction of sensitive credentials (`token`, `password`, `secret`, `api_key`).
+
