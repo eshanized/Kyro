@@ -105,16 +105,57 @@ export const getModelDisplayInfo = (modelId?: string | null) => {
   return { label: name.slice(0, 20), badge: parts[0]?.slice(0, 8) || "LLM", isNvidia: mid.startsWith("nvidia/") };
 };
 
+export function redactSensitiveString(str: string): string {
+  if (!str || typeof str !== "string") return str;
+
+  // 1. Private keys
+  let out = str.replace(
+    /-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----/g,
+    "[REDACTED_PRIVATE_KEY]"
+  );
+
+  // 2. Bearer tokens
+  out = out.replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, "Bearer [REDACTED_TOKEN]");
+
+  // 3. Known API keys (OpenAI, Anthropic, GitHub, AWS, Slack, Stripe)
+  out = out.replace(/\b(sk|pk|rk)_[a-zA-Z0-9_\-]{16,}\b/g, "[REDACTED_API_KEY]");
+  out = out.replace(/\bgh[pousr]_[a-zA-Z0-9]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]");
+  out = out.replace(/\bgithub_pat_[a-zA-Z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]");
+  out = out.replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]");
+  out = out.replace(/\bxox[baprs]-[0-9a-zA-Z\-]{10,}\b/g, "[REDACTED_SLACK_TOKEN]");
+
+  // 4. Authorization / Proxy headers
+  out = out.replace(/(authorization|proxy-authorization):\s*[^\r\n]+/gi, "$1: [REDACTED]");
+
+  // 5. Embedded credentials in URL / URI authority (http, https, postgres, mysql, etc.)
+  out = out.replace(
+    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/:]+):([^/@]+)@/gi,
+    (_match, proto, user) => `${proto}${user}:[REDACTED]@`
+  );
+
+  // 6. Embedded password / secret parameters in CLI arguments or queries
+  out = out.replace(
+    /((?:--password|--token|--api-key|--secret|-p)\s+)(["']?[^\s"']+["']?)/gi,
+    "$1[REDACTED]"
+  );
+  out = out.replace(
+    /((?:password|passwd|token|auth_token|api_key|apikey|secret|access_token)\s*[:=]\s*["']?)([^&"'\s]{4,})(["']?)/gi,
+    "$1[REDACTED]$3"
+  );
+
+  return out;
+}
+
 export function redactSensitiveFields(val: any): any {
   if (val === null || val === undefined) return val;
-  if (typeof val === "string") return val;
+  if (typeof val === "string") return redactSensitiveString(val);
   if (Array.isArray(val)) return val.map(redactSensitiveFields);
   if (typeof val === "object") {
     const res: Record<string, any> = {};
-    const SENSITIVE_KEY_REGEX = /pass(word)?|token|secret|api[_-]?key|auth|bearer|credential/i;
+    const SENSITIVE_KEY_REGEX = /pass(word)?|token|secret|api[_-]?key|auth|bearer|credential|private[_-]?key/i;
     for (const [k, v] of Object.entries(val)) {
-      if (SENSITIVE_KEY_REGEX.test(k) && typeof v === "string") {
-        res[k] = "[REDACTED]";
+      if (SENSITIVE_KEY_REGEX.test(k)) {
+        res[k] = typeof v === "string" ? "[REDACTED]" : redactSensitiveFields(v);
       } else {
         res[k] = redactSensitiveFields(v);
       }
@@ -133,11 +174,29 @@ export function parseApprovalArgs(argsJson: string): {
     const obj = JSON.parse(argsJson);
     if (obj && typeof obj === "object") {
       let target: string | null = null;
-      if (obj.command) target = `Command: ${obj.command}`;
-      else if (obj.path) target = `File: ${obj.path}`;
-      else if (obj.url) target = `URL: ${obj.url}`;
-      else if (obj.action) target = `Action: ${obj.action}${obj.x !== undefined ? ` at (${obj.x}, ${obj.y})` : ""}`;
-      else if (obj.keys) target = `Keys: ${Array.isArray(obj.keys) ? obj.keys.join("+") : obj.keys}`;
+      if (obj.command) {
+        target = `Command: ${redactSensitiveString(String(obj.command))}${obj.cwd || obj.working_dir ? ` (in ${obj.cwd || obj.working_dir})` : ""}`;
+      } else if (obj.path) {
+        target = `File: ${obj.path}`;
+      } else if (obj.url) {
+        target = `URL: ${redactSensitiveString(String(obj.url))}`;
+      } else if (obj.action) {
+        const actName = String(obj.action);
+        if (actName === "hotkey" && obj.keys) {
+          const keysStr = Array.isArray(obj.keys) ? obj.keys.join("+") : String(obj.keys);
+          target = `Action: Hotkey (${keysStr})`;
+        } else if (actName === "key" && obj.text) {
+          target = `Action: Press key '${obj.text}'`;
+        } else if (actName === "type" && obj.text) {
+          target = `Action: Type text (${String(obj.text).length} chars)`;
+        } else if (obj.x !== undefined && obj.y !== undefined) {
+          target = `Action: ${actName} at (${obj.x}, ${obj.y})`;
+        } else {
+          target = `Action: ${actName}`;
+        }
+      } else if (obj.keys) {
+        target = `Keys: ${Array.isArray(obj.keys) ? obj.keys.join("+") : obj.keys}`;
+      }
 
       const redacted = redactSensitiveFields(obj);
       return {
@@ -152,8 +211,47 @@ export function parseApprovalArgs(argsJson: string): {
   return {
     parsed: null,
     targetDetail: null,
-    formattedRedacted: argsJson,
+    formattedRedacted: redactSensitiveString(argsJson),
   };
+}
+
+export function formatTruthfulAssistantReply(
+  reply: string,
+  authoritativeStatus: string,
+  plan?: TaskPlan | null,
+  errorDetail?: string
+): string {
+  const trimmed = reply.trim();
+  const baseText = trimmed.length > 0 ? trimmed : "No response was generated by the model.";
+
+  if (authoritativeStatus === "failed") {
+    const reason = errorDetail || plan?.remaining?.[0] || "One or more required steps failed during execution";
+    return `⚠️ **[Execution Failed]** ${baseText}\n\n> **Authoritative Failure Notice:** The requested task could not be completed successfully (${reason}).`;
+  }
+
+  if (authoritativeStatus === "uncertain") {
+    const uncertReason =
+      plan?.remaining?.find((r) => r.toLowerCase().includes("uncertain")) ||
+      "Postcondition check inconclusive; target state could not be independently established";
+    return `⚠️ **[Outcome Uncertain]** ${baseText}\n\n> **Authoritative Verification Notice:** Kyro dispatched the requested actions, but independent verification could not establish whether the intended outcome occurred (${uncertReason}).`;
+  }
+
+  if (authoritativeStatus === "unverified") {
+    if (plan && plan.steps.length > 0) {
+      return `ℹ️ **[Unverified Completion]** ${baseText}\n\n> **Authoritative Verification Notice:** Actions executed without affirmative postcondition verification.`;
+    }
+    return baseText;
+  }
+
+  if (authoritativeStatus === "cancelled") {
+    return `🛑 **[Cancelled]** Task was cancelled by user request.`;
+  }
+
+  if (authoritativeStatus === "interrupted") {
+    return `⚠️ **[Interrupted]** Task was interrupted unexpectedly during execution.`;
+  }
+
+  return baseText;
 }
 
 export const App: React.FC = () => {
@@ -462,7 +560,7 @@ export const App: React.FC = () => {
 
         for (const res of payload.tool_results || []) {
           const commandArg = findCallCommand(res);
-          const isVerification = isVerificationToolName(res.name, commandArg);
+          const isVerification = isVerificationToolName(res.name, commandArg, res.output, res.verification);
           const isInspection = !isVerification && isInspectionToolName(res.name);
 
           const isToolUncertain = (() => {
@@ -1427,9 +1525,17 @@ export const App: React.FC = () => {
       if (!runErrored) {
         const trimmedReply = (finalReply || "").trim();
         const hasValidReply = trimmedReply.length > 0;
-        const assistantContent = hasValidReply
-          ? trimmedReply
-          : "No response was generated by the model.";
+        // Retrieve authoritative backend run status so model-generated text
+        // can never contradict or conceal the true execution outcome.
+        const authoritativeRun = await invoke<any>("get_agent_run", { id: runId }).catch(() => null);
+        const authoritativeStatus = authoritativeRun?.status || (activePlanRef.current?.status ?? "unverified");
+
+        const assistantContent = formatTruthfulAssistantReply(
+          finalReply,
+          authoritativeStatus,
+          activePlanRef.current,
+          authoritativeRun?.error
+        );
 
         const assistantMsg: Message = {
           id: "msg_" + crypto.randomUUID(),
@@ -2182,7 +2288,7 @@ export const App: React.FC = () => {
                                 : "bg-neutral-800 text-neutral-400 border border-neutral-700"
                             }`}
                           >
-                            {isDestructive ? "Irreversible" : "Reversible"}
+                            {isDestructive ? "Irreversible" : "Not guaranteed"}
                           </span>
                           <span className="font-mono text-neutral-200 text-[11px] font-semibold bg-black/40 px-2 py-0.5 rounded border border-neutral-800">
                             {req.tool_name}

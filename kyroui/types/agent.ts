@@ -70,6 +70,20 @@ export interface ToolResult {
   name: string;
   output: string;
   is_error: boolean;
+  verification?: {
+    status: "succeeded" | "verified" | "failed" | "uncertain" | "unverified" | "not_applicable";
+    condition_checked: string;
+    evidence: string;
+    resource?: string;
+    human_intervention_required?: boolean;
+    action_dispatched?: boolean;
+    action_effect_observed?: boolean;
+    task_postcondition_verified?: boolean;
+    run_id?: string;
+    tool_call_id?: string;
+    action_name?: string;
+    trusted_verifier?: boolean;
+  };
 }
 
 export interface AgentStepEvent {

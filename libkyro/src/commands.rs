@@ -1401,10 +1401,20 @@ pub async fn run_agent_turn<R: tauri::Runtime>(
             // overwrite a terminal state that a racing cancellation already
             // confirmed. If the CAS is refused, the run's actual repository
             // state wins and the caller must see the truthful outcome.
-            let final_outcome = state
-                .db
-                .get_run_outcome_from_events(&effective_run_id)
-                .unwrap_or_else(|_| "succeeded".to_string());
+            let final_outcome = match state.db.get_run_outcome_from_events(&effective_run_id) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    log::error!(
+                        "Database failure determining truthful run outcome for '{}': {}",
+                        effective_run_id,
+                        e
+                    );
+                    return Err(format!(
+                        "Run finished but its execution outcome could not be determined from the database: {}",
+                        e
+                    ));
+                }
+            };
 
             // Compare-and-set finalization: a stale completion can never
             // overwrite a terminal state that a racing cancellation already

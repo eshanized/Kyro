@@ -137,19 +137,32 @@ The policy engine automatically halts automation, records a high-risk approval/t
 
 ## 15. Execution Trust, Outcome Verification & Direct IPC Normalization
 
-- **Truthful Execution Lifecycle**: Operations distinguish action execution from outcome postcondition verification. Run and task states transition across `pending`, `running`, `awaiting_approval`, `succeeded`, `failed`, `uncertain`, and `cancelled`.
-- **Postcondition Verification**:
-  - File writes read back target bytes and verify SHA-256 cryptographic hashes before confirming success.
-  - Shell commands check exit status and expected output tokens; nonzero exits report explicit failure.
-  - Computer use actions monitor visual difference metrics; actions producing negligible screen delta (e.g., `<= 5%`) report `uncertain` rather than false success.
-- **Safe-by-Default Computer Use**:
-  - New installations default to `ConfirmDestructive` instead of `FullAutonomous`.
-  - Unrecognized or corrupted policy values fail closed to `AskAlways` / `ConfirmDestructive`.
-  - Settings migrations preserve returning users' explicit configurations via `CURRENT_POLICY_SCHEMA_VERSION = 1`.
-- **Canonical Action Normalization & Hotkey Classification**:
-  - Direct IPC calls (`perform_computer_action`) and agent tool calls route through a single canonical `NormalizedComputerAction` parser.
-  - Multi-modifier shortcuts (`Ctrl`, `Alt`, `Shift`, `Super`/`Meta`) across Linux, macOS, and Windows are classified truthfully against destructive impact tables.
-- **Single-Use Approval Consumption**:
-  - Pending approval requests are consumed atomically inside a single SQLite transaction with strict parameter and run binding (`consume_approval_request_bound`). Replay attacks and parameter alterations fail closed.
-  - User-facing approval dialogs provide transparent inspections with automatic redaction of sensitive credentials (`token`, `password`, `secret`, `api_key`).
+- **Truthful Execution Lifecycle**:
+  - The runtime strictly separates three independent operational facts:
+    1. `action_dispatched`: the request to execute an action was sent to the target subsystem.
+    2. `action_effect_observed`: immediate sensory or visual effects (such as screenshot pixel deltas or process spawn) were observed.
+    3. `task_postcondition_verified`: the intended task postcondition was affirmatively and independently established on the host.
+  - Run and task states transition across `pending`, `running`, `awaiting_approval`, `succeeded`, `failed`, `uncertain`, `unverified`, `cancelled`, and `interrupted`.
+  - Stale callbacks, late tool events, or conversational completions cannot overwrite terminal states.
+- **Affirmative Postcondition Verification**:
+  - Verification success is never inferred from tool names (e.g., `verify_*`, `validate_*`), model descriptions, or arbitrary tool output strings.
+  - Only typed `VerificationResult` instances emitted by Kyro's trusted backend execution layer can establish verified status.
+  - File writes read back written bytes and cryptographically verify content or SHA-256 hashes on disk.
+  - Shell commands check exit status and expected pattern matches.
+  - Computer use actions monitor visual difference metrics; visual changes alone are observations (`action_effect_observed = true`), NOT proof of task completion (`task_postcondition_verified = false`). Actions without machine-readable application-state verification report `uncertain` or `not_applicable` rather than false success.
+- **Absence of Success Fallbacks**:
+  - Database outcome retrieval failures propagate as errors; they never fall back to `succeeded`.
+  - Empty or incomplete event histories default to `unverified`, never `succeeded`.
+  - Startup reconciliation reconciles active runs into `interrupted`, never `succeeded` or `pending`.
+- **Non-Overridable Safeguards in FullAutonomous Mode**:
+  - Destructive shortcut and key classification runs unconditionally before any general policy allow decision.
+  - Destructive combinations (e.g., `Alt+F4`, `Ctrl+W`, `Ctrl+Q`, `Ctrl+Alt+Del`, `Cmd+Opt+Esc`, `Shift+Delete`, terminal interrupt signals) require human confirmation even when `FullAutonomous` mode is active.
+  - Unknown computer actions, corrupt policies, and unrecognized policy modes fail closed.
+- **Secret-Safe Approval Previews**:
+  - Pending approval previews display normalized action targets (e.g. `Action: Hotkey (Alt+F4)`, working directories, file paths, and sanitized command strings).
+  - Multi-tier recursive credential scrubbing automatically redacts Bearer tokens, API keys, private keys, database connection strings, passwords, and authorization headers from preview cards, logs, and audit records.
+  - Actions are only labeled `Reversible` when an authoritative rollback path exists; unverified or destructive actions display `Not guaranteed` or `Irreversible`.
+- **Authoritative Consistency in Final Responses**:
+  - Model-generated replies cannot override or conceal the authoritative task outcome.
+  - Unverified tasks, failures, uncertainties, cancellations, and interruptions prepend or append authoritative execution notices to assistant messages in the UI and durable message store.
 

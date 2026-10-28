@@ -8,9 +8,12 @@ pub enum OutcomeStatus {
     Running,
     AwaitingApproval,
     Succeeded,
+    Verified,
     Failed,
     Uncertain,
+    Unverified,
     Cancelled,
+    NotApplicable,
 }
 
 impl OutcomeStatus {
@@ -20,9 +23,12 @@ impl OutcomeStatus {
             OutcomeStatus::Running => "running",
             OutcomeStatus::AwaitingApproval => "awaiting_approval",
             OutcomeStatus::Succeeded => "succeeded",
+            OutcomeStatus::Verified => "verified",
             OutcomeStatus::Failed => "failed",
             OutcomeStatus::Uncertain => "uncertain",
+            OutcomeStatus::Unverified => "unverified",
             OutcomeStatus::Cancelled => "cancelled",
+            OutcomeStatus::NotApplicable => "not_applicable",
         }
     }
 
@@ -30,11 +36,17 @@ impl OutcomeStatus {
         matches!(
             self,
             OutcomeStatus::Succeeded
+                | OutcomeStatus::Verified
                 | OutcomeStatus::Failed
                 | OutcomeStatus::Uncertain
+                | OutcomeStatus::Unverified
                 | OutcomeStatus::Cancelled
         )
     }
+}
+
+fn default_trusted_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,6 +56,20 @@ pub struct VerificationResult {
     pub evidence: String,
     pub resource: Option<String>,
     pub human_intervention_required: bool,
+    #[serde(default)]
+    pub action_dispatched: bool,
+    #[serde(default)]
+    pub action_effect_observed: bool,
+    #[serde(default)]
+    pub task_postcondition_verified: bool,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub action_name: Option<String>,
+    #[serde(default = "default_trusted_true")]
+    pub trusted_verifier: bool,
     pub details: serde_json::Value,
 }
 
@@ -59,6 +85,13 @@ impl VerificationResult {
             evidence: evidence.into(),
             resource,
             human_intervention_required: false,
+            action_dispatched: true,
+            action_effect_observed: true,
+            task_postcondition_verified: true,
+            run_id: None,
+            tool_call_id: None,
+            action_name: None,
+            trusted_verifier: true,
             details: serde_json::Value::Null,
         }
     }
@@ -74,6 +107,13 @@ impl VerificationResult {
             evidence: evidence.into(),
             resource,
             human_intervention_required: true,
+            action_dispatched: true,
+            action_effect_observed: false,
+            task_postcondition_verified: false,
+            run_id: None,
+            tool_call_id: None,
+            action_name: None,
+            trusted_verifier: true,
             details: serde_json::Value::Null,
         }
     }
@@ -90,8 +130,44 @@ impl VerificationResult {
             evidence: evidence.into(),
             resource,
             human_intervention_required,
+            action_dispatched: true,
+            action_effect_observed: false,
+            task_postcondition_verified: false,
+            run_id: None,
+            tool_call_id: None,
+            action_name: None,
+            trusted_verifier: true,
             details: serde_json::Value::Null,
         }
+    }
+
+    pub fn not_applicable(
+        condition: impl Into<String>,
+        evidence: impl Into<String>,
+        resource: Option<String>,
+    ) -> Self {
+        Self {
+            status: OutcomeStatus::NotApplicable,
+            condition_checked: condition.into(),
+            evidence: evidence.into(),
+            resource,
+            human_intervention_required: false,
+            action_dispatched: true,
+            action_effect_observed: false,
+            task_postcondition_verified: false,
+            run_id: None,
+            tool_call_id: None,
+            action_name: None,
+            trusted_verifier: true,
+            details: serde_json::Value::Null,
+        }
+    }
+
+    pub fn bind(mut self, run_id: &str, tool_call_id: &str, action_name: &str) -> Self {
+        self.run_id = Some(run_id.to_string());
+        self.tool_call_id = Some(tool_call_id.to_string());
+        self.action_name = Some(action_name.to_string());
+        self
     }
 }
 
@@ -216,6 +292,9 @@ pub fn verify_command_postcondition(
 }
 
 /// Verifies postcondition for computer-use UI automation.
+/// Distinguishes input dispatch (`action_dispatched`), visual observation (`action_effect_observed`),
+/// and task postcondition (`task_postcondition_verified`).
+/// Visual changes alone are observations, not affirmative proof of task completion.
 pub fn verify_computer_action_postcondition(
     action: &str,
     x: Option<i32>,
@@ -229,33 +308,128 @@ pub fn verify_computer_action_postcondition(
 
     if x.is_some() && y.is_some() {
         if diff_percent > 0.05 {
-            VerificationResult::success(
-                "UI visual state transition",
-                format!(
-                    "Visual change of {:.2}% detected, confirming UI state transition",
+            VerificationResult {
+                status: OutcomeStatus::Uncertain,
+                condition_checked: "UI visual state transition observation".to_string(),
+                evidence: format!(
+                    "Visual difference of {:.2}% detected (observation of UI transition); visual changes alone cannot establish task postcondition without application-state verification",
                     diff_percent * 100.0
                 ),
                 resource,
-            )
+                human_intervention_required: false,
+                action_dispatched: true,
+                action_effect_observed: true,
+                task_postcondition_verified: false,
+                run_id: None,
+                tool_call_id: None,
+                action_name: Some(action.to_string()),
+                trusted_verifier: true,
+                details: serde_json::json!({
+                    "visual_change_percent": diff_percent,
+                    "observation_only": true,
+                }),
+            }
         } else {
-            VerificationResult::uncertain(
-                "UI visual state transition",
-                format!(
+            VerificationResult {
+                status: OutcomeStatus::Uncertain,
+                condition_checked: "UI visual state transition observation".to_string(),
+                evidence: format!(
                     "The input was delivered but visual difference was only {:.2}% (below 5% threshold); the target UI element may not have changed state",
                     diff_percent * 100.0
                 ),
                 resource,
-                true,
-            )
+                human_intervention_required: true,
+                action_dispatched: true,
+                action_effect_observed: false,
+                task_postcondition_verified: false,
+                run_id: None,
+                tool_call_id: None,
+                action_name: Some(action.to_string()),
+                trusted_verifier: true,
+                details: serde_json::json!({
+                    "visual_change_percent": diff_percent,
+                    "negligible_change": true,
+                }),
+            }
         }
     } else {
-        VerificationResult::success(
-            "Non-coordinate action dispatch",
-            format!(
-                "Action '{}' dispatched without coordinate targeting",
+        VerificationResult {
+            status: OutcomeStatus::NotApplicable,
+            condition_checked: "Non-coordinate action dispatch".to_string(),
+            evidence: format!(
+                "Action '{}' dispatched without coordinate targeting; application outcome is unverified without an authoritative postcondition",
                 action
             ),
             resource,
-        )
+            human_intervention_required: false,
+            action_dispatched: true,
+            action_effect_observed: false,
+            task_postcondition_verified: false,
+            run_id: None,
+            tool_call_id: None,
+            action_name: Some(action.to_string()),
+            trusted_verifier: true,
+            details: serde_json::json!({
+                "dispatch_only": true,
+            }),
+        }
+    }
+}
+
+/// Conclusively verifies a computer action when an authoritative postcondition verifier is provided.
+pub fn verify_computer_action_with_target_postcondition<F>(
+    action: &str,
+    x: Option<i32>,
+    y: Option<i32>,
+    diff_percent: f64,
+    postcondition_check: F,
+) -> VerificationResult
+where
+    F: FnOnce() -> (bool, String, Option<String>),
+{
+    let resource = match (x, y) {
+        (Some(px), Some(py)) => Some(format!("action '{}' at ({}, {})", action, px, py)),
+        _ => Some(format!("action '{}'", action)),
+    };
+    let (passed, check_evidence, check_resource) = postcondition_check();
+    let final_resource = check_resource.or(resource);
+    if passed {
+        VerificationResult {
+            status: OutcomeStatus::Succeeded,
+            condition_checked: "Authoritative application-state postcondition".to_string(),
+            evidence: check_evidence,
+            resource: final_resource,
+            human_intervention_required: false,
+            action_dispatched: true,
+            action_effect_observed: diff_percent > 0.05,
+            task_postcondition_verified: true,
+            run_id: None,
+            tool_call_id: None,
+            action_name: Some(action.to_string()),
+            trusted_verifier: true,
+            details: serde_json::json!({
+                "visual_change_percent": diff_percent,
+                "authoritative_verified": true,
+            }),
+        }
+    } else {
+        VerificationResult {
+            status: OutcomeStatus::Failed,
+            condition_checked: "Authoritative application-state postcondition".to_string(),
+            evidence: check_evidence,
+            resource: final_resource,
+            human_intervention_required: true,
+            action_dispatched: true,
+            action_effect_observed: diff_percent > 0.05,
+            task_postcondition_verified: false,
+            run_id: None,
+            tool_call_id: None,
+            action_name: Some(action.to_string()),
+            trusted_verifier: true,
+            details: serde_json::json!({
+                "visual_change_percent": diff_percent,
+                "authoritative_verified": false,
+            }),
+        }
     }
 }

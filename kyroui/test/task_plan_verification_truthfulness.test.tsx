@@ -64,6 +64,15 @@ describe("Phase 1.2 Regression Tests: Task Plans and Truthful Verification", () 
       name: "run_tests",
       output: "test result: ok. 45 passed; 0 failed; finished in 0.33s",
       is_error: false,
+      verification: {
+        status: "succeeded",
+        condition_checked: "Test suite exit status and assertions",
+        task_postcondition_verified: true,
+        action_dispatched: true,
+        action_effect_observed: true,
+        evidence: "Verification check passed via run_tests",
+        trusted_verifier: true,
+      },
     };
 
     const outcome = evaluateVerificationOutcome(successTestResult);

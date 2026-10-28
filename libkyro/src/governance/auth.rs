@@ -3027,37 +3027,37 @@ impl AuthorizationEngine {
             }
         }
 
-        // ConfirmDestructive mode checks
+        // Non-overridable safeguard: destructive shortcuts and high-impact keys
+        // ALWAYS require approval, regardless of whether policy is ConfirmDestructive or FullAutonomous.
+        if let NormalizedComputerAction::Hotkey { ref keys } = action {
+            if let Some(impact) = classify_destructive_hotkey(keys) {
+                let shortcut = keys.join("+");
+                return AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Destructive shortcut '{}' requires user confirmation ({})",
+                        shortcut, impact
+                    ),
+                    risk: RiskLevel::Destructive,
+                    summary: format!("Execute shortcut: {}", shortcut),
+                };
+            }
+        }
+
+        if let NormalizedComputerAction::Key { ref text } = action {
+            if let Some(impact) = classify_destructive_hotkey(std::slice::from_ref(text)) {
+                return AuthDecision::RequireApproval {
+                    reason: format!(
+                        "Destructive key '{}' requires user confirmation ({})",
+                        text, impact
+                    ),
+                    risk: RiskLevel::Destructive,
+                    summary: format!("Press key: '{}'", text),
+                };
+            }
+        }
+
+        // ConfirmDestructive mode checks for pointer actions
         if policy.computer_use_mode == "ConfirmDestructive" {
-            // Check hotkeys
-            if let NormalizedComputerAction::Hotkey { ref keys } = action {
-                if let Some(impact) = classify_destructive_hotkey(keys) {
-                    let shortcut = keys.join("+");
-                    return AuthDecision::RequireApproval {
-                        reason: format!(
-                            "Destructive shortcut '{}' requires user confirmation ({})",
-                            shortcut, impact
-                        ),
-                        risk: RiskLevel::Destructive,
-                        summary: format!("Execute shortcut: {}", shortcut),
-                    };
-                }
-            }
-
-            // Check single keys
-            if let NormalizedComputerAction::Key { ref text } = action {
-                if let Some(impact) = classify_destructive_hotkey(std::slice::from_ref(text)) {
-                    return AuthDecision::RequireApproval {
-                        reason: format!(
-                            "Destructive key '{}' requires user confirmation ({})",
-                            text, impact
-                        ),
-                        risk: RiskLevel::Destructive,
-                        summary: format!("Press key: '{}'", text),
-                    };
-                }
-            }
-
             // Pointer actions
             if crate::ghost::GhostDisplayManager::is_enabled() {
                 return AuthDecision::Allow;
