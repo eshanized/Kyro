@@ -5,7 +5,7 @@ import { ToolResult } from "../types/agent";
 export interface TaskStep {
   id: string;
   text: string;
-  status: "pending" | "running" | "completed" | "failed" | "unverified";
+  status: "pending" | "running" | "completed" | "failed" | "unverified" | "uncertain";
   done?: boolean;
   evidence?: string;
   toolName?: string;
@@ -20,7 +20,7 @@ export interface TaskPlan {
   understanding: string;
   resources: string[];
   steps: TaskStep[];
-  status: "planning" | "approved" | "executing" | "completed" | "failed" | "cancelled" | "unverified";
+  status: "planning" | "approved" | "executing" | "completed" | "failed" | "cancelled" | "unverified" | "uncertain";
   accomplished: string[];
   remaining: string[];
 }
@@ -29,19 +29,93 @@ export interface VerificationEvidence {
   verified: boolean;
   attempted: boolean;
   failed: boolean;
+  uncertain?: boolean;
   reason: string;
+  conditionChecked?: string;
+  resource?: string;
+  humanInterventionRequired?: boolean;
   toolName?: string;
 }
 
 /**
  * Truthfully evaluates verification evidence from a tool result.
  * Inspection tools (e.g. `inspect_project`) do NOT constitute verification.
- * A failed test MUST NEVER be counted as successful verification.
+ * A tool name prefix (`verify_*`, `validate_*`) or generic success output is NEVER trusted as proof.
+ * Only authoritative verification results from the trusted execution layer can establish verification.
  */
-export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?: string): VerificationEvidence {
-  const toolName = (toolResult.name || "").toLowerCase();
+export function evaluateVerificationOutcome(toolResult: ToolResult, _commandArg?: string): VerificationEvidence {
+  // 1. Authoritative typed verification from trusted Rust execution layer
+  if (toolResult.verification && typeof toolResult.verification === "object") {
+    const v = toolResult.verification;
+    const status = (v.status || "").toLowerCase();
+    if (
+      (status === "succeeded" || status === "success" || status === "verified") &&
+      v.task_postcondition_verified === true
+    ) {
+      return {
+        verified: true,
+        attempted: true,
+        failed: false,
+        uncertain: false,
+        reason: v.evidence || `Verification check passed via ${toolResult.name}`,
+        conditionChecked: v.condition_checked,
+        resource: v.resource,
+        humanInterventionRequired: false,
+        toolName: toolResult.name,
+      };
+    } else if (status === "uncertain") {
+      return {
+        verified: false,
+        attempted: true,
+        failed: false,
+        uncertain: true,
+        reason: v.evidence || "Postcondition check inconclusive (uncertain outcome)",
+        conditionChecked: v.condition_checked,
+        resource: v.resource,
+        humanInterventionRequired: v.human_intervention_required ?? true,
+        toolName: toolResult.name,
+      };
+    } else if (status === "failed") {
+      return {
+        verified: false,
+        attempted: true,
+        failed: true,
+        uncertain: false,
+        reason: v.evidence || "Postcondition verification check failed",
+        conditionChecked: v.condition_checked,
+        resource: v.resource,
+        humanInterventionRequired: true,
+        toolName: toolResult.name,
+      };
+    } else if (status === "not_applicable") {
+      return {
+        verified: false,
+        attempted: false,
+        failed: false,
+        uncertain: false,
+        reason: v.evidence || `Action '${toolResult.name}' has no defined postcondition verifier.`,
+        conditionChecked: v.condition_checked,
+        resource: v.resource,
+        humanInterventionRequired: false,
+        toolName: toolResult.name,
+      };
+    }
+  }
+
+  // 2. Explicit tool errors fail verification immediately
+  if (toolResult.is_error) {
+    return {
+      verified: false,
+      attempted: true,
+      failed: true,
+      uncertain: false,
+      reason: `Verification failed in ${toolResult.name}: ${(toolResult.output || "").slice(0, 100)}`,
+      toolName: toolResult.name,
+    };
+  }
 
   // Inspection/diagnostic tools are never task verification
+  const toolName = (toolResult.name || "").toLowerCase();
   const isInspectionOnly =
     toolName === "inspect_project" ||
     toolName === "read_file" ||
@@ -56,49 +130,104 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?:
       verified: false,
       attempted: false,
       failed: false,
+      uncertain: false,
       reason: `Inspection performed by ${toolResult.name}; does not verify task outcome.`,
       toolName: toolResult.name,
     };
   }
 
-  // Check if tool is an explicit test or verification tool
-  const isTestOrVerificationTool =
-    toolName === "run_tests" ||
-    toolName === "run_test" ||
-    toolName === "test" ||
-    toolName === "execute_tests" ||
-    toolName === "verify_checkpoint" ||
-    toolName === "check_verification" ||
-    toolName.startsWith("verify_") ||
-    toolName.startsWith("validate_") ||
-    (toolName === "execute_shell" &&
-      Boolean(
-        commandArg &&
-          /\b(test|pytest|npm\s+test|cargo\s+test|vitest|jest|make\s+test|make\s+verify)\b/i.test(commandArg)
-      ));
+  // 3. Inspect structured output for fail-closed signals and genuine trusted verification metadata
+  if (toolResult.output && typeof toolResult.output === "string") {
+    try {
+      const parsed = JSON.parse(toolResult.output);
+      if (parsed && typeof parsed === "object") {
+        if (parsed.verification && typeof parsed.verification === "object") {
+          const v = parsed.verification;
+          const status = (v.status || "").toLowerCase();
+          if (
+            (status === "succeeded" || status === "success" || status === "verified") &&
+            v.trusted_verifier === true &&
+            v.task_postcondition_verified === true
+          ) {
+            return {
+              verified: true,
+              attempted: true,
+              failed: false,
+              uncertain: false,
+              reason: v.evidence || `Verification check passed via ${toolResult.name}`,
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: false,
+              toolName: toolResult.name,
+            };
+          } else if (status === "uncertain" || parsed.status === "uncertain") {
+            return {
+              verified: false,
+              attempted: true,
+              failed: false,
+              uncertain: true,
+              reason: v.evidence || parsed.note || "Postcondition check inconclusive (uncertain outcome)",
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: v.human_intervention_required ?? true,
+              toolName: toolResult.name,
+            };
+          } else if (status === "failed" || parsed.status === "failed") {
+            return {
+              verified: false,
+              attempted: true,
+              failed: true,
+              uncertain: false,
+              reason: v.evidence || "Postcondition verification check failed",
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: true,
+              toolName: toolResult.name,
+            };
+          } else if (status === "succeeded" || status === "success") {
+            // Untrusted or unauthenticated claim of verification from tool output
+            return {
+              verified: false,
+              attempted: true,
+              failed: false,
+              uncertain: true,
+              reason: "Untrusted verification claim rejected: no authoritative verification proof from trusted runtime",
+              conditionChecked: v.condition_checked,
+              resource: v.resource,
+              humanInterventionRequired: true,
+              toolName: toolResult.name,
+            };
+          }
+        }
 
-  if (!isTestOrVerificationTool) {
-    return {
-      verified: false,
-      attempted: false,
-      failed: false,
-      reason: `Action executed (${toolResult.name}).`,
-      toolName: toolResult.name,
-    };
+        if (parsed.status === "uncertain") {
+          return {
+            verified: false,
+            attempted: true,
+            failed: false,
+            uncertain: true,
+            reason: parsed.note || "Action executed with inconclusive postcondition (uncertain outcome)",
+            toolName: toolResult.name,
+          };
+        }
+
+        if (parsed.status === "failed") {
+          return {
+            verified: false,
+            attempted: true,
+            failed: true,
+            uncertain: false,
+            reason: parsed.error || "Action execution failed",
+            toolName: toolResult.name,
+          };
+        }
+      }
+    } catch {
+      // not JSON
+    }
   }
 
-  // The tool was a test / verification tool
-  if (toolResult.is_error) {
-    return {
-      verified: false,
-      attempted: true,
-      failed: true,
-      reason: `Verification failed in ${toolResult.name}: ${toolResult.output.slice(0, 100)}`,
-      toolName: toolResult.name,
-    };
-  }
-
-  // Check for test failures inside the output text
+  // 4. Check for obvious error output strings (fail-closed check)
   const lowerOutput = (toolResult.output || "").toLowerCase();
   const testFailedPattern =
     lowerOutput.includes("test failed") ||
@@ -114,27 +243,68 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, commandArg?:
       verified: false,
       attempted: true,
       failed: true,
+      uncertain: false,
       reason: `Test execution reported failures: ${toolResult.output.slice(0, 100)}`,
       toolName: toolResult.name,
     };
   }
 
+  // 5. Genuine test runners executing test assertions
+  const isRealTestRunner =
+    toolName === "run_tests" ||
+    toolName === "run_test" ||
+    toolName === "test" ||
+    toolName === "execute_tests" ||
+    (toolName === "execute_shell" &&
+      Boolean(
+        _commandArg &&
+          /\b(test|pytest|npm\s+test|cargo\s+test|vitest|jest|make\s+test|make\s+verify)\b/i.test(
+            _commandArg
+          )
+      ));
+
+  if (isRealTestRunner) {
+    return {
+      verified: true,
+      attempted: true,
+      failed: false,
+      uncertain: false,
+      reason: `Verification check passed via ${toolResult.name}`,
+      toolName: toolResult.name,
+    };
+  }
+
+  // 6. If no trusted verification proof exists, the action is UNVERIFIED.
+  // Tool name prefixes (verify_*, validate_*) are NEVER accepted as proof of success!
   return {
-    verified: true,
-    attempted: true,
+    verified: false,
+    attempted: false,
     failed: false,
-    reason: `Verification check passed via ${toolResult.name}`,
+    uncertain: false,
+    reason: `Action executed (${toolResult.name}); no authoritative postcondition verification recorded.`,
     toolName: toolResult.name,
   };
 }
 
 /**
- * Name/command-based detection of test-or-verification tools. Mirrors the
- * tool namespace rules of `evaluateVerificationOutcome` so the plan reducer
- * can classify results BEFORE asking the evaluator for truthful evidence
- * (Bug 6). `execute_shell` counts only when its command actually runs tests.
+ * Structured or explicit verification tool detection.
+ * Name prefixes such as `verify_*` or `validate_*` indicate intent to verify, but
+ * evaluateVerificationOutcome() strictly requires proof before marking verified.
  */
-export function isVerificationToolName(name: string, commandArg?: string): boolean {
+export function isVerificationToolName(
+  name: string,
+  commandArg?: string,
+  output?: string,
+  verification?: any
+): boolean {
+  if (verification) return true;
+  if (output && typeof output === "string") {
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed?.verification) return true;
+    } catch {}
+  }
+
   const toolName = (name || "").toLowerCase();
   return (
     toolName === "run_tests" ||
@@ -210,6 +380,7 @@ export const TaskProgress: React.FC<TaskProgressProps> = ({
       case "failed":
         return "bg-red-950/40 text-red-300 border border-red-800/60";
       case "unverified":
+      case "uncertain":
         return "bg-amber-950/40 text-amber-300 border border-amber-800/60";
       case "executing":
         return "bg-neutral-800 text-neutral-200 border border-neutral-700 animate-pulse";

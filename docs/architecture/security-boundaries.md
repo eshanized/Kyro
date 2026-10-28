@@ -131,4 +131,38 @@ The policy engine automatically halts automation, records a high-risk approval/t
 
 - **Task Grant Provenance**: Granted permissions track originating task IDs and cannot be reused across sessions or hijacked by child processes.
 - **Negation Priority**: Deny and negation directives always take priority over affirmative allowances.
-- **Compare-And-Swap (CAS) Status Guards**: Agent run terminal states (`succeeded`, `failed`, `cancelled`, `interrupted`) are immutable and protected against race conditions or late-arriving completion interleave.
+- **Compare-And-Swap (CAS) Status Guards**: Agent run terminal states (`succeeded`, `failed`, `uncertain`, `cancelled`, `interrupted`) are immutable and protected against race conditions or late-arriving completion interleave.
+
+---
+
+## 15. Execution Trust, Outcome Verification & Direct IPC Normalization
+
+- **Truthful Execution Lifecycle**:
+  - The runtime strictly separates three independent operational facts:
+    1. `action_dispatched`: the request to execute an action was sent to the target subsystem.
+    2. `action_effect_observed`: immediate sensory or visual effects (such as screenshot pixel deltas or process spawn) were observed.
+    3. `task_postcondition_verified`: the intended task postcondition was affirmatively and independently established on the host.
+  - Run and task states transition across `pending`, `running`, `awaiting_approval`, `succeeded`, `failed`, `uncertain`, `unverified`, `cancelled`, and `interrupted`.
+  - Stale callbacks, late tool events, or conversational completions cannot overwrite terminal states.
+- **Affirmative Postcondition Verification**:
+  - Verification success is never inferred from tool names (e.g., `verify_*`, `validate_*`), model descriptions, or arbitrary tool output strings.
+  - Only typed `VerificationResult` instances emitted by Kyro's trusted backend execution layer can establish verified status.
+  - File writes read back written bytes and cryptographically verify content or SHA-256 hashes on disk.
+  - Shell commands check exit status and expected pattern matches.
+  - Computer use actions monitor visual difference metrics; visual changes alone are observations (`action_effect_observed = true`), NOT proof of task completion (`task_postcondition_verified = false`). Actions without machine-readable application-state verification report `uncertain` or `not_applicable` rather than false success.
+- **Absence of Success Fallbacks**:
+  - Database outcome retrieval failures propagate as errors; they never fall back to `succeeded`.
+  - Empty or incomplete event histories default to `unverified`, never `succeeded`.
+  - Startup reconciliation reconciles active runs into `interrupted`, never `succeeded` or `pending`.
+- **Non-Overridable Safeguards in FullAutonomous Mode**:
+  - Destructive shortcut and key classification runs unconditionally before any general policy allow decision.
+  - Destructive combinations (e.g., `Alt+F4`, `Ctrl+W`, `Ctrl+Q`, `Ctrl+Alt+Del`, `Cmd+Opt+Esc`, `Shift+Delete`, terminal interrupt signals) require human confirmation even when `FullAutonomous` mode is active.
+  - Unknown computer actions, corrupt policies, and unrecognized policy modes fail closed.
+- **Secret-Safe Approval Previews**:
+  - Pending approval previews display normalized action targets (e.g. `Action: Hotkey (Alt+F4)`, working directories, file paths, and sanitized command strings).
+  - Multi-tier recursive credential scrubbing automatically redacts Bearer tokens, API keys, private keys, database connection strings, passwords, and authorization headers from preview cards, logs, and audit records.
+  - Actions are only labeled `Reversible` when an authoritative rollback path exists; unverified or destructive actions display `Not guaranteed` or `Irreversible`.
+- **Authoritative Consistency in Final Responses**:
+  - Model-generated replies cannot override or conceal the authoritative task outcome.
+  - Unverified tasks, failures, uncertainties, cancellations, and interruptions prepend or append authoritative execution notices to assistant messages in the UI and durable message store.
+

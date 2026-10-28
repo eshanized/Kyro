@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { App, getModelDisplayInfo } from "../App";
 import { invoke } from "@tauri-apps/api/core";
@@ -229,38 +229,53 @@ describe("Phase 3 & 7 — Plan Semantics and Model Persistence", () => {
       const stepCb = eventListeners["agent:step"];
       expect(stepCb).toBeDefined();
 
-      // 1. Action tool execution
-      stepCb({
-        payload: {
-          run_id: capturedRunId,
-          step: 1,
-          thought: "Moving files to target directories",
-          tool_calls: [{ id: "tc_1", name: "execute_shell", arguments: {} }],
-          tool_results: [{ tool_call_id: "tc_1", name: "execute_shell", output: "moved 3 files", is_error: false }],
-          is_finished: false,
-        },
-      });
+      act(() => {
+        // 1. Action tool execution
+        stepCb({
+          payload: {
+            run_id: capturedRunId,
+            step: 1,
+            thought: "Moving files to target directories",
+            tool_calls: [{ id: "tc_1", name: "execute_shell", arguments: {} }],
+            tool_results: [{ tool_call_id: "tc_1", name: "execute_shell", output: "moved 3 files", is_error: false }],
+            is_finished: false,
+          },
+        });
 
-      // 2. Verification tool execution
-      stepCb({
-        payload: {
-          run_id: capturedRunId,
-          step: 2,
-          thought: "Verifying file integrity and path structure",
-          tool_calls: [{ id: "tc_2", name: "verify_file_integrity", arguments: {} }],
-          tool_results: [{ tool_call_id: "tc_2", name: "verify_file_integrity", output: "checksum matches", is_error: false }],
-          is_finished: true,
-        },
-      });
+        // 2. Verification tool execution
+        stepCb({
+          payload: {
+            run_id: capturedRunId,
+            step: 2,
+            thought: "Verifying file integrity and path structure",
+            tool_calls: [{ id: "tc_2", name: "verify_file_integrity", arguments: {} }],
+            tool_results: [
+              {
+                tool_call_id: "tc_2",
+                name: "verify_file_integrity",
+                output: "checksum matches",
+                is_error: false,
+                verification: {
+                  status: "succeeded",
+                  task_postcondition_verified: true,
+                  evidence: "Executed verify_file_integrity: checksum matches",
+                  trusted_verifier: true,
+                },
+              },
+            ],
+            is_finished: true,
+          },
+        });
 
-      // Finish agent turn
-      runTurnPromiseResolve!("Organization complete and verified.");
+        // Finish agent turn
+        runTurnPromiseResolve!("Organization complete and verified.");
+      });
 
       // Because verification actually executed, status is completed
       await waitFor(() => {
         expect(screen.getByText("completed")).toBeInTheDocument();
         expect(screen.getByText("Accomplished Actions:")).toBeInTheDocument();
-        expect(screen.getByText(/Executed verify_file_integrity/i)).toBeInTheDocument();
+        expect(screen.getAllByText(/Executed verify_file_integrity/i).length).toBeGreaterThanOrEqual(1);
       });
     });
 

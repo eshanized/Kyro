@@ -88,6 +88,8 @@ pub struct ToolResult {
     pub name: String,
     pub output: String,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::execution::VerificationResult>,
 }
 
 #[derive(Clone)]
@@ -933,14 +935,79 @@ The program is started as an explicit executable plus argument vector; free-form
                     )
                     .await;
 
+                // Derive authoritative trusted verification from the execution
+                let trusted_verification: Option<crate::execution::VerificationResult> = if is_error
+                {
+                    Some(
+                        crate::execution::VerificationResult::failure(
+                            format!("Execution of '{}'", tc.name),
+                            output.chars().take(200).collect::<String>(),
+                            None,
+                        )
+                        .bind(run_id, &tc.id, &tc.name),
+                    )
+                } else if tc.name == "write_file" {
+                    let path_opt = tc
+                        .arguments
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .map(PathBuf::from);
+                    if let Some(path) = path_opt {
+                        let content_bytes = tc
+                            .arguments
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.as_bytes());
+                        Some(
+                            crate::execution::verify_file_postcondition(&path, content_bytes, None)
+                                .bind(run_id, &tc.id, "write_file"),
+                        )
+                    } else {
+                        None
+                    }
+                } else if tc.name == "computer_action" {
+                    if let Ok(out_val) = serde_json::from_str::<serde_json::Value>(&output) {
+                        if let Some(ver_json) = out_val.get("verification") {
+                            if let Ok(ver_res) = serde_json::from_value::<
+                                crate::execution::VerificationResult,
+                            >(ver_json.clone())
+                            {
+                                Some(ver_res.bind(run_id, &tc.id, "computer_action"))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else if matches!(tc.name.as_str(), "execute_shell" | "bash" | "terminal") {
+                    let exit_code =
+                        if output.starts_with("EXIT_CODE: 0") || output.contains("exit code 0") {
+                            0
+                        } else {
+                            1
+                        };
+                    Some(
+                        crate::execution::verify_command_postcondition(
+                            exit_code, &output, "", None,
+                        )
+                        .bind(run_id, &tc.id, &tc.name),
+                    )
+                } else {
+                    None
+                };
+
                 tool_results.push(ToolResult {
                     tool_call_id: tc.id.clone(),
                     name: tc.name.clone(),
                     output: output.clone(),
                     is_error,
+                    verification: trusted_verification.clone(),
                 });
 
-                // Persist tool execution event
+                // Persist tool execution event with authoritative trusted_verification field
                 let tool_seq = db.get_next_event_seq(run_id).unwrap_or(seq + 1);
                 let tool_event = RunEvent {
                     id: format!("evt_{}_{}", run_id, tool_seq),
@@ -953,6 +1020,7 @@ The program is started as an explicit executable plus argument vector; free-form
                         "arguments": tc.arguments,
                         "output": output,
                         "is_error": is_error,
+                        "trusted_verification": trusted_verification,
                     })
                     .to_string(),
                     created_at: chrono::Utc::now().timestamp_millis(),
@@ -1430,6 +1498,30 @@ The program is started as an explicit executable plus argument vector; free-form
 
                     if let Ok(Some(status)) = db.get_approval_request(&req_id) {
                         if status.status == "approved" {
+                            let consume_res = db.consume_approval_request_bound(
+                                &req_id,
+                                run_id,
+                                &[tc.name.as_str(), canonical_name.as_str()],
+                                &tc.arguments,
+                                now,
+                            );
+                            if let Err(err) = consume_res {
+                                log::warn!(
+                                    "[Security] Approval consumption rejected for req '{}': {}",
+                                    req_id,
+                                    err
+                                );
+                                let _ = db.update_run_status(run_id, "running", None, None, None);
+                                return (
+                                    format!(
+                                        "Action '{}' rejected: authorization proof could not be consumed: {}",
+                                        tc.name, err
+                                    ),
+                                    true,
+                                    None,
+                                );
+                            }
+
                             let _ = db.update_run_status(run_id, "running", None, None, None);
                             let proof = crate::connector::InvocationAuthProof {
                                 approval_id: req_id.clone(),
@@ -1754,6 +1846,26 @@ The program is started as an explicit executable plus argument vector; free-form
                     Ok(p) => p,
                     Err(e) => return (format!("Filesystem access denied: {}", e), true, None),
                 };
+
+                // Independent postcondition verification: confirm file exists and content matches on disk
+                let ver_res = crate::execution::verify_file_postcondition(
+                    &safe_path,
+                    Some(content.as_bytes()),
+                    None,
+                );
+                if ver_res.status != crate::execution::OutcomeStatus::Succeeded {
+                    return (
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": format!("File postcondition verification failed: {}", ver_res.evidence),
+                            "verification": ver_res,
+                            "path": safe_path.to_string_lossy(),
+                        })
+                        .to_string(),
+                        true,
+                        None,
+                    );
+                }
 
                 // Register write_file into artifacts registry
                 let file_name = safe_path
@@ -2311,19 +2423,17 @@ The program is started as an explicit executable plus argument vector; free-form
                                 let _ = db.save_timeline_step(&step_rec);
                             }
 
-                            // The action was dispatched successfully.  Whether
-                            // the *intended* transition happened is reported
-                            // separately so the model does not mistake a
-                            // successful dispatch for a confirmed effect.
-                            let status = if x.is_some() && y.is_some() {
-                                if diff_percent > 0.05 {
-                                    "success"
-                                } else {
-                                    "uncertain"
-                                }
-                            } else {
-                                "success"
-                            };
+                            // The action was dispatched successfully. Whether
+                            // the *intended* transition happened is verified
+                            // separately so the model and frontend never mistake a
+                            // successful dispatch for a confirmed outcome.
+                            let ver_res = crate::execution::verify_computer_action_postcondition(
+                                action_str,
+                                x,
+                                y,
+                                diff_percent as f64,
+                            );
+                            let status = ver_res.status.as_str();
                             (
                                 serde_json::json!({
                                     "status": status,
@@ -2333,6 +2443,7 @@ The program is started as an explicit executable plus argument vector; free-form
                                     "x": x,
                                     "y": y,
                                     "visual_change_percent": diff_percent,
+                                    "verification": ver_res,
                                     "note": if status == "uncertain" {
                                         "The input was delivered but no visual change was detected; the target may not have changed state."
                                     } else {

@@ -111,6 +111,8 @@ pub enum RunStatus {
     WaitingApproval,
     Succeeded,
     Failed,
+    Uncertain,
+    Unverified,
     Cancelled,
     Interrupted,
 }
@@ -123,6 +125,8 @@ impl RunStatus {
             RunStatus::WaitingApproval => "waiting_approval",
             RunStatus::Succeeded => "succeeded",
             RunStatus::Failed => "failed",
+            RunStatus::Uncertain => "uncertain",
+            RunStatus::Unverified => "unverified",
             RunStatus::Cancelled => "cancelled",
             RunStatus::Interrupted => "interrupted",
         }
@@ -139,6 +143,8 @@ impl std::str::FromStr for RunStatus {
             "waiting_approval" => RunStatus::WaitingApproval,
             "succeeded" => RunStatus::Succeeded,
             "failed" => RunStatus::Failed,
+            "uncertain" => RunStatus::Uncertain,
+            "unverified" => RunStatus::Unverified,
             "cancelled" => RunStatus::Cancelled,
             _ => RunStatus::Interrupted,
         })
@@ -1322,6 +1328,7 @@ impl Database {
             "waiting_approval",
             "succeeded",
             "failed",
+            "uncertain",
             "cancelled",
             "interrupted",
             "completed",
@@ -1374,7 +1381,7 @@ impl Database {
             "waiting_approval" => &["running", "queued"],
             // Finalization is only legal from an active state; it can never
             // overwrite another terminal outcome.
-            "succeeded" | "completed" => &["queued", "running"],
+            "succeeded" | "completed" | "uncertain" | "unverified" => &["queued", "running"],
             "failed" => &["queued", "running", "waiting_approval"],
             "cancelled" => &["queued", "running", "waiting_approval"],
             "interrupted" => &["queued", "running", "waiting_approval"],
@@ -1452,6 +1459,84 @@ impl Database {
             params![id, now, reason],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Evaluates the authoritative execution outcome of a run by inspecting its recorded tool events.
+    /// Distinguishes complete success (requires affirmative postcondition verification),
+    /// verification failure, inconclusive/uncertain actions, and unverified completion.
+    /// Untrusted tool output can never forge verified status.
+    pub fn get_run_outcome_from_events(&self, run_id: &str) -> Result<String> {
+        let events = self.get_run_events(run_id, None)?;
+        if events.is_empty() {
+            // Absence of events is NOT affirmative evidence of success!
+            return Ok("unverified".to_string());
+        }
+
+        let mut has_failure = false;
+        let mut has_uncertain = false;
+        let mut has_affirmative_verification = false;
+
+        for evt in events {
+            if evt.event_type == "error" {
+                has_failure = true;
+            } else if evt.event_type == "tool_result" {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evt.payload_json) {
+                    if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        has_failure = true;
+                    }
+
+                    // 1. Authoritative verification from trusted backend execution layer
+                    if let Some(tv) = v.get("trusted_verification") {
+                        if !tv.is_null() {
+                            let status = tv.get("status").and_then(|s| s.as_str());
+                            let postcondition_verified = tv
+                                .get("task_postcondition_verified")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false);
+                            if status == Some("failed") {
+                                has_failure = true;
+                            } else if status == Some("uncertain") {
+                                has_uncertain = true;
+                            } else if (status == Some("succeeded") || status == Some("verified"))
+                                && postcondition_verified
+                            {
+                                has_affirmative_verification = true;
+                            }
+                        }
+                    }
+
+                    // 2. Also inspect tool output for fail-closed signals (failure and uncertainty).
+                    // NEVER accept success or verification claims from untrusted tool output!
+                    if let Some(out_str) = v.get("output").and_then(|s| s.as_str()) {
+                        if let Ok(out_json) = serde_json::from_str::<serde_json::Value>(out_str) {
+                            let status = out_json.get("status").and_then(|s| s.as_str());
+                            let ver_status = out_json
+                                .get("verification")
+                                .and_then(|ver| ver.get("status"))
+                                .and_then(|s| s.as_str());
+                            if status == Some("uncertain") || ver_status == Some("uncertain") {
+                                has_uncertain = true;
+                            } else if status == Some("failed") || ver_status == Some("failed") {
+                                has_failure = true;
+                            }
+                            // Notice: we deliberately DO NOT check status == Some("succeeded") here!
+                            // Tool outputs cannot authorize completion without trusted verification.
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_failure {
+            Ok("failed".to_string())
+        } else if has_uncertain {
+            Ok("uncertain".to_string())
+        } else if has_affirmative_verification {
+            Ok("succeeded".to_string())
+        } else {
+            // Execution completed without affirmative postcondition verification
+            Ok("unverified".to_string())
+        }
     }
 
     pub fn get_run(&self, id: &str) -> Result<Option<AgentRun>> {

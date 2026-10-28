@@ -167,17 +167,17 @@ async fn test_computer_use_and_permission_commands() {
 
     abort_computer_use();
 
-    let perm1 = check_command_permission("ls -la".to_string(), false);
+    let perm1 = check_command_permission(state.clone(), "ls -la".to_string(), false);
     assert!(perm1.allowed || !perm1.allowed);
 
-    let perm_dangerous = check_command_permission("rm -rf /".to_string(), false);
+    let perm_dangerous = check_command_permission(state.clone(), "rm -rf /".to_string(), false);
     assert!(perm_dangerous.requires_prompt || !perm_dangerous.allowed);
 
     let click_action = kyro_lib::computer_use::ComputerAction::LeftClick {
         x: Some(100),
         y: Some(100),
     };
-    let _ = perform_computer_action(state.clone(), click_action);
+    let _ = perform_computer_action(state.clone(), click_action, None);
 }
 
 #[tokio::test]
@@ -1305,7 +1305,7 @@ async fn test_screen_capture_and_ghost_mode_commands() {
     abort_computer_use();
 
     // Command permissions
-    let perm = check_command_permission("ls -la".to_string(), true);
+    let perm = check_command_permission(state.clone(), "ls -la".to_string(), true);
     assert!(perm.allowed);
 
     // Explain screen capture without model fallback
