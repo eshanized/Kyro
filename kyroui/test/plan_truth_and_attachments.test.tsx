@@ -255,6 +255,13 @@ describe("Step evidence truthfulness (bug 6)", () => {
               name: "execute_shell",
               output: "All 24 assertions executed correctly and passed",
               is_error: false,
+              verification: {
+                status: "succeeded",
+                condition_checked: "Process exit status and test suite passing",
+                evidence: "Verification check passed via execute_shell",
+                task_postcondition_verified: true,
+                trusted_verifier: true,
+              },
             },
           ],
           is_finished: true,
@@ -263,7 +270,7 @@ describe("Step evidence truthfulness (bug 6)", () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByText(/Verification check passed via execute_shell/i)).toBeInTheDocument()
+      expect(screen.getAllByText(/Verification check passed via execute_shell/i).length).toBeGreaterThanOrEqual(1)
     );
   });
 
