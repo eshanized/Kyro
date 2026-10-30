@@ -25,6 +25,7 @@
   <a href="https://react.dev"><img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black" alt="React 19" /></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white" alt="TypeScript 5.7" /></a>
   <a href="#-zero-trust-security--privacy"><img src="https://img.shields.io/badge/Privacy-100%25%20Local--First-2ea44f?logo=sqlite&logoColor=white" alt="Local-First Privacy" /></a>
+  <a href="#-architecture--demo-walkthrough"><img src="https://img.shields.io/badge/Demo-Architecture%20Walkthrough-FF0000?logo=github&logoColor=white" alt="Demo Walkthrough" /></a>
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
@@ -35,6 +36,52 @@
 **Kyro** is a high-performance, local-first autonomous desktop AI agent that bridges natural language reasoning with real computer interaction. Unlike web-wrapped wrappers or cloud-dependent bots, Kyro runs a multi-threaded Rust native core with Tauri v2 and React 19, delivering zero-latency screen understanding, browser automation, terminal execution, and secure Model Context Protocol (MCP) integrations.
 
 Kyro is built with a **Zero-Trust Security Model**: all conversations, embeddings, task histories, and artifacts stay strictly on your local disk in SQLite (WAL mode). API keys and credentials are encrypted using your Operating System Keyring (`Vault`), and dangerous actions require argument-aware authorization and human-in-the-loop verification.
+
+---
+
+## 🎬 Architecture & Demo Walkthrough
+
+<div align="center">
+  <img src="assets/Architecting_the_Autonomous_Workspace__Deconstructing_Kyro_s_Ze-cleaned.gif" alt="Architecting the Autonomous Workspace: Deconstructing Kyro's Zero-Trust Architecture" width="100%" />
+  <p><em>Architecting the Autonomous Workspace: Deconstructing Kyro's Zero-Trust Architecture & Autonomous Workflow.</em></p>
+  <p><a href="assets/Architecting_the_Autonomous_Workspace__Deconstructing_Kyro_s_Ze-cleaned.gif"><strong>🔍 View Full-Resolution Animated Walkthrough (.gif)</strong></a> &bull; <a href="assets/Kyro.mp4"><strong>▶️ Download Full Audio Video Demo (.mp4)</strong></a></p>
+</div>
+
+<br />
+
+### 📖 Architecture Breakdown & Deep-Dive Explanation
+
+The animated walkthrough (`Architecting the Autonomous Workspace: Deconstructing Kyro's Zero-Trust Architecture`) provides a visual step-by-step breakdown of Kyro's architecture, demonstrating how it overcomes the critical failure modes of conventional LLM agents through local-first execution, zero-trust security boundaries, and affirmative verification:
+
+1. **The Reliability Paradox: Why Unchecked LLMs Fail on Real Desktops (00:00 – 01:30)**
+   - **The Problem**: Conventional AI agents treat desktop automation as open-ended text generation. When unprivileged models emit commands directly to a host, they frequently hallucinate non-existent arguments, misinterpret syntax, and cause cascading system errors (such as unhandled null-pointer exceptions or terminal crashes) because they operate without a deterministic ground-truth feedback loop.
+   - **Kyro's Approach**: Replaces open-ended text guessing with typed, stateful task execution plans. The runtime separates three distinct operational facts: *action dispatched*, *sensory effect observed*, and *affirmative postcondition verified*. A task cannot report completion without machine-verifiable evidence.
+
+2. **Centralized Zero-Trust Engine & Lexical Shell Firewall (01:30 – 03:30)**
+   - **The Threat**: Prompt injection, malicious workspace repos, or runaway model loops attempting destructive operations (e.g., `cat server.log | rm -rf /`).
+   - **Lexical Analysis**: Kyro's Rust security kernel intercepts all raw shell inputs before they touch the host OS. Commands are lexically parsed into structured `argv[]` token vectors (`argv[0] = "cat"`, `argv[1] = "server.log"`, `argv[2] = "|"`, `argv[3] = "rm"`, `argv[4] = "-rf"`).
+   - **Injection Firewall**: Shell metacharacters, subshells, pipelines, and chained commands are identified immediately. Any unverified shell sequence fails closed, halting execution before any command is spawned.
+
+3. **Ephemeral Container Sandboxing & Least Privilege (03:30 – 04:30)**
+   - **Execution Isolation**: When untrusted scripts or experimental code runs, Kyro delegates execution to an isolated container runtime (`docker run --network none --security-opt no-new-privileges --cap-drop ALL`).
+   - **Zero Host Risk**: All Linux capabilities are dropped, outbound network connections are blocked by default (`NO_NET`), the root filesystem is mounted read-only, and memory/CPU quotas prevent fork-bombs and host contamination. If the container engine is missing, Kyro fails closed rather than silently falling back to the host.
+
+4. **Developer Workbench & Intelligent Diagnostic Triage (04:30 – 05:30)**
+   - **Build Doctor**: Intercepts compiler errors (such as Rust `cargo build --release` compiler errors like `E0308`), maps the offending source file and span, and provides automated diagnostic triage.
+   - **UI Audit & Visual Regression**: Captures multi-viewport snapshots and compares layout geometry across viewports, detecting microscopic visual flaws (such as button coordinate shifts `(x+5, y+2)`) before frontend bugs reach production.
+
+5. **Human Takeover & Cryptographically Bound Approvals (05:30 – 06:15)**
+   - **Sensitive Checkpoints**: When automation encounters credential forms, 2FA/MFA challenges, CAPTCHAs, or destructive system shortcuts (e.g., `Alt+F4`, `Ctrl+W`, `Shift+Delete`), automation immediately pauses for human intervention.
+   - **Anti-TOCTOU & Proof Binding**: Human approvals emit a single-use authorization token cryptographically bound to the exact `run_id`, canonical `action`, and SHA-256 hash of the execution arguments. Replay attacks, argument tampering, or cross-run token reuse are strictly rejected.
+
+6. **Hardware-Encrypted OS Keyring & Ephemeral Secret Lifecycle (06:15 – 06:45)**
+   - **Zero Plaintext Persistence**: Public settings stay in SQLite WAL on disk, while API keys and OAuth tokens reside exclusively in the OS Keyring (macOS Keychain, Linux Secret Service, Windows Credential Manager).
+   - **Ephemeral In-Memory Tokens**: Tokens are loaded into volatile memory only for the exact duration of an authenticated network call and immediately dropped and zeroed out (`token_exposed: false`).
+   - **Scrubbing Engine**: Multi-tier redaction automatically sanitizes Bearer tokens, private keys, JWTs, and passwords from UI cards, logs, and database records.
+
+7. **Native MCP Host & Multi-Agent Collaboration (06:45 – 07:25)**
+   - **Model Context Protocol (MCP)**: Dynamic tool discovery and execution via JSON-RPC 2.0 (stdio and HTTP/SSE) connects Kyro to standard MCP servers (e.g., `@modelcontextprotocol/server-filesystem`) with fine-grained per-tool permissions.
+   - **Multi-Agent Workspace**: Autonomous specialist agents (**Apex**, **Forge**, and **Scout**) operate on independent Git worktrees, allowing parallel development, testing, and auditing without workspace conflicts or state contamination.
 
 ---
 
@@ -288,7 +335,7 @@ Keys configured in UI Settings are encrypted inside your OS Keyring and will nev
 
 ## 🛠️ Verification & Testing
 
-Kyro has strict test coverage across unit, integration, and security layers (over 317 backend Rust tests and 318 frontend Vitest tests across 39 test suites, achieving &ge; 95% frontend coverage and 635+ total automated tests):
+Kyro has strict test coverage across unit, integration, and security layers (over 346 backend Rust tests and 365 frontend Vitest tests across 43 test suites, achieving &ge; 95% frontend coverage and 711+ total automated tests):
 
 ```bash
 # Run the complete end-to-end verification pipeline:
