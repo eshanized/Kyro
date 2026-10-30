@@ -116,3 +116,16 @@ This document records the implemented remediation phases that evolved the Kyro d
 - [x] Enforce strict UTF-8 validation and binary magic byte detection on text attachments.
 - [x] Expand automated test coverage to 317 Rust tests and 318 Vitest tests across 39 test files with zero compiler or linter warnings (`cargo clippy --all-targets --all-features -- -D warnings`).
 - [x] Bump version to `0.1.3` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs.
+
+### Phase 18: v0.1.4 Release — Authoritative Verification Contracts, Truthful Execution Lifecycle, Deep Credential Redaction & Specialized Multi-Agent Personas
+- [x] Eliminate untrusted verification metadata acceptance and name-based verification heuristics in `kyroui/components/TaskProgress.tsx`.
+- [x] Enforce strict context binding for verification records (`run_id`, `tool_call_id`, `action_name`, expected postcondition, and target resource).
+- [x] Enforce action-level outcome tracking in `libkyro/src/storage/db.rs` with strict precedence (`failed` > `uncertain` > `unverified` > `succeeded`) and add `"unverified"` to `VALID_RUN_STATUSES`.
+- [x] Enforce truthful assistant messaging (`formatTruthfulAssistantReply()`) across all execution flows when outcomes are unverified.
+- [x] Implement deep credential scrubbing (`redactSensitiveString`) and keystroke masking for sensitive computer-use targets.
+- [x] Add specialized agent personas (`code-reviewer`, `doc-reviewer`, `test-engineer`) and safe caller API key fallback for child delegations.
+- [x] Reconcile multi-agent worktree via terminal DAG candidate resolution, explicit apply actions, and conflict-safe shadow-copying (#27, #28, #29).
+- [x] Enhance file organization tool with fine-grained pattern exclusions and descriptive labels.
+- [x] Add autonomous workspace architecture walkthrough animation and demo video with Git-LFS tracking.
+- [x] Expand automated test coverage to over 320 Rust tests and 365 Vitest tests across 43 test files with zero compiler or linter warnings.
+- [x] Bump version to `0.1.4` across `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs.

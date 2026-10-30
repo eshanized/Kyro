@@ -394,3 +394,8 @@ This log chronicles the engineering remediation, feature completion, and verific
 - **Backend Desktop E2E Suite** (`libkyro/tests/desktop_e2e_tests.rs`): 7 tests covering Scenarios A through G across real SQLite DB, AppState, and Tauri mock application boundaries.
 - **Frontend Adversarial & UI E2E Suites** (`kyroui/test/verification_integrity_and_redaction.test.tsx`, `kyroui/test/desktop_e2e_scenarios.test.tsx`): 30 tests covering adversarial verification payloads, credential redaction, and Scenarios A through G.
 
+### 6. Version Bump to `0.1.4`
+- Bumped `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs to `0.1.4`.
+- Authored `RELEASE_NOTES_v0.1.4.md` and updated `CHANGELOG.md` with full multi-agent, verification contract, and credential scrubbing breakdown.
+- Multi-distribution release pipeline validation and GitHub release publishing.
+

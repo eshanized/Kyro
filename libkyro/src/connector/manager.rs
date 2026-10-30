@@ -1034,7 +1034,7 @@ impl ConnectorManager {
                     .unwrap_or_default();
                 let resp = match http
                     .get("https://api.github.com/user")
-                    .header("User-Agent", "Kyro-Desktop-Agent/0.1.3")
+                    .header("User-Agent", "Kyro-Desktop-Agent/0.1.4")
                     .header("Accept", "application/vnd.github+json")
                     .header(
                         "Authorization",
