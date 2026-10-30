@@ -117,33 +117,71 @@ export function redactSensitiveString(str: string): string {
   // 2. Bearer tokens
   out = out.replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, "Bearer [REDACTED_TOKEN]");
 
-  // 3. Known API keys (OpenAI, Anthropic, GitHub, AWS, Slack, Stripe)
-  out = out.replace(/\b(sk|pk|rk)_[a-zA-Z0-9_\-]{16,}\b/g, "[REDACTED_API_KEY]");
+  // 3. JWT tokens
+  out = out.replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED_JWT]");
+
+  // 4. Known API keys (OpenAI, Anthropic, GitHub, AWS, Slack, Stripe, Square)
+  out = out.replace(/\b(sk|pk|rk)[_-][a-zA-Z0-9_\-]{16,}\b/g, "[REDACTED_API_KEY]");
   out = out.replace(/\bgh[pousr]_[a-zA-Z0-9]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]");
   out = out.replace(/\bgithub_pat_[a-zA-Z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]");
   out = out.replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]");
   out = out.replace(/\bxox[baprs]-[0-9a-zA-Z\-]{10,}\b/g, "[REDACTED_SLACK_TOKEN]");
+  out = out.replace(/\bsq0idp-[a-zA-Z0-9_\-]{20,}\b/g, "[REDACTED_SQUARE_TOKEN]");
 
-  // 4. Authorization / Proxy headers
-  out = out.replace(/(authorization|proxy-authorization):\s*[^\r\n]+/gi, "$1: [REDACTED]");
+  // 5. Authorization / Proxy headers
+  out = out.replace(/(authorization|proxy-authorization):\s*[^'"\r\n]+/gi, "$1: [REDACTED]");
 
-  // 5. Embedded credentials in URL / URI authority (http, https, postgres, mysql, etc.)
+  // 6. Embedded credentials in URL / URI authority (http, https, postgres, mysql, mongodb, redis, etc.)
   out = out.replace(
-    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/:]+):([^/@]+)@/gi,
+    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/:\s]+):([^/@\s]+)@/gi,
     (_match, proto, user) => `${proto}${user}:[REDACTED]@`
   );
 
-  // 6. Embedded password / secret parameters in CLI arguments or queries
+  // 7. Embedded password / secret parameters in CLI arguments or queries
   out = out.replace(
-    /((?:--password|--token|--api-key|--secret|-p)\s+)(["']?[^\s"']+["']?)/gi,
+    /((?:--password|--token|--api-key|--secret|-p|--pass|--key)\s+)(["']?[^\s"']+["']?)/gi,
     "$1[REDACTED]"
   );
   out = out.replace(
-    /((?:password|passwd|token|auth_token|api_key|apikey|secret|access_token)\s*[:=]\s*["']?)([^&"'\s]{4,})(["']?)/gi,
+    /((?:password|passwd|token|auth_token|api_key|apikey|secret|access_token|client_secret|private_key)\s*[:=]\s*["']?)([^&"'\s\r\n]{3,})(["']?)/gi,
+    "$1[REDACTED]$3"
+  );
+  out = out.replace(
+    /((?:export|set)\s+(?:[A-Za-z0-9_]*(?:SECRET|KEY|TOKEN|PASSWORD|PASS|AUTH)[A-Za-z0-9_]*)\s*=\s*["']?)([^"'\s\r\n]+)(["']?)/gi,
     "$1[REDACTED]$3"
   );
 
   return out;
+}
+
+export function isSensitiveInput(obj: Record<string, any>, text?: string): boolean {
+  if (
+    obj.sensitive === true ||
+    obj.is_sensitive === true ||
+    obj.credential === true ||
+    obj.secret === true ||
+    obj.password === true
+  ) {
+    return true;
+  }
+  const category = String(obj.category || "").toLowerCase();
+  if (category === "credential" || category === "password" || category === "secret") {
+    return true;
+  }
+  const typeStr = String(obj.type || obj.field_type || "").toLowerCase();
+  if (typeStr === "password" || typeStr === "credential") {
+    return true;
+  }
+  const nameStr = String(obj.name || obj.selector || obj.label || "").toLowerCase();
+  if (/pass(word)?|token|secret|credential|api[_-]?key/i.test(nameStr)) {
+    return true;
+  }
+  if (typeof text === "string" && text.length > 0) {
+    if (redactSensitiveString(text) !== text) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function redactSensitiveFields(val: any): any {
@@ -153,8 +191,11 @@ export function redactSensitiveFields(val: any): any {
   if (typeof val === "object") {
     const res: Record<string, any> = {};
     const SENSITIVE_KEY_REGEX = /pass(word)?|token|secret|api[_-]?key|auth|bearer|credential|private[_-]?key/i;
+    const isSensAction =
+      (val.action === "type" || val.action === "key") && isSensitiveInput(val, val.text);
+
     for (const [k, v] of Object.entries(val)) {
-      if (SENSITIVE_KEY_REGEX.test(k)) {
+      if (SENSITIVE_KEY_REGEX.test(k) || (isSensAction && k === "text")) {
         res[k] = typeof v === "string" ? "[REDACTED]" : redactSensitiveFields(v);
       } else {
         res[k] = redactSensitiveFields(v);
@@ -175,32 +216,52 @@ export function parseApprovalArgs(argsJson: string): {
     if (obj && typeof obj === "object") {
       let target: string | null = null;
       if (obj.command) {
-        target = `Command: ${redactSensitiveString(String(obj.command))}${obj.cwd || obj.working_dir ? ` (in ${obj.cwd || obj.working_dir})` : ""}`;
+        const cmdStr = redactSensitiveString(String(obj.command));
+        const cwdStr = obj.cwd || obj.working_dir
+          ? ` (in ${redactSensitiveString(String(obj.cwd || obj.working_dir))})`
+          : "";
+        target = `Command: ${cmdStr}${cwdStr}`;
       } else if (obj.path) {
-        target = `File: ${obj.path}`;
+        target = `File: ${redactSensitiveString(String(obj.path))}`;
       } else if (obj.url) {
         target = `URL: ${redactSensitiveString(String(obj.url))}`;
       } else if (obj.action) {
         const actName = String(obj.action);
         if (actName === "hotkey" && obj.keys) {
-          const keysStr = Array.isArray(obj.keys) ? obj.keys.join("+") : String(obj.keys);
+          const keysStr = Array.isArray(obj.keys)
+            ? obj.keys.map((k: any) => redactSensitiveString(String(k))).join("+")
+            : redactSensitiveString(String(obj.keys));
           target = `Action: Hotkey (${keysStr})`;
-        } else if (actName === "key" && obj.text) {
-          target = `Action: Press key '${obj.text}'`;
-        } else if (actName === "type" && obj.text) {
-          target = `Action: Type text (${String(obj.text).length} chars)`;
+        } else if (actName === "key") {
+          const rawText = obj.text !== undefined ? String(obj.text) : "";
+          if (isSensitiveInput(obj, rawText)) {
+            target = "Action: Press key [REDACTED_CREDENTIAL]";
+          } else {
+            target = `Action: Press key '${redactSensitiveString(rawText)}'`;
+          }
+        } else if (actName === "type") {
+          const rawText = obj.text !== undefined ? String(obj.text) : "";
+          if (isSensitiveInput(obj, rawText)) {
+            // Never expose length or content of typed credentials!
+            target = "Action: Type text [REDACTED_CREDENTIAL]";
+          } else {
+            target = `Action: Type text (${rawText.length} chars)`;
+          }
         } else if (obj.x !== undefined && obj.y !== undefined) {
           target = `Action: ${actName} at (${obj.x}, ${obj.y})`;
         } else {
           target = `Action: ${actName}`;
         }
       } else if (obj.keys) {
-        target = `Keys: ${Array.isArray(obj.keys) ? obj.keys.join("+") : obj.keys}`;
+        const keysStr = Array.isArray(obj.keys)
+          ? obj.keys.map((k: any) => redactSensitiveString(String(k))).join("+")
+          : redactSensitiveString(String(obj.keys));
+        target = `Keys: ${keysStr}`;
       }
 
       const redacted = redactSensitiveFields(obj);
       return {
-        parsed: obj,
+        parsed: redacted,
         targetDetail: target,
         formattedRedacted: JSON.stringify(redacted, null, 2),
       };
@@ -237,10 +298,7 @@ export function formatTruthfulAssistantReply(
   }
 
   if (authoritativeStatus === "unverified") {
-    if (plan && plan.steps.length > 0) {
-      return `ℹ️ **[Unverified Completion]** ${baseText}\n\n> **Authoritative Verification Notice:** Actions executed without affirmative postcondition verification.`;
-    }
-    return baseText;
+    return `ℹ️ **[Unverified Completion]** ${baseText}\n\n> **Authoritative Verification Notice:** Actions executed without affirmative postcondition verification.`;
   }
 
   if (authoritativeStatus === "cancelled") {
@@ -2288,7 +2346,7 @@ export const App: React.FC = () => {
                                 : "bg-neutral-800 text-neutral-400 border border-neutral-700"
                             }`}
                           >
-                            {isDestructive ? "Irreversible" : "Not guaranteed"}
+                            {isDestructive ? "Irreversible" : "Unknown / Not guaranteed"}
                           </span>
                           <span className="font-mono text-neutral-200 text-[11px] font-semibold bg-black/40 px-2 py-0.5 rounded border border-neutral-800">
                             {req.tool_name}
