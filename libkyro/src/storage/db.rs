@@ -1329,6 +1329,7 @@ impl Database {
             "succeeded",
             "failed",
             "uncertain",
+            "unverified",
             "cancelled",
             "interrupted",
             "completed",
@@ -1461,82 +1462,268 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Determines if a tool is read-only / informational (inspections, listings, queries).
+    /// Informational actions do not require an affirmative postcondition verifier.
+    pub fn is_read_only_tool_name(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        let read_only_prefixes = [
+            "read_",
+            "inspect_",
+            "list_",
+            "search_",
+            "find_",
+            "get_",
+            "view_",
+            "describe_",
+            "fetch_",
+            "check_",
+            "info",
+            "timeline_",
+        ];
+        if read_only_prefixes
+            .iter()
+            .any(|&p| lower.starts_with(p) || lower == p.trim_end_matches('_'))
+        {
+            return true;
+        }
+        matches!(
+            lower.as_str(),
+            "read_file" | "list_directory" | "inspect_project" | "capture_screen"
+        )
+    }
+
     /// Evaluates the authoritative execution outcome of a run by inspecting its recorded tool events.
-    /// Distinguishes complete success (requires affirmative postcondition verification),
+    /// Distinguishes complete success (requires affirmative postcondition verification on all consequential actions),
     /// verification failure, inconclusive/uncertain actions, and unverified completion.
     /// Untrusted tool output can never forge verified status.
     pub fn get_run_outcome_from_events(&self, run_id: &str) -> Result<String> {
+        // 1. Check existing immutable terminal status in database
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT status FROM agent_runs WHERE id = ?1")?;
+            let mut rows = stmt.query(params![run_id])?;
+            if let Some(row) = rows.next()? {
+                let current_status: String = row.get(0)?;
+                if current_status == "cancelled" || current_status == "interrupted" {
+                    return Ok(current_status);
+                }
+            }
+
+            // 2. A run awaiting approval at termination cannot be marked successful
+            let mut app_stmt = conn.prepare(
+                "SELECT 1 FROM approval_requests WHERE run_id = ?1 AND status = 'pending'",
+            )?;
+            if app_stmt.exists(params![run_id])? {
+                return Ok("waiting_approval".to_string());
+            }
+        }
+
         let events = self.get_run_events(run_id, None)?;
         if events.is_empty() {
             // Absence of events is NOT affirmative evidence of success!
             return Ok("unverified".to_string());
         }
 
-        let mut has_failure = false;
-        let mut has_uncertain = false;
-        let mut has_affirmative_verification = false;
+        // If the final event is waiting_approval, the run is still awaiting authorization
+        if let Some(last_evt) = events.last() {
+            if last_evt.event_type == "waiting_approval" {
+                return Ok("waiting_approval".to_string());
+            }
+        }
 
-        for evt in events {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ActionOutcome {
+            Verified,
+            CompletedReadOnly,
+            Failed,
+            Uncertain,
+            Unverified,
+        }
+
+        let mut has_global_failure = false;
+        let mut actions: std::collections::HashMap<String, (String, ActionOutcome)> =
+            std::collections::HashMap::new();
+
+        for evt in &events {
             if evt.event_type == "error" {
-                has_failure = true;
+                has_global_failure = true;
             } else if evt.event_type == "tool_result" {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evt.payload_json) {
-                    if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
-                        has_failure = true;
+                let v = match serde_json::from_str::<serde_json::Value>(&evt.payload_json) {
+                    Ok(val) => val,
+                    Err(_) => {
+                        // Malformed persisted event fails closed
+                        has_global_failure = true;
+                        continue;
                     }
+                };
 
-                    // 1. Authoritative verification from trusted backend execution layer
-                    if let Some(tv) = v.get("trusted_verification") {
-                        if !tv.is_null() {
+                let tool_call_id = v
+                    .get("tool_call_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(&evt.id)
+                    .to_string();
+                let tool_name = v
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+                let is_read_only = Self::is_read_only_tool_name(&tool_name);
+
+                let mut output_indicates_failure = false;
+                let mut output_indicates_uncertain = false;
+
+                // Inspect tool output for fail-closed signals (failure and uncertainty).
+                // NEVER accept success or verification claims from untrusted tool output!
+                if let Some(out_str) = v.get("output").and_then(|s| s.as_str()) {
+                    if let Ok(out_json) = serde_json::from_str::<serde_json::Value>(out_str) {
+                        let status = out_json.get("status").and_then(|s| s.as_str());
+                        let ver_status = out_json
+                            .get("verification")
+                            .and_then(|ver| ver.get("status"))
+                            .and_then(|s| s.as_str());
+                        if status == Some("uncertain") || ver_status == Some("uncertain") {
+                            output_indicates_uncertain = true;
+                        } else if status == Some("failed") || ver_status == Some("failed") {
+                            output_indicates_failure = true;
+                        }
+                    }
+                    let lower = out_str.to_lowercase();
+                    if lower.contains("exit code: 1")
+                        || lower.contains("exit status: 1")
+                        || lower.contains("tests failed")
+                        || lower.contains("test failed")
+                        || lower.contains("assertion error")
+                    {
+                        output_indicates_failure = true;
+                    }
+                }
+
+                // Authoritative verification from trusted backend execution layer
+                let mut tv_verified = false;
+                let mut tv_failed = false;
+                let mut tv_uncertain = false;
+
+                if let Some(tv) = v.get("trusted_verification") {
+                    if !tv.is_null() && tv.is_object() {
+                        let is_trusted = tv
+                            .get("trusted_verifier")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false);
+                        let tv_run_id = tv.get("run_id").and_then(|s| s.as_str());
+                        let tv_tool_call_id = tv.get("tool_call_id").and_then(|s| s.as_str());
+                        let tv_action_name = tv.get("action_name").and_then(|s| s.as_str());
+
+                        // Binding checks: verify that the record binds to the exact run, action ID, and tool name
+                        let run_matches = tv_run_id.map(|r| r == run_id).unwrap_or(true);
+                        let tc_matches =
+                            tv_tool_call_id.map(|tc| tc == tool_call_id).unwrap_or(true);
+                        let action_matches =
+                            tv_action_name.map(|act| act == tool_name).unwrap_or(true);
+
+                        if !is_trusted || !run_matches || !tc_matches || !action_matches {
+                            // Binding mismatch or untrusted proof: cannot authorize success
+                            tv_failed = true;
+                        } else {
                             let status = tv.get("status").and_then(|s| s.as_str());
                             let postcondition_verified = tv
                                 .get("task_postcondition_verified")
                                 .and_then(|b| b.as_bool())
                                 .unwrap_or(false);
                             if status == Some("failed") {
-                                has_failure = true;
+                                tv_failed = true;
                             } else if status == Some("uncertain") {
-                                has_uncertain = true;
+                                tv_uncertain = true;
                             } else if (status == Some("succeeded") || status == Some("verified"))
                                 && postcondition_verified
                             {
-                                has_affirmative_verification = true;
+                                tv_verified = true;
                             }
-                        }
-                    }
-
-                    // 2. Also inspect tool output for fail-closed signals (failure and uncertainty).
-                    // NEVER accept success or verification claims from untrusted tool output!
-                    if let Some(out_str) = v.get("output").and_then(|s| s.as_str()) {
-                        if let Ok(out_json) = serde_json::from_str::<serde_json::Value>(out_str) {
-                            let status = out_json.get("status").and_then(|s| s.as_str());
-                            let ver_status = out_json
-                                .get("verification")
-                                .and_then(|ver| ver.get("status"))
-                                .and_then(|s| s.as_str());
-                            if status == Some("uncertain") || ver_status == Some("uncertain") {
-                                has_uncertain = true;
-                            } else if status == Some("failed") || ver_status == Some("failed") {
-                                has_failure = true;
-                            }
-                            // Notice: we deliberately DO NOT check status == Some("succeeded") here!
-                            // Tool outputs cannot authorize completion without trusted verification.
                         }
                     }
                 }
+
+                let current_outcome = if is_error || output_indicates_failure || tv_failed {
+                    ActionOutcome::Failed
+                } else if output_indicates_uncertain || tv_uncertain {
+                    ActionOutcome::Uncertain
+                } else if tv_verified {
+                    ActionOutcome::Verified
+                } else if is_read_only {
+                    ActionOutcome::CompletedReadOnly
+                } else {
+                    ActionOutcome::Unverified
+                };
+
+                // Update action with strict precedence: Failed > Uncertain > Verified/Unverified
+                actions
+                    .entry(tool_call_id)
+                    .and_modify(|(_, existing)| match *existing {
+                        ActionOutcome::Failed => {}
+                        ActionOutcome::Uncertain => {
+                            if current_outcome == ActionOutcome::Failed {
+                                *existing = ActionOutcome::Failed;
+                            }
+                        }
+                        _ => {
+                            *existing = current_outcome;
+                        }
+                    })
+                    .or_insert((tool_name, current_outcome));
             }
         }
 
-        if has_failure {
-            Ok("failed".to_string())
-        } else if has_uncertain {
-            Ok("uncertain".to_string())
-        } else if has_affirmative_verification {
-            Ok("succeeded".to_string())
-        } else {
-            // Execution completed without affirmative postcondition verification
-            Ok("unverified".to_string())
+        if has_global_failure {
+            return Ok("failed".to_string());
         }
+
+        if actions.is_empty() {
+            return Ok("unverified".to_string());
+        }
+
+        let mut count_failed = 0;
+        let mut count_uncertain = 0;
+        let mut count_unverified = 0;
+        let mut count_verified = 0;
+        let mut count_read_only = 0;
+
+        for (_name, outcome) in actions.values() {
+            match outcome {
+                ActionOutcome::Failed => count_failed += 1,
+                ActionOutcome::Uncertain => count_uncertain += 1,
+                ActionOutcome::Unverified => count_unverified += 1,
+                ActionOutcome::Verified => count_verified += 1,
+                ActionOutcome::CompletedReadOnly => count_read_only += 1,
+            }
+        }
+
+        // 1. Any failed action results in failed run
+        if count_failed > 0 {
+            return Ok("failed".to_string());
+        }
+
+        // 2. Any uncertain action results in uncertain run
+        if count_uncertain > 0 {
+            return Ok("uncertain".to_string());
+        }
+
+        // 3. Any unverified consequential action prevents success: one verified action
+        // cannot compensate for an unverified action in the same run
+        if count_unverified > 0 {
+            return Ok("unverified".to_string());
+        }
+
+        // 4. If consequential actions were executed and all were affirmatively verified
+        if count_verified > 0 {
+            return Ok("succeeded".to_string());
+        }
+
+        // 5. If purely read-only/informational actions were executed and none failed
+        if count_read_only > 0 {
+            return Ok("succeeded".to_string());
+        }
+
+        Ok("unverified".to_string())
     }
 
     pub fn get_run(&self, id: &str) -> Result<Option<AgentRun>> {
