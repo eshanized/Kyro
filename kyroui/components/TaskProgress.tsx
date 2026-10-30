@@ -37,20 +37,59 @@ export interface VerificationEvidence {
   toolName?: string;
 }
 
+export interface VerificationBindingContext {
+  runId?: string;
+  toolCallId?: string;
+  actionName?: string;
+  resource?: string;
+  commandArg?: string;
+}
+
 /**
  * Truthfully evaluates verification evidence from a tool result.
  * Inspection tools (e.g. `inspect_project`) do NOT constitute verification.
  * A tool name prefix (`verify_*`, `validate_*`) or generic success output is NEVER trusted as proof.
  * Only authoritative verification results from the trusted execution layer can establish verification.
  */
-export function evaluateVerificationOutcome(toolResult: ToolResult, _commandArg?: string): VerificationEvidence {
+export function evaluateVerificationOutcome(
+  toolResult: ToolResult,
+  options?: string | VerificationBindingContext
+): VerificationEvidence {
+  const bindingContext: VerificationBindingContext =
+    typeof options === "string" ? { commandArg: options } : options || {};
+
   // 1. Authoritative typed verification from trusted Rust execution layer
   if (toolResult.verification && typeof toolResult.verification === "object") {
     const v = toolResult.verification;
     const status = (v.status || "").toLowerCase();
+
+    // Verification binding integrity checks
+    const expectedToolCallId = bindingContext.toolCallId || toolResult.tool_call_id;
+    const expectedActionName = bindingContext.actionName || toolResult.name;
+
+    const toolCallIdMatches = !v.tool_call_id || !expectedToolCallId || v.tool_call_id === expectedToolCallId;
+    const actionNameMatches = !v.action_name || !expectedActionName || v.action_name === expectedActionName;
+    const runIdMatches = !v.run_id || !bindingContext.runId || v.run_id === bindingContext.runId;
+    const resourceMatches = !v.resource || !bindingContext.resource || v.resource === bindingContext.resource;
+
+    if (!toolCallIdMatches || !actionNameMatches || !runIdMatches || !resourceMatches) {
+      return {
+        verified: false,
+        attempted: true,
+        failed: true,
+        uncertain: false,
+        reason: `Binding validation failed: verification evidence mismatch (action '${v.action_name || "unknown"}' / call '${v.tool_call_id || "unknown"}' does not match expected target)`,
+        conditionChecked: v.condition_checked,
+        resource: v.resource,
+        humanInterventionRequired: true,
+        toolName: toolResult.name,
+      };
+    }
+
     if (
       (status === "succeeded" || status === "success" || status === "verified") &&
-      v.task_postcondition_verified === true
+      v.task_postcondition_verified === true &&
+      v.trusted_verifier === true
     ) {
       return {
         verified: true,
@@ -99,6 +138,19 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, _commandArg?
         humanInterventionRequired: false,
         toolName: toolResult.name,
       };
+    } else if (status === "succeeded" || status === "success" || status === "verified") {
+      // Untrusted verification claim rejected
+      return {
+        verified: false,
+        attempted: true,
+        failed: false,
+        uncertain: true,
+        reason: "Untrusted verification claim rejected: no authoritative verification proof from trusted runtime",
+        conditionChecked: v.condition_checked,
+        resource: v.resource,
+        humanInterventionRequired: true,
+        toolName: toolResult.name,
+      };
     }
   }
 
@@ -136,88 +188,58 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, _commandArg?
     };
   }
 
-  // 3. Inspect structured output for fail-closed signals and genuine trusted verification metadata
+  // 3. Inspect structured output for fail-closed signals ONLY.
+  // Arbitrary tool output is NEVER trusted to declare success or verification!
   if (toolResult.output && typeof toolResult.output === "string") {
     try {
       const parsed = JSON.parse(toolResult.output);
       if (parsed && typeof parsed === "object") {
-        if (parsed.verification && typeof parsed.verification === "object") {
-          const v = parsed.verification;
-          const status = (v.status || "").toLowerCase();
-          if (
-            (status === "succeeded" || status === "success" || status === "verified") &&
-            v.trusted_verifier === true &&
-            v.task_postcondition_verified === true
-          ) {
-            return {
-              verified: true,
-              attempted: true,
-              failed: false,
-              uncertain: false,
-              reason: v.evidence || `Verification check passed via ${toolResult.name}`,
-              conditionChecked: v.condition_checked,
-              resource: v.resource,
-              humanInterventionRequired: false,
-              toolName: toolResult.name,
-            };
-          } else if (status === "uncertain" || parsed.status === "uncertain") {
-            return {
-              verified: false,
-              attempted: true,
-              failed: false,
-              uncertain: true,
-              reason: v.evidence || parsed.note || "Postcondition check inconclusive (uncertain outcome)",
-              conditionChecked: v.condition_checked,
-              resource: v.resource,
-              humanInterventionRequired: v.human_intervention_required ?? true,
-              toolName: toolResult.name,
-            };
-          } else if (status === "failed" || parsed.status === "failed") {
-            return {
-              verified: false,
-              attempted: true,
-              failed: true,
-              uncertain: false,
-              reason: v.evidence || "Postcondition verification check failed",
-              conditionChecked: v.condition_checked,
-              resource: v.resource,
-              humanInterventionRequired: true,
-              toolName: toolResult.name,
-            };
-          } else if (status === "succeeded" || status === "success") {
-            // Untrusted or unauthenticated claim of verification from tool output
-            return {
-              verified: false,
-              attempted: true,
-              failed: false,
-              uncertain: true,
-              reason: "Untrusted verification claim rejected: no authoritative verification proof from trusted runtime",
-              conditionChecked: v.condition_checked,
-              resource: v.resource,
-              humanInterventionRequired: true,
-              toolName: toolResult.name,
-            };
-          }
-        }
-
-        if (parsed.status === "uncertain") {
-          return {
-            verified: false,
-            attempted: true,
-            failed: false,
-            uncertain: true,
-            reason: parsed.note || "Action executed with inconclusive postcondition (uncertain outcome)",
-            toolName: toolResult.name,
-          };
-        }
-
-        if (parsed.status === "failed") {
+        if (parsed.status === "failed" || parsed.verification?.status === "failed") {
           return {
             verified: false,
             attempted: true,
             failed: true,
             uncertain: false,
-            reason: parsed.error || "Action execution failed",
+            reason: parsed.error || parsed.verification?.evidence || "Postcondition verification check failed",
+            conditionChecked: parsed.verification?.condition_checked,
+            resource: parsed.verification?.resource,
+            humanInterventionRequired: true,
+            toolName: toolResult.name,
+          };
+        }
+
+        if (parsed.status === "uncertain" || parsed.verification?.status === "uncertain") {
+          return {
+            verified: false,
+            attempted: true,
+            failed: false,
+            uncertain: true,
+            reason: parsed.note || parsed.verification?.evidence || "Postcondition check inconclusive (uncertain outcome)",
+            conditionChecked: parsed.verification?.condition_checked,
+            resource: parsed.verification?.resource,
+            humanInterventionRequired: parsed.verification?.human_intervention_required ?? true,
+            toolName: toolResult.name,
+          };
+        }
+
+        // If arbitrary tool output claims verification or success, explicitly reject the claim!
+        if (
+          parsed.verification ||
+          parsed.status === "succeeded" ||
+          parsed.status === "success" ||
+          parsed.status === "verified" ||
+          parsed.trusted_verifier ||
+          parsed.task_postcondition_verified
+        ) {
+          return {
+            verified: false,
+            attempted: true,
+            failed: false,
+            uncertain: false,
+            reason: "Untrusted verification claim rejected: arbitrary tool output cannot forge verification evidence",
+            conditionChecked: parsed.verification?.condition_checked,
+            resource: parsed.verification?.resource,
+            humanInterventionRequired: true,
             toolName: toolResult.name,
           };
         }
@@ -249,33 +271,8 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, _commandArg?
     };
   }
 
-  // 5. Genuine test runners executing test assertions
-  const isRealTestRunner =
-    toolName === "run_tests" ||
-    toolName === "run_test" ||
-    toolName === "test" ||
-    toolName === "execute_tests" ||
-    (toolName === "execute_shell" &&
-      Boolean(
-        _commandArg &&
-          /\b(test|pytest|npm\s+test|cargo\s+test|vitest|jest|make\s+test|make\s+verify)\b/i.test(
-            _commandArg
-          )
-      ));
-
-  if (isRealTestRunner) {
-    return {
-      verified: true,
-      attempted: true,
-      failed: false,
-      uncertain: false,
-      reason: `Verification check passed via ${toolResult.name}`,
-      toolName: toolResult.name,
-    };
-  }
-
-  // 6. If no trusted verification proof exists, the action is UNVERIFIED.
-  // Tool name prefixes (verify_*, validate_*) are NEVER accepted as proof of success!
+  // 5. If no trusted verification proof exists, the action is UNVERIFIED.
+  // Tool names (verify_*, test, run_tests, etc.) are NEVER accepted as proof of success!
   return {
     verified: false,
     attempted: false,
@@ -294,16 +291,11 @@ export function evaluateVerificationOutcome(toolResult: ToolResult, _commandArg?
 export function isVerificationToolName(
   name: string,
   commandArg?: string,
-  output?: string,
+  _output?: string,
   verification?: any
 ): boolean {
   if (verification) return true;
-  if (output && typeof output === "string") {
-    try {
-      const parsed = JSON.parse(output);
-      if (parsed?.verification) return true;
-    } catch {}
-  }
+  // NOTE: Untrusted tool output JSON is NEVER examined to classify a tool as a verifier.
 
   const toolName = (name || "").toLowerCase();
   return (
