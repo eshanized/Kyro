@@ -364,3 +364,33 @@ This log chronicles the engineering remediation, feature completion, and verific
 
 ### 7. Version Bump to `0.1.3`
 - Bumped `package.json`, `package-lock.json`, `libkyro/Cargo.toml`, `libkyro/Cargo.lock`, `libkyro/tauri.conf.json`, `install.sh`, connectors, issue templates, and docs to `0.1.3`.
+
+---
+
+## 2026-10-28: Final Remediation — Verification Integrity, Whole-Run Outcomes, Truthful Assistant Messaging & Desktop E2E
+
+### 1. Verification Integrity & Strict Context Binding (Phase 1)
+- **Eliminated Untrusted Metadata Acceptance**: Removed reliance on tool output claiming verification via arbitrary JSON fields (`trusted_verifier`, `task_postcondition_verified`, `verification.status`), and eliminated heuristic verification based on tool names (`verify_*`, `test_*`, `npm test`) in `kyroui/components/TaskProgress.tsx`.
+- **Strict Verification Binding Enforced**: Verification records must strictly match `run_id`, `tool_call_id`, `action_name`, expected postcondition, and target resource. Output from untrusted sources or cross-run/cross-action replays are discarded.
+- **Explicit Outcome Derivation**: Outcomes strictly categorized into `Verified`, `Failed`, `Uncertain`, and `Unverified`.
+
+### 2. Multi-Action Outcome Aggregation & Status Persistence (Phase 2)
+- **Action-Level Outcome Tracking**: Rewrote `get_run_outcome_from_events()` in `libkyro/src/storage/db.rs` to track each consequential tool call individually rather than relying on a global boolean.
+- **Precedence Hierarchy**: `failed` > `uncertain` > `unverified` > `succeeded`. A single verified action can never mask an unverified or failed consequential action.
+- **Read-Only Exemption Policy**: Purely read-only tools (`read_file`, `list_directory`, `search_*`, `get_*`) are exempt from postcondition requirements if no state mutations occurred.
+- **Fixed `unverified` Status Persistence**: Added `"unverified"` to `VALID_RUN_STATUSES` in `Database::update_run_status()`, resolving persistence rejection when `get_run_outcome_from_events()` emits `unverified`.
+- **Terminal Immutability**: Protected terminal states (`cancelled`, `interrupted`) and blocked runs with pending approvals from resolving to `succeeded`.
+
+### 3. Truthful Assistant Responses (Phase 3)
+- **Non-Plan Workflow Protection**: Updated `formatTruthfulAssistantReply()` in `kyroui/App.tsx` so that when `authoritativeStatus === "unverified"`, the authoritative unverified notice is appended unconditionally across all workflows, including single-turn requests and runs lacking an execution plan.
+
+### 4. Secret-Safe Approval Previews & Keystroke Masking (Phase 4)
+- **Deep Redaction Engine**: Enhanced `redactSensitiveString()` with regex coverage for JWTs, Bearer tokens, API keys (`sk_`, `sk-`, `ghp_`, `AKIA`, `sq0idp-`), basic auth URLs (`protocol://user:[REDACTED]@host`), and CLI exports.
+- **Computer-Use Credential Masking**: Detected sensitive field targets and masked `type` and `key` action payloads as `[REDACTED_CREDENTIAL]` without revealing raw passwords or string character lengths.
+- **Reversibility Clarification**: Updated approval badge to `Unknown / Not guaranteed` when unverified.
+
+### 5. Regression & Desktop E2E Test Suites (Phases 5 & 6)
+- **Backend Whole-Run Suite** (`libkyro/tests/whole_run_verification_tests.rs`): 7 tests covering single/multi-action aggregation, binding validation, invalid status rejection, immutable terminal states, pending approval blockage, read-only policy, and corrupt event handling.
+- **Backend Desktop E2E Suite** (`libkyro/tests/desktop_e2e_tests.rs`): 7 tests covering Scenarios A through G across real SQLite DB, AppState, and Tauri mock application boundaries.
+- **Frontend Adversarial & UI E2E Suites** (`kyroui/test/verification_integrity_and_redaction.test.tsx`, `kyroui/test/desktop_e2e_scenarios.test.tsx`): 30 tests covering adversarial verification payloads, credential redaction, and Scenarios A through G.
+

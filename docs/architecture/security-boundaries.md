@@ -160,9 +160,59 @@ The policy engine automatically halts automation, records a high-risk approval/t
   - Unknown computer actions, corrupt policies, and unrecognized policy modes fail closed.
 - **Secret-Safe Approval Previews**:
   - Pending approval previews display normalized action targets (e.g. `Action: Hotkey (Alt+F4)`, working directories, file paths, and sanitized command strings).
-  - Multi-tier recursive credential scrubbing automatically redacts Bearer tokens, API keys, private keys, database connection strings, passwords, and authorization headers from preview cards, logs, and audit records.
-  - Actions are only labeled `Reversible` when an authoritative rollback path exists; unverified or destructive actions display `Not guaranteed` or `Irreversible`.
+  - Multi-tier recursive credential scrubbing automatically redacts Bearer tokens, JWT tokens, API keys (`sk_`, `sk-`, `ghp_`, `AKIA`, `sq0idp-`), private keys, database connection strings, basic auth URLs (`protocol://user:[REDACTED]@host`), passwords, and authorization headers from preview cards, logs, and audit records.
+  - Keystroke and typed credential masking: Computer-use `type` and `key` actions targeting sensitive fields (passwords, PINs, secrets, tokens, credentials) replace raw text with `[REDACTED_CREDENTIAL]` without revealing character lengths or counts.
+  - Actions are only labeled `Reversible` when an authoritative rollback path exists; unverified or destructive actions display `Unknown / Not guaranteed` or `Irreversible`.
 - **Authoritative Consistency in Final Responses**:
   - Model-generated replies cannot override or conceal the authoritative task outcome.
   - Unverified tasks, failures, uncertainties, cancellations, and interruptions prepend or append authoritative execution notices to assistant messages in the UI and durable message store.
+  - For `unverified` runs, the authoritative notice is appended unconditionally across all workflows, including single-turn requests, routine operations, and runs without a structured task plan.
+
+---
+
+## 16. Verification Binding Vector, Multi-Action Aggregation & Verification Test Suite
+
+### Verification Binding Vector
+Authoritative verification results must bind strictly to execution context:
+1. `run_id`: Exact run identifier. Verification evidence for a different run is rejected.
+2. `tool_call_id`: Exact tool call identifier. Verification evidence bound to an unmatched action ID is rejected.
+3. `action_name`: Canonical tool/action identifier (e.g., `write_file`, `execute_shell`).
+4. `expected_postcondition`: Explicit expected invariant (e.g., file existence, hash match, exit status).
+5. `target_resource`: Canonical resource identifier (e.g., canonical path, PID).
+6. Tool outputs claiming verification via untrusted fields (`trusted_verifier: true`, `task_postcondition_verified: true`, `verification.status: succeeded`) or tool names (`verify_*`, `test_*`, `run_tests`) without backend verification evidence are untrusted and discarded.
+
+### Multi-Action Aggregation & Precedence Rules
+Task completion evaluates every consequential action executed in the run:
+- **Action-Level Tracking**: Each tool call ID is tracked to its authoritative outcome.
+- **Outcome Precedence**:
+  1. `failed`: If any consequential action failed, the whole run is `failed`.
+  2. `uncertain`: If no action failed but any consequential action has uncertain outcome, the whole run is `uncertain`.
+  3. `unverified`: If no action failed/uncertain but any consequential action lacks affirmative backend verification, the whole run is `unverified`. One verified action cannot compensate for another unverified action.
+  4. `succeeded`: The whole run is `succeeded` only if ALL consequential actions achieved affirmative backend verification.
+- **Read-Only Exemption Policy**: Purely read-only inspection operations (`read_file`, `list_directory`, `search_*`, `get_*`, `view_image`) do not require postcondition verification if no mutations occurred.
+- **Terminal Immutability**: Runs in `cancelled` or `interrupted` states cannot transition to `succeeded` regardless of subsequent events.
+- **Pending Approvals**: A run with unresolved approval requests at termination resolves to `awaiting_approval` or `unverified`, never `succeeded`.
+
+### Running Verification & Desktop E2E Tests
+```bash
+# Whole-run verification aggregation and lifecycle tests (Rust backend)
+cargo test --manifest-path libkyro/Cargo.toml --test whole_run_verification_tests
+
+# Desktop E2E integration tests across Tauri mock runtime, DB, and state
+cargo test --manifest-path libkyro/Cargo.toml --test desktop_e2e_tests
+
+# Trust authorization and security unit/integration tests
+cargo test --manifest-path libkyro/Cargo.toml --test trust_and_authorization_tests
+
+# Frontend adversarial verification integrity and secret redaction tests
+npm test kyroui/test/verification_integrity_and_redaction.test.tsx
+
+# Frontend Desktop E2E scenarios across UI, TaskProgress, approvals, and Truthful reply
+npm test kyroui/test/desktop_e2e_scenarios.test.tsx
+
+# Full test suites
+cargo test --manifest-path libkyro/Cargo.toml
+npm test
+```
+
 
