@@ -29,7 +29,7 @@ futures = "0.3"
 rusqlite = { version = "0.40", features = ["bundled"] }
 portable-pty = "0.9"
 enigo = { version = "0.6", features = ["serde"] }
-xcap = "0.2"
+xcap = "0.9"
 image = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
 async-trait = "0.1"
